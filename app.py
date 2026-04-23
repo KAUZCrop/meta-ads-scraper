@@ -87,12 +87,15 @@ CUSTOM_CSS = """
 
     /* 헤더 */
     .ad-header {
-        display: flex;
-        align-items: flex-end;
-        gap: 16px;
         margin-bottom: 2rem;
         padding-bottom: 1.5rem;
         border-bottom: 1px solid var(--border);
+    }
+
+    .ad-header-inner {
+        display: flex;
+        align-items: center;
+        gap: 12px;
     }
 
     .ad-logo {
@@ -101,6 +104,7 @@ CUSTOM_CSS = """
         font-weight: 800;
         letter-spacing: -0.5px;
         color: var(--text);
+        line-height: 1;
     }
 
     .ad-logo span {
@@ -111,17 +115,18 @@ CUSTOM_CSS = """
         font-family: 'DM Mono', monospace;
         font-size: 11px;
         color: var(--muted);
-        margin-bottom: 3px;
         border: 1px solid var(--border2);
         padding: 2px 8px;
         border-radius: 4px;
+        line-height: 1.4;
     }
 
     .ad-subtitle {
-        font-size: 13px;
-        color: var(--muted);
-        margin-left: auto;
         font-family: 'DM Mono', monospace;
+        font-size: 11px;
+        color: var(--muted);
+        letter-spacing: 1.5px;
+        margin-top: 10px;
     }
 
     /* 검색바 */
@@ -695,8 +700,10 @@ def get_csv_data(assets):
 # =========================================================
 st.markdown("""
 <div class="ad-header">
-    <div class="ad-logo">AD<span>INTEL</span></div>
-    <div class="ad-version">v2.0</div>
+    <div class="ad-header-inner">
+        <div class="ad-logo">AD<span>INTEL</span></div>
+        <div class="ad-version">v2.0</div>
+    </div>
     <div class="ad-subtitle">META AD LIBRARY INTELLIGENCE BOARD</div>
 </div>
 """, unsafe_allow_html=True)
