@@ -7,3 +7,4 @@ libxkbcommon0
 libgbm1
 libasound2t64
 libxcomposite1
+libxdamage1
