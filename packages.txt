@@ -5,6 +5,7 @@ libx11-xcb1
 libxcb-dri3-0
 libxcomposite1
 libxdamage1
+libxfixes3
 libxrandr2
 libgbm1
 libasound2
