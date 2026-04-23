@@ -559,15 +559,26 @@ def extract_assets_from_meta(keyword: str, country: str = "KR", max_scrolls: int
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"]
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-extensions",
+                "--disable-plugins",
+                "--disable-background-networking",
+                "--no-first-run",
+                "--disable-default-apps",
+            ]
         )
-        page = browser.new_page(viewport={"width": 1440, "height": 2000})
+        context = browser.new_context(viewport={"width": 1440, "height": 2000})
+        # 폰트 파일 차단 → 로딩 속도 향상
+        context.route("**/*.{woff,woff2,ttf,otf,eot}", lambda r: r.abort())
+        page = context.new_page()
         page.goto(url, wait_until="domcontentloaded", timeout=90000)
-        page.wait_for_timeout(7000)
+        page.wait_for_timeout(3500)  # 7000 → 3500ms
 
         for _ in range(max_scrolls):
             page.mouse.wheel(0, 3200)
-            page.wait_for_timeout(1800)
+            page.wait_for_timeout(1100)  # 1800 → 1100ms
 
         js = """
         () => {
@@ -602,6 +613,7 @@ def extract_assets_from_meta(keyword: str, country: str = "KR", max_scrolls: int
         """
 
         candidates = page.evaluate(js)
+        context.close()
         browser.close()
 
     for item in candidates:
@@ -788,6 +800,7 @@ with search_col:
         "keyword",
         placeholder="예: 캐리어, 공기청정기, 스킨케어, 다이어트",
         label_visibility="collapsed",
+        on_change=lambda: st.session_state.update({"enter_search": True}),
     )
 
 with btn_col1:
@@ -796,7 +809,12 @@ with btn_col1:
 with btn_col2:
     add_clicked = st.button("누적 검색", use_container_width=True)
 
-st.caption("누적 검색: 기존 보드에 결과 추가 / 검색: 새 검색으로 교체")
+# 엔터 검색 처리
+enter_search = st.session_state.pop("enter_search", False)
+if enter_search:
+    search_clicked = True
+
+st.caption("↵ 엔터로 바로 검색 · 누적 검색: 기존 보드에 결과 추가")
 st.markdown('</div>', unsafe_allow_html=True)
 
 
