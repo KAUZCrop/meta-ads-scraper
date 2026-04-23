@@ -80,7 +80,7 @@ CUSTOM_CSS = """
     }
 
     .block-container {
-        padding-top: 2rem;
+        padding-top: 4.5rem;
         padding-bottom: 3rem;
         max-width: 1600px;
     }
