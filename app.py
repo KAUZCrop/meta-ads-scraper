@@ -1,8 +1,19 @@
 import sys
 import asyncio
+import subprocess
+import streamlit as st
 
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+
+@st.cache_resource
+def ensure_playwright_browser():
+    subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        check=True,
+    )
+    return True
 
 import time
 import uuid
@@ -209,6 +220,8 @@ def make_asset_fingerprint(item):
 
 
 def extract_assets_from_meta(keyword: str, country: str = "KR", max_scrolls: int = 8, max_assets: int = 80):
+    ensure_playwright_browser()
+
     url = (
         "https://www.facebook.com/ads/library/"
         f"?active_status=all&ad_type=all&country={country}&q={quote(keyword)}"
@@ -218,7 +231,10 @@ def extract_assets_from_meta(keyword: str, country: str = "KR", max_scrolls: int
     seen_keys = set()
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+    headless=True,
+    args=["--no-sandbox", "--disable-dev-shm-usage"]
+)
         page = browser.new_page(viewport={"width": 1440, "height": 2000})
         page.goto(url, wait_until="domcontentloaded", timeout=90000)
         page.wait_for_timeout(7000)
