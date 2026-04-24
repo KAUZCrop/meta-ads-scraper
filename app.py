@@ -21,1020 +21,438 @@ import uuid
 import io
 from urllib.parse import quote, urlparse
 
-import streamlit as st
 from playwright.sync_api import sync_playwright
 
-# =========================================================
-# Streamlit page config
-# =========================================================
 st.set_page_config(
     page_title="AD INTEL — Meta Ad Library",
     page_icon="◼",
     layout="wide",
 )
 
-# =========================================================
-# Custom UI — 대행사 내부 툴 스타일
-# =========================================================
-CUSTOM_CSS = """
+st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@600;700;800&family=DM+Sans:wght@300;400;500&display=swap');
-
-    :root {
-        --bg:       #0d0f12;
-        --bg2:      #13161b;
-        --bg3:      #1a1e26;
-        --border:   #252a34;
-        --border2:  #2f3542;
-        --accent:   #4f7cff;
-        --accent2:  #7c5cff;
-        --danger:   #ff4f6b;
-        --success:  #3dffa0;
-        --text:     #e8eaf0;
-        --muted:    #6b7280;
-        --tag:      #1e2330;
-    }
-
-    html, body, [class*="css"] {
-        font-family: 'DM Sans', sans-serif;
-        background-color: var(--bg) !important;
-        color: var(--text) !important;
-    }
-
-    .stApp {
-        background-color: var(--bg) !important;
-    }
-
-    [data-testid="stHeader"] {
-        background: var(--bg) !important;
-        border-bottom: 1px solid var(--border);
-    }
-
-    [data-testid="stSidebar"] {
-        background: var(--bg2) !important;
-        border-right: 1px solid var(--border) !important;
-    }
-
-    [data-testid="stSidebar"] * {
-        color: var(--text) !important;
-    }
-
-    .block-container {
-        padding-top: 4.5rem;
-        padding-bottom: 3rem;
-        max-width: 1600px;
-    }
-
-    /* 헤더 */
-    .ad-header {
-        margin-bottom: 2rem;
-        padding-bottom: 1.5rem;
-        border-bottom: 1px solid var(--border);
-    }
-
-    .ad-header-inner {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-    }
-
-    .ad-logo {
-        font-family: 'Syne', sans-serif;
-        font-size: 22px;
-        font-weight: 800;
-        letter-spacing: -0.5px;
-        color: var(--text);
-        line-height: 1;
-    }
-
-    .ad-logo span {
-        color: var(--accent);
-    }
-
-    .ad-version {
-        font-family: 'DM Mono', monospace;
-        font-size: 11px;
-        color: var(--muted);
-        border: 1px solid var(--border2);
-        padding: 2px 8px;
-        border-radius: 4px;
-        line-height: 1.4;
-    }
-
-    .ad-subtitle {
-        font-family: 'DM Mono', monospace;
-        font-size: 11px;
-        color: var(--muted);
-        letter-spacing: 1.5px;
-        margin-top: 10px;
-    }
-
-    /* 검색바 */
-    .search-wrapper {
-        background: var(--bg2);
-        border: 1px solid var(--border);
-        border-radius: 12px;
-        padding: 20px;
-        margin-bottom: 1.5rem;
-        transition: border-color 0.2s;
-    }
-
-    .search-wrapper:focus-within {
-        border-color: var(--accent);
-    }
-
-    .search-label {
-        font-family: 'DM Mono', monospace;
-        font-size: 10px;
-        color: var(--muted);
-        letter-spacing: 1.5px;
-        text-transform: uppercase;
-        margin-bottom: 10px;
-    }
-
-    /* 스탯 카드 */
-    .stat-row {
-        display: grid;
-        grid-template-columns: repeat(4, 1fr);
-        gap: 12px;
-        margin-bottom: 1.5rem;
-    }
-
-    .stat-card {
-        background: var(--bg2);
-        border: 1px solid var(--border);
-        border-radius: 10px;
-        padding: 16px 18px;
-        position: relative;
-        overflow: hidden;
-    }
-
-    .stat-card::before {
-        content: '';
-        position: absolute;
-        top: 0; left: 0; right: 0;
-        height: 2px;
-        background: linear-gradient(90deg, var(--accent), var(--accent2));
-        opacity: 0;
-        transition: opacity 0.2s;
-    }
-
-    .stat-card:hover::before { opacity: 1; }
-
-    .stat-label {
-        font-family: 'DM Mono', monospace;
-        font-size: 10px;
-        color: var(--muted);
-        letter-spacing: 1px;
-        text-transform: uppercase;
-        margin-bottom: 8px;
-    }
-
-    .stat-value {
-        font-family: 'Syne', sans-serif;
-        font-size: 28px;
-        font-weight: 700;
-        color: var(--text);
-        line-height: 1;
-    }
-
-    .stat-sub {
-        font-size: 11px;
-        color: var(--muted);
-        margin-top: 4px;
-    }
-
-    /* 키워드 태그 */
-    .tag-wrap { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 1.5rem; }
-
-    .kw-tag {
-        font-family: 'DM Mono', monospace;
-        font-size: 11px;
-        background: var(--tag);
-        border: 1px solid var(--border2);
-        color: var(--accent);
-        padding: 4px 10px;
-        border-radius: 6px;
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-    }
-
-    .kw-tag .dot {
-        width: 5px; height: 5px;
-        border-radius: 50%;
-        background: var(--success);
-        display: inline-block;
-    }
-
-    /* 섹션 헤더 */
-    .section-header {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        margin-bottom: 1rem;
-        padding-bottom: 10px;
-        border-bottom: 1px solid var(--border);
-    }
-
-    .section-title {
-        font-family: 'Syne', sans-serif;
-        font-size: 13px;
-        font-weight: 700;
-        color: var(--text);
-        letter-spacing: 0.5px;
-        text-transform: uppercase;
-    }
-
-    .section-count {
-        font-family: 'DM Mono', monospace;
-        font-size: 11px;
-        color: var(--muted);
-    }
-
-    /* 소재 카드 */
-    .asset-card {
-        background: var(--bg2);
-        border: 1px solid var(--border);
-        border-radius: 12px;
-        overflow: hidden;
-        margin-bottom: 12px;
-        transition: border-color 0.15s, transform 0.15s;
-    }
-
-    .asset-card:hover {
-        border-color: var(--border2);
-        transform: translateY(-1px);
-    }
-
-    .asset-img-wrap {
-        position: relative;
-        background: var(--bg3);
-    }
-
-    .asset-body {
-        padding: 12px 14px;
-        border-top: 1px solid var(--border);
-    }
-
-    .asset-kw {
-        font-family: 'DM Mono', monospace;
-        font-size: 10px;
-        color: var(--accent);
-        letter-spacing: 0.8px;
-        text-transform: uppercase;
-        margin-bottom: 4px;
-    }
-
-    .asset-type-badge {
-        display: inline-block;
-        font-family: 'DM Mono', monospace;
-        font-size: 9px;
-        padding: 2px 7px;
-        border-radius: 4px;
-        margin-bottom: 8px;
-        letter-spacing: 0.5px;
-    }
-
-    .badge-image {
-        background: rgba(79, 124, 255, 0.12);
-        color: var(--accent);
-        border: 1px solid rgba(79, 124, 255, 0.25);
-    }
-
-    .badge-video {
-        background: rgba(124, 92, 255, 0.12);
-        color: var(--accent2);
-        border: 1px solid rgba(124, 92, 255, 0.25);
-    }
-
-    .asset-meta {
-        font-size: 11px;
-        color: var(--muted);
-        line-height: 1.6;
-    }
-
-    .asset-caption {
-        font-size: 12px;
-        color: var(--text);
-        margin-top: 6px;
-        margin-bottom: 8px;
-        line-height: 1.4;
-        opacity: 0.8;
-        font-style: italic;
-    }
-
-    /* 버튼 */
-    .stButton > button {
-        font-family: 'DM Mono', monospace !important;
-        font-size: 11px !important;
-        letter-spacing: 0.5px !important;
-        border-radius: 8px !important;
-        border: 1px solid var(--border2) !important;
-        background: var(--bg3) !important;
-        color: var(--muted) !important;
-        transition: all 0.15s !important;
-        height: 34px !important;
-    }
-
-    .stButton > button:hover {
-        border-color: var(--accent) !important;
-        color: var(--accent) !important;
-        background: rgba(79, 124, 255, 0.08) !important;
-    }
-
-    .stDownloadButton > button {
-        font-family: 'DM Mono', monospace !important;
-        font-size: 11px !important;
-        border-radius: 8px !important;
-        border: 1px solid var(--border2) !important;
-        background: var(--bg3) !important;
-        color: var(--muted) !important;
-    }
-
-    /* 입력 필드 */
-    .stTextInput input {
-        background: var(--bg3) !important;
-        border: 1px solid var(--border) !important;
-        border-radius: 8px !important;
-        color: var(--text) !important;
-        font-family: 'DM Sans', sans-serif !important;
-    }
-
-    .stTextInput input:focus {
-        border-color: var(--accent) !important;
-        box-shadow: 0 0 0 2px rgba(79, 124, 255, 0.12) !important;
-    }
-
-    .stSelectbox > div > div {
-        background: var(--bg3) !important;
-        border: 1px solid var(--border) !important;
-        border-radius: 8px !important;
-        color: var(--text) !important;
-    }
-
-    .stSlider > div { padding: 4px 0; }
-
-    /* 알림 */
-    .stSuccess {
-        background: rgba(61, 255, 160, 0.08) !important;
-        border: 1px solid rgba(61, 255, 160, 0.2) !important;
-        border-radius: 8px !important;
-        color: var(--success) !important;
-    }
-
-    .stWarning {
-        background: rgba(255, 160, 50, 0.08) !important;
-        border: 1px solid rgba(255, 160, 50, 0.2) !important;
-        border-radius: 8px !important;
-    }
-
-    .stInfo {
-        background: rgba(79, 124, 255, 0.08) !important;
-        border: 1px solid rgba(79, 124, 255, 0.2) !important;
-        border-radius: 8px !important;
-    }
-
-    /* 구분선 */
-    hr { border-color: var(--border) !important; }
-
-    /* 탭 */
-    .stTabs [data-baseweb="tab-list"] {
-        background: transparent !important;
-        border-bottom: 1px solid var(--border) !important;
-        gap: 0 !important;
-    }
-
-    .stTabs [data-baseweb="tab"] {
-        font-family: 'DM Mono', monospace !important;
-        font-size: 11px !important;
-        color: var(--muted) !important;
-        background: transparent !important;
-        padding: 8px 16px !important;
-        letter-spacing: 0.5px !important;
-    }
-
-    .stTabs [aria-selected="true"] {
-        color: var(--accent) !important;
-        border-bottom: 2px solid var(--accent) !important;
-    }
-
-    /* 사이드바 */
-    .sidebar-section {
-        margin-bottom: 1.5rem;
-        padding-bottom: 1.5rem;
-        border-bottom: 1px solid var(--border);
-    }
-
-    .sidebar-label {
-        font-family: 'DM Mono', monospace;
-        font-size: 10px;
-        color: var(--muted);
-        letter-spacing: 1.2px;
-        text-transform: uppercase;
-        margin-bottom: 12px;
-    }
-
-    /* 필터 칩 */
-    .filter-chip {
-        display: inline-block;
-        font-family: 'DM Mono', monospace;
-        font-size: 10px;
-        padding: 3px 9px;
-        border-radius: 5px;
-        border: 1px solid var(--border2);
-        color: var(--muted);
-        margin-right: 6px;
-        margin-bottom: 6px;
-    }
-
-    /* 툴팁/캡션 */
-    .stCaption { color: var(--muted) !important; font-size: 11px !important; }
-
-    /* 링크 */
-    a { color: var(--accent) !important; }
-
-    /* 스피너 */
-    .stSpinner > div { border-top-color: var(--accent) !important; }
-
-    /* 스크롤바 */
-    ::-webkit-scrollbar { width: 4px; height: 4px; }
-    ::-webkit-scrollbar-track { background: var(--bg); }
-    ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 4px; }
-
-    /* 빈 상태 */
-    .empty-state {
-        text-align: center;
-        padding: 80px 20px;
-        color: var(--muted);
-    }
-
-    .empty-icon {
-        font-size: 40px;
-        margin-bottom: 16px;
-        opacity: 0.3;
-    }
-
-    .empty-title {
-        font-family: 'Syne', sans-serif;
-        font-size: 16px;
-        font-weight: 600;
-        margin-bottom: 8px;
-        color: var(--text);
-        opacity: 0.5;
-    }
-
-    .empty-desc {
-        font-size: 13px;
-        line-height: 1.6;
-    }
-
-    /* 로그 라인 */
-    .log-line {
-        font-family: 'DM Mono', monospace;
-        font-size: 11px;
-        color: var(--muted);
-        padding: 3px 0;
-        border-bottom: 1px solid var(--border);
-    }
-
-    .log-line .ts { color: var(--accent); margin-right: 10px; }
-    .log-line .ok { color: var(--success); }
-    .log-line .err { color: var(--danger); }
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@600;700;800&family=DM+Sans:wght@300;400;500&display=swap');
+:root {
+    --bg:#0d0f12; --bg2:#13161b; --bg3:#1a1e26;
+    --border:#252a34; --border2:#2f3542;
+    --accent:#4f7cff; --accent2:#7c5cff;
+    --danger:#ff4f6b; --success:#3dffa0; --warn:#ffb84f;
+    --text:#e8eaf0; --muted:#6b7280; --tag:#1e2330;
+}
+html,body,[class*="css"]{font-family:'DM Sans',sans-serif;background-color:var(--bg)!important;color:var(--text)!important;}
+.stApp{background-color:var(--bg)!important;}
+[data-testid="stHeader"]{background:var(--bg)!important;border-bottom:1px solid var(--border);}
+[data-testid="stSidebar"]{background:var(--bg2)!important;border-right:1px solid var(--border)!important;}
+[data-testid="stSidebar"] *{color:var(--text)!important;}
+.block-container{padding-top:4.5rem;padding-bottom:3rem;max-width:1600px;}
+.ad-header{margin-bottom:2rem;padding-bottom:1.2rem;border-bottom:1px solid var(--border);}
+.ad-header-inner{display:flex;align-items:center;gap:10px;}
+.ad-logo{font-family:'Syne',sans-serif;font-size:22px;font-weight:800;letter-spacing:-.5px;color:var(--text);line-height:1;}
+.ad-logo span{color:var(--accent);}
+.ad-version{font-family:'DM Mono',monospace;font-size:11px;color:var(--muted);border:1px solid var(--border2);padding:2px 8px;border-radius:4px;line-height:1.4;}
+.ad-subtitle{font-family:'DM Mono',monospace;font-size:11px;color:var(--muted);letter-spacing:1.5px;margin-top:8px;}
+.sidebar-label{font-family:'DM Mono',monospace;font-size:10px;color:var(--muted);letter-spacing:1.2px;text-transform:uppercase;margin-bottom:10px;margin-top:4px;}
+.search-wrapper{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:18px 20px;margin-bottom:1.2rem;}
+.search-label{font-family:'DM Mono',monospace;font-size:10px;color:var(--muted);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:10px;}
+.stat-card{background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:14px 16px;position:relative;overflow:hidden;}
+.stat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--accent),var(--accent2));opacity:0;transition:opacity .2s;}
+.stat-card:hover::before{opacity:1;}
+.stat-label{font-family:'DM Mono',monospace;font-size:9px;color:var(--muted);letter-spacing:1px;text-transform:uppercase;margin-bottom:6px;}
+.stat-value{font-family:'Syne',sans-serif;font-size:26px;font-weight:700;color:var(--text);line-height:1;}
+.stat-sub{font-size:11px;color:var(--muted);margin-top:4px;}
+.tag-wrap{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:1.2rem;}
+.kw-tag{font-family:'DM Mono',monospace;font-size:11px;background:var(--tag);border:1px solid var(--border2);color:var(--accent);padding:4px 10px;border-radius:6px;display:inline-flex;align-items:center;gap:6px;}
+.kw-tag .dot{width:5px;height:5px;border-radius:50%;background:var(--success);}
+.section-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:.8rem;padding-bottom:8px;border-bottom:1px solid var(--border);}
+.section-title{font-family:'Syne',sans-serif;font-size:12px;font-weight:700;color:var(--text);letter-spacing:.5px;text-transform:uppercase;}
+.section-count{font-family:'DM Mono',monospace;font-size:11px;color:var(--muted);}
+.asset-body{padding:10px 12px;border-top:1px solid var(--border);background:var(--bg2);border-radius:0 0 10px 10px;}
+.asset-kw{font-family:'DM Mono',monospace;font-size:10px;color:var(--accent);letter-spacing:.8px;text-transform:uppercase;margin-bottom:3px;}
+.asset-type-badge{display:inline-block;font-family:'DM Mono',monospace;font-size:9px;padding:2px 7px;border-radius:4px;margin-bottom:6px;letter-spacing:.5px;}
+.badge-image{background:rgba(79,124,255,.12);color:var(--accent);border:1px solid rgba(79,124,255,.25);}
+.badge-video{background:rgba(124,92,255,.12);color:var(--accent2);border:1px solid rgba(124,92,255,.25);}
+.badge-star{background:rgba(255,184,79,.12);color:var(--warn);border:1px solid rgba(255,184,79,.25);}
+.asset-meta{font-size:11px;color:var(--muted);line-height:1.6;}
+.asset-caption{font-size:11px;color:var(--text);margin:4px 0 6px;line-height:1.4;opacity:.7;font-style:italic;}
+.stButton>button{font-family:'DM Mono',monospace!important;font-size:11px!important;letter-spacing:.5px!important;border-radius:8px!important;border:1px solid var(--border2)!important;background:var(--bg3)!important;color:var(--muted)!important;transition:all .15s!important;height:34px!important;}
+.stButton>button:hover{border-color:var(--accent)!important;color:var(--accent)!important;background:rgba(79,124,255,.08)!important;}
+.stDownloadButton>button{font-family:'DM Mono',monospace!important;font-size:11px!important;border-radius:8px!important;border:1px solid var(--border2)!important;background:var(--bg3)!important;color:var(--muted)!important;}
+.stTextInput input{background:var(--bg3)!important;border:1px solid var(--border)!important;border-radius:8px!important;color:var(--text)!important;font-family:'DM Sans',sans-serif!important;}
+.stTextInput input:focus{border-color:var(--accent)!important;box-shadow:0 0 0 2px rgba(79,124,255,.12)!important;}
+div[data-baseweb="select"]>div{background:var(--bg3)!important;border-color:var(--border)!important;}
+.stTabs [data-baseweb="tab-list"]{background:transparent!important;border-bottom:1px solid var(--border)!important;gap:0!important;}
+.stTabs [data-baseweb="tab"]{font-family:'DM Mono',monospace!important;font-size:11px!important;color:var(--muted)!important;background:transparent!important;padding:8px 16px!important;letter-spacing:.5px!important;}
+.stTabs [aria-selected="true"]{color:var(--accent)!important;border-bottom:2px solid var(--accent)!important;}
+.stSuccess{background:rgba(61,255,160,.08)!important;border:1px solid rgba(61,255,160,.2)!important;border-radius:8px!important;}
+.stWarning{background:rgba(255,184,79,.08)!important;border:1px solid rgba(255,184,79,.2)!important;border-radius:8px!important;}
+.stInfo{background:rgba(79,124,255,.08)!important;border:1px solid rgba(79,124,255,.2)!important;border-radius:8px!important;}
+.stError{background:rgba(255,79,107,.08)!important;border:1px solid rgba(255,79,107,.2)!important;border-radius:8px!important;}
+.empty-state{text-align:center;padding:80px 20px;color:var(--muted);}
+.empty-icon{font-size:40px;margin-bottom:16px;opacity:.3;}
+.empty-title{font-family:'Syne',sans-serif;font-size:16px;font-weight:600;margin-bottom:8px;color:var(--text);opacity:.5;}
+.empty-desc{font-size:13px;line-height:1.6;}
+.log-line{font-family:'DM Mono',monospace;font-size:11px;color:var(--muted);padding:3px 0;border-bottom:1px solid var(--border);}
+.log-line .ts{color:var(--accent);margin-right:8px;}
+.log-line .ok{color:var(--success);}
+.log-line .err{color:var(--danger);}
+hr{border-color:var(--border)!important;}
+.stCaption{color:var(--muted)!important;font-size:11px!important;}
+a{color:var(--accent)!important;}
+::-webkit-scrollbar{width:4px;height:4px;}
+::-webkit-scrollbar-track{background:var(--bg);}
+::-webkit-scrollbar-thumb{background:var(--border2);border-radius:4px;}
 </style>
-"""
-st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
-
-# =========================================================
-# Session state
-# =========================================================
-defaults = {
+# ── Session state ──
+DEFAULTS = {
     "assets": [],
     "hidden_asset_ids": set(),
     "search_history": [],
-    "last_error": "",
     "search_log": [],
-    "view_mode": "grid",
+    "last_error": "",
 }
-for k, v in defaults.items():
+for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-
-# =========================================================
-# Scraper helpers
-# =========================================================
-def valid_asset(width: int, height: int) -> bool:
-    if width < 180 or height < 180:
+# ── Scraper helpers ──
+def valid_asset(w, h):
+    if w < 180 or h < 180:
         return False
-    ratio = width / height if height else 0
-    if ratio > 3.0 or ratio < 0.25:
-        return False
-    return True
+    r = w / h if h else 0
+    return 0.25 <= r <= 3.0
 
+def make_fp(item):
+    url = (item.get("image_url") or "").strip()
+    p = urlparse(url)
+    return (
+        f"{p.netloc}{p.path}",
+        (item.get("asset_type") or "").strip(),
+        (item.get("caption") or "").strip().lower()[:80],
+        item.get("width") or 0,
+        item.get("height") or 0,
+    )
 
-def make_asset_fingerprint(item):
-    image_url = (item.get("image_url") or "").strip()
-    caption = (item.get("caption") or "").strip().lower()
-    width = item.get("width") or 0
-    height = item.get("height") or 0
-    asset_type = (item.get("asset_type") or "").strip()
-    parsed = urlparse(image_url)
-    normalized_url = f"{parsed.netloc}{parsed.path}"
-    return (normalized_url, asset_type, caption[:80], width, height)
-
-
-def extract_assets_from_meta(keyword: str, country: str = "KR", max_scrolls: int = 8, max_assets: int = 80):
+def scrape(keyword, country, max_scrolls, max_assets):
     ensure_playwright_browser()
-
-    url = (
+    search_url = (
         "https://www.facebook.com/ads/library/"
         f"?active_status=all&ad_type=all&country={country}&q={quote(keyword)}"
     )
-
-    collected = []
-    seen_keys = set()
-
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-extensions",
-                "--disable-plugins",
-                "--disable-background-networking",
-                "--no-first-run",
-                "--disable-default-apps",
-            ]
+            args=["--no-sandbox","--disable-dev-shm-usage","--disable-extensions",
+                  "--disable-plugins","--disable-background-networking",
+                  "--no-first-run","--disable-default-apps"],
         )
-        context = browser.new_context(viewport={"width": 1440, "height": 2000})
-        # 폰트 파일 차단 → 로딩 속도 향상
-        context.route("**/*.{woff,woff2,ttf,otf,eot}", lambda r: r.abort())
-        page = context.new_page()
-        page.goto(url, wait_until="domcontentloaded", timeout=90000)
-        page.wait_for_timeout(4000)  # 초기 로딩 대기
+        ctx = browser.new_context(viewport={"width": 1440, "height": 2000})
+        ctx.route("**/*.{woff,woff2,ttf,otf,eot}", lambda r: r.abort())
+        page = ctx.new_page()
+        page.goto(search_url, wait_until="domcontentloaded", timeout=90000)
+        page.wait_for_timeout(4000)
 
-        def count_cards():
-            """현재 페이지에 로드된 광고 카드 수 반환"""
-            return page.evaluate("""
-                () => document.querySelectorAll('div[class*="x8gbvx8"]').length
-                  || document.querySelectorAll('div[data-visualcompletion="ignore-dynamic"]').length
-                  || document.querySelectorAll('div._7jyr').length
-                  || document.querySelectorAll('div[class*="xh8yej3"]').length
-                  || 0
-            """)
+        def card_count():
+            return page.evaluate("""() => {
+                const sels = ['div[class*="x8gbvx8"]','div[data-visualcompletion="ignore-dynamic"]','div._7jyr','div[class*="xh8yej3"]'];
+                for (const s of sels) { const n = document.querySelectorAll(s).length; if (n>0) return n; }
+                return document.querySelectorAll('img[src*="fbcdn"]').length;
+            }""")
 
-        # 스마트 스크롤: 카드가 늘어날 때까지 기다렸다가 다음 스크롤
-        prev_count = 0
-        stall_count = 0
-
-        for scroll_idx in range(max_scrolls):
+        prev, stalls = 0, 0
+        for _ in range(max_scrolls):
             page.mouse.wheel(0, 3200)
-
-            # 최대 3.5초 동안 새 카드 로드 대기
             waited = 0
             while waited < 3500:
                 page.wait_for_timeout(400)
                 waited += 400
-                cur = count_cards()
-                if cur > prev_count:
-                    prev_count = cur
-                    break
+                cur = card_count()
+                if cur > prev:
+                    prev = cur; stalls = 0; break
             else:
-                stall_count += 1
-                # 2번 연속으로 카드가 안 늘면 조기 종료
-                if stall_count >= 2:
-                    break
+                stalls += 1
+                if stalls >= 2: break
 
-        js = """
-        () => {
-            const results = [];
-
-            const imgs = Array.from(document.querySelectorAll('img'));
-            for (const img of imgs) {
+        raw = page.evaluate("""() => {
+            const out = [];
+            for (const img of document.querySelectorAll('img')) {
                 const src = img.currentSrc || img.src || '';
-                results.push({
-                    asset_type: 'image',
-                    src: src,
-                    width: img.naturalWidth || 0,
-                    height: img.naturalHeight || 0,
-                    alt: img.alt || ''
-                });
+                if (!src || src.startsWith('data:')) continue;
+                out.push({type:'image', src, w:img.naturalWidth||img.width||0, h:img.naturalHeight||img.height||0, alt:img.alt||''});
             }
-
-            const videos = Array.from(document.querySelectorAll('video'));
-            for (const video of videos) {
-                const poster = video.poster || '';
-                results.push({
-                    asset_type: 'video_poster',
-                    src: poster,
-                    width: video.videoWidth || video.clientWidth || 0,
-                    height: video.videoHeight || video.clientHeight || 0,
-                    alt: ''
-                });
+            for (const v of document.querySelectorAll('video')) {
+                const poster = v.poster || '';
+                if (!poster) continue;
+                out.push({type:'video_poster', src:poster, w:v.videoWidth||v.clientWidth||0, h:v.videoHeight||v.clientHeight||0, alt:''});
             }
+            return out;
+        }""")
+        ctx.close(); browser.close()
 
-            return results;
-        }
-        """
-
-        candidates = page.evaluate(js)
-        context.close()
-        browser.close()
-
-    for item in candidates:
-        if len(collected) >= max_assets:
-            break
-
-        src = (item.get("src") or "").strip()
-        width = int(item.get("width") or 0)
-        height = int(item.get("height") or 0)
-        alt = (item.get("alt") or "").strip()
-        asset_type = (item.get("asset_type") or "image").strip()
-
-        if not src or src.startswith("data:"):
-            continue
-        if not valid_asset(width, height):
-            continue
-
-        asset = {
-            "id": str(uuid.uuid4()),
-            "keyword": keyword,
-            "country": country,
-            "asset_type": asset_type,
-            "image_url": src,
-            "source_url": url,
-            "caption": alt,
-            "width": width,
-            "height": height,
-            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "starred": False,
-        }
-
-        fp = make_asset_fingerprint(asset)
-        if fp in seen_keys:
-            continue
-
-        seen_keys.add(fp)
-        collected.append(asset)
-
+    seen, collected, now = set(), [], time.strftime("%Y-%m-%d %H:%M:%S")
+    for r in raw:
+        if len(collected) >= max_assets: break
+        src = (r.get("src") or "").strip()
+        w, h = int(r.get("w") or 0), int(r.get("h") or 0)
+        if not src or not valid_asset(w, h): continue
+        asset = {"id":str(uuid.uuid4()),"keyword":keyword,"country":country,
+                 "asset_type":r.get("type","image"),"image_url":src,
+                 "source_url":search_url,"caption":(r.get("alt") or "").strip(),
+                 "width":w,"height":h,"created_at":now,"starred":False}
+        fp = make_fp(asset)
+        if fp in seen: continue
+        seen.add(fp); collected.append(asset)
     return collected
 
+def merge(existing, new_items, hidden_ids):
+    known = {make_fp(a) for a in existing}
+    known |= {make_fp(a) for a in existing if a["id"] in hidden_ids}
+    out, added = list(existing), 0
+    for item in new_items:
+        fp = make_fp(item)
+        if fp in known: continue
+        known.add(fp); out.append(item); added += 1
+    return out, added
 
-# =========================================================
-# App helpers
-# =========================================================
-def merge_assets(existing_assets, new_assets, hidden_ids=None):
-    """
-    기존 소재 + 제외된 소재의 fingerprint를 모두 기억해
-    새 결과에서 중복·제외 소재를 빼고 신규 소재만 추가한다.
-    """
-    # 현재 보드에 있는 모든 소재 fingerprint (보이는 것 + 제외된 것 모두)
-    existing_keys = {make_asset_fingerprint(item) for item in existing_assets}
-
-    # 제외된 소재의 fingerprint도 블랙리스트에 추가
-    if hidden_ids:
-        hidden_fps = {
-            make_asset_fingerprint(item)
-            for item in existing_assets
-            if item["id"] in hidden_ids
-        }
-        existing_keys |= hidden_fps
-
-    merged = list(existing_assets)
-    added_count = 0
-    for item in new_assets:
-        fp = make_asset_fingerprint(item)
-        if fp in existing_keys:
-            continue
-        merged.append(item)
-        existing_keys.add(fp)
-        added_count += 1
-    return merged, added_count
-
-
-def visible_assets(asset_filter="전체", kw_filter=None):
+def get_visible(filter_type, filter_kw, filter_star):
     hidden = st.session_state.hidden_asset_ids
     items = [a for a in st.session_state.assets if a["id"] not in hidden]
-    if asset_filter != "전체":
-        items = [a for a in items if a["asset_type"] == asset_filter]
-    if kw_filter and kw_filter != "전체":
-        items = [a for a in items if a["keyword"] == kw_filter]
+    if filter_type != "전체":
+        items = [a for a in items if a["asset_type"] == filter_type]
+    if filter_kw and filter_kw != "전체":
+        items = [a for a in items if a["keyword"] == filter_kw]
+    if filter_star:
+        items = [a for a in items if a.get("starred")]
     return items
 
-
-def reset_board():
+def reset():
     st.session_state.assets = []
     st.session_state.hidden_asset_ids = set()
     st.session_state.search_history = []
-    st.session_state.last_error = ""
     st.session_state.search_log = []
+    st.session_state.last_error = ""
 
-
-def toggle_star(asset_id):
+def star_toggle(asset_id):
     for a in st.session_state.assets:
         if a["id"] == asset_id:
             a["starred"] = not a.get("starred", False)
             break
 
-
-def get_csv_data(assets):
+def get_csv(assets):
     import csv
-    output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=["keyword", "country", "asset_type", "image_url", "source_url", "caption", "width", "height", "created_at"])
-    writer.writeheader()
+    fields = ["keyword","country","asset_type","image_url","source_url","caption","width","height","created_at","starred"]
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=fields)
+    w.writeheader()
     for a in assets:
-        writer.writerow({k: a.get(k, "") for k in writer.fieldnames})
-    return output.getvalue().encode("utf-8-sig")
+        w.writerow({f: a.get(f, "") for f in fields})
+    return buf.getvalue().encode("utf-8-sig")
 
-
-# =========================================================
-# Header
-# =========================================================
+# ── Header ──
 st.markdown("""
 <div class="ad-header">
-    <div class="ad-header-inner">
-        <div class="ad-logo">AD<span>INTEL</span></div>
-        <div class="ad-version">v2.0</div>
-    </div>
-    <div class="ad-subtitle">META AD LIBRARY INTELLIGENCE BOARD</div>
+  <div class="ad-header-inner">
+    <div class="ad-logo">AD<span>INTEL</span></div>
+    <div class="ad-version">v2.1</div>
+  </div>
+  <div class="ad-subtitle">META AD LIBRARY INTELLIGENCE BOARD</div>
 </div>
 """, unsafe_allow_html=True)
 
-
-# =========================================================
-# Sidebar
-# =========================================================
+# ── Sidebar ──
 with st.sidebar:
     st.markdown('<div class="sidebar-label">수집 설정</div>', unsafe_allow_html=True)
-
-    country = st.selectbox(
-        "국가",
-        ["KR", "US", "JP", "GB", "SG", "AU"],
-        index=0,
-        label_visibility="collapsed",
-    )
+    country = st.selectbox("국가", ["KR","US","JP","GB","SG","AU"], index=0, label_visibility="collapsed")
     st.caption(f"대상 국가: **{country}**")
-
     max_scrolls = st.slider("스크롤 깊이", 3, 15, 8, 1)
-    max_assets = st.slider("최대 수집량", 10, 120, 50, 10)
+    max_assets  = st.slider("최대 수집량", 10, 150, 60, 10)
+    st.markdown("---")
 
-    st.markdown('<div style="height:16px"></div>', unsafe_allow_html=True)
     st.markdown('<div class="sidebar-label">뷰 설정</div>', unsafe_allow_html=True)
+    filter_type = st.selectbox("소재 타입", ["전체","image","video_poster"], label_visibility="collapsed")
+    all_kws     = ["전체"] + list(dict.fromkeys(a["keyword"] for a in st.session_state.assets))
+    filter_kw   = st.selectbox("키워드 필터", all_kws, label_visibility="collapsed")
+    filter_star = st.toggle("⭐ 즐겨찾기만 보기", value=False)
+    col_count   = st.select_slider("열 수", options=[2,3,4,5], value=4)
+    st.markdown("---")
 
-    asset_filter = st.selectbox("소재 타입", ["전체", "image", "video_poster"])
+    st.markdown('<div class="sidebar-label">정렬</div>', unsafe_allow_html=True)
+    sort_by = st.selectbox("정렬 기준", ["최신순","오래된순","키워드순","즐겨찾기순"], label_visibility="collapsed")
+    st.markdown("---")
 
-    all_keywords = ["전체"] + list(dict.fromkeys(
-        [a["keyword"] for a in st.session_state.assets]
-    ))
-    kw_filter = st.selectbox("키워드 필터", all_keywords)
-
-    col_count = st.select_slider("열 수", options=[2, 3, 4, 5], value=4)
-
-    st.markdown('<div style="height:16px"></div>', unsafe_allow_html=True)
     st.markdown('<div class="sidebar-label">데이터 관리</div>', unsafe_allow_html=True)
+    shown_for_export = get_visible(filter_type, filter_kw if filter_kw != "전체" else None, filter_star)
+    starred_assets   = [a for a in st.session_state.assets if a.get("starred")]
 
-    shown = visible_assets(asset_filter, kw_filter if kw_filter != "전체" else None)
+    if shown_for_export:
+        st.download_button("📥 현재 보드 CSV", data=get_csv(shown_for_export),
+            file_name=f"adintel_{time.strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv", use_container_width=True)
+    if starred_assets:
+        st.download_button("⭐ 즐겨찾기 CSV", data=get_csv(starred_assets),
+            file_name=f"adintel_starred_{time.strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv", use_container_width=True)
 
-    if shown:
-        csv_data = get_csv_data(shown)
-        st.download_button(
-            "CSV 내보내기",
-            data=csv_data,
-            file_name=f"ad_intel_{time.strftime('%Y%m%d_%H%M')}.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+    st.markdown('<div style="height:6px"></div>', unsafe_allow_html=True)
+    if st.button("🗑 보드 초기화", use_container_width=True):
+        reset(); st.rerun()
 
-    st.markdown('<div style="height:8px"></div>', unsafe_allow_html=True)
-
-    if st.button("보드 초기화", use_container_width=True):
-        reset_board()
-        st.rerun()
-
-    # 검색 로그
     if st.session_state.search_log:
-        st.markdown('<div style="height:16px"></div>', unsafe_allow_html=True)
+        st.markdown("---")
         st.markdown('<div class="sidebar-label">검색 로그</div>', unsafe_allow_html=True)
-        for log in reversed(st.session_state.search_log[-6:]):
-            status = "ok" if log["success"] else "err"
-            symbol = "+" if log["success"] else "!"
+        for log in reversed(st.session_state.search_log[-8:]):
+            cls = "ok" if log["success"] else "err"
+            sym = "+" if log["success"] else "!"
             st.markdown(
-                f'<div class="log-line">'
-                f'<span class="ts">{log["time"]}</span>'
-                f'<span class="{status}">[{symbol}] {log["keyword"]} — {log["count"]}건</span>'
-                f'</div>',
-                unsafe_allow_html=True
-            )
+                f'<div class="log-line"><span class="ts">{log["time"]}</span>'
+                f'<span class="{cls}">[{sym}] {log["keyword"]} — {log["count"]}건</span></div>',
+                unsafe_allow_html=True)
 
-
-# =========================================================
-# Search bar
-# =========================================================
+# ── Search bar ──
 st.markdown('<div class="search-wrapper">', unsafe_allow_html=True)
 st.markdown('<div class="search-label">⌕ 키워드 검색</div>', unsafe_allow_html=True)
-
-search_col, btn_col1, btn_col2 = st.columns([5, 1, 1])
-
-with search_col:
-    keyword = st.text_input(
-        "keyword",
+sc, b1, b2 = st.columns([5, 1, 1])
+with sc:
+    keyword = st.text_input("keyword",
         placeholder="예: 캐리어, 공기청정기, 스킨케어, 다이어트",
         label_visibility="collapsed",
-        on_change=lambda: st.session_state.update({"enter_search": True}),
-    )
+        on_change=lambda: st.session_state.update({"_enter": True}))
+with b1:
+    btn_search = st.button("검색", use_container_width=True)
+with b2:
+    btn_add = st.button("누적 검색", use_container_width=True)
 
-with btn_col1:
-    search_clicked = st.button("검색", use_container_width=True)
+enter_fired = st.session_state.pop("_enter", False)
+if enter_fired:
+    btn_search = True
 
-with btn_col2:
-    add_clicked = st.button("누적 검색", use_container_width=True)
-
-# 엔터 검색 처리
-enter_search = st.session_state.pop("enter_search", False)
-if enter_search:
-    search_clicked = True
-
-st.caption("↵ 엔터로 바로 검색 · 누적 검색: 기존 보드에 결과 추가")
+st.caption("↵ 엔터 = 새 검색  ·  누적 검색 = 기존 보드에 추가 (중복·제외 자동 제외)")
 st.markdown('</div>', unsafe_allow_html=True)
 
-
-# =========================================================
-# Search logic
-# =========================================================
-if search_clicked or add_clicked:
-    cleaned = (keyword or "").strip()
-    if not cleaned:
+# ── Search logic ──
+if btn_search or btn_add:
+    kw = (keyword or "").strip()
+    if not kw:
         st.warning("검색어를 입력하세요.")
     else:
         try:
-            if search_clicked:
+            if btn_search:
                 st.session_state.assets = []
                 st.session_state.hidden_asset_ids = set()
+                st.session_state.search_history = []
 
-            with st.spinner(f"'{cleaned}' 수집 중 — Meta Ad Library 실시간 접근 중..."):
-                new_results = extract_assets_from_meta(
-                    keyword=cleaned,
-                    country=country,
-                    max_scrolls=max_scrolls,
-                    max_assets=max_assets,
-                )
+            with st.spinner(f"'{kw}' 수집 중 — Meta Ad Library 실시간 접근..."):
+                new_items = scrape(kw, country, max_scrolls, max_assets)
 
-            merged, added_count = merge_assets(st.session_state.assets, new_results, hidden_ids=st.session_state.hidden_asset_ids)
+            merged, added = merge(st.session_state.assets, new_items, st.session_state.hidden_asset_ids)
             st.session_state.assets = merged
-            st.session_state.last_error = ""
 
-            if cleaned not in st.session_state.search_history:
-                st.session_state.search_history.append(cleaned)
+            if kw not in st.session_state.search_history:
+                st.session_state.search_history.append(kw)
 
-            st.session_state.search_log.append({
-                "time": time.strftime("%H:%M"),
-                "keyword": cleaned,
-                "count": added_count,
-                "success": True,
-            })
+            st.session_state.search_log.append({"time": time.strftime("%H:%M"), "keyword": kw, "count": added, "success": True})
 
-            if added_count == 0:
-                st.info("새로 추가된 소재가 없습니다. 중복이거나 검색 결과가 적을 수 있어요.")
+            if added == 0:
+                st.info("새로 추가된 소재가 없습니다.")
             else:
-                st.success(f"✓  {added_count}개 소재 수집 완료")
-
+                st.success(f"✓ {added}개 소재 수집 완료")
             st.rerun()
 
         except Exception as e:
-            st.session_state.last_error = str(e)
-            st.session_state.search_log.append({
-                "time": time.strftime("%H:%M"),
-                "keyword": cleaned,
-                "count": 0,
-                "success": False,
-            })
+            st.session_state.search_log.append({"time": time.strftime("%H:%M"), "keyword": kw, "count": 0, "success": False})
             st.error(f"오류: {e}")
 
+# ── Stats ──
+all_assets   = st.session_state.assets
+shown_assets = get_visible(filter_type, filter_kw if filter_kw != "전체" else None, filter_star)
 
-# =========================================================
-# Stats row
-# =========================================================
-all_assets = st.session_state.assets
-shown_assets = visible_assets(asset_filter, kw_filter if kw_filter != "전체" else None)
+if sort_by == "최신순":
+    shown_assets = sorted(shown_assets, key=lambda a: a["created_at"], reverse=True)
+elif sort_by == "오래된순":
+    shown_assets = sorted(shown_assets, key=lambda a: a["created_at"])
+elif sort_by == "키워드순":
+    shown_assets = sorted(shown_assets, key=lambda a: a["keyword"])
+elif sort_by == "즐겨찾기순":
+    shown_assets = sorted(shown_assets, key=lambda a: (not a.get("starred"), a["created_at"]))
 
-img_count = sum(1 for a in shown_assets if a["asset_type"] == "image")
-vid_count = sum(1 for a in shown_assets if a["asset_type"] == "video_poster")
-hidden_count = len(st.session_state.hidden_asset_ids)
-kw_count = len(set(a["keyword"] for a in all_assets))
+img_cnt  = sum(1 for a in shown_assets if a["asset_type"] == "image")
+vid_cnt  = sum(1 for a in shown_assets if a["asset_type"] == "video_poster")
+star_cnt = sum(1 for a in all_assets if a.get("starred"))
+hid_cnt  = len(st.session_state.hidden_asset_ids)
+kw_cnt   = len(set(a["keyword"] for a in all_assets))
 
-s1, s2, s3, s4 = st.columns(4)
-
-with s1:
-    st.markdown(f"""
-    <div class="stat-card">
-        <div class="stat-label">TOTAL ASSETS</div>
-        <div class="stat-value">{len(all_assets)}</div>
-        <div class="stat-sub">누적 수집 소재</div>
+c1,c2,c3,c4,c5 = st.columns(5)
+for col, label, val, sub in [
+    (c1,"TOTAL",    len(all_assets),   "누적 수집"),
+    (c2,"DISPLAYED",len(shown_assets), f"IMG {img_cnt} · VID {vid_cnt}"),
+    (c3,"KEYWORDS", kw_cnt,            "검색 키워드"),
+    (c4,"STARRED",  star_cnt,          "즐겨찾기"),
+    (c5,"HIDDEN",   hid_cnt,           "제외 소재"),
+]:
+    col.markdown(f"""<div class="stat-card">
+        <div class="stat-label">{label}</div>
+        <div class="stat-value">{val}</div>
+        <div class="stat-sub">{sub}</div>
     </div>""", unsafe_allow_html=True)
 
-with s2:
-    st.markdown(f"""
-    <div class="stat-card">
-        <div class="stat-label">DISPLAYED</div>
-        <div class="stat-value">{len(shown_assets)}</div>
-        <div class="stat-sub">이미지 {img_count} · 영상 {vid_count}</div>
-    </div>""", unsafe_allow_html=True)
-
-with s3:
-    st.markdown(f"""
-    <div class="stat-card">
-        <div class="stat-label">KEYWORDS</div>
-        <div class="stat-value">{kw_count}</div>
-        <div class="stat-sub">검색 키워드 수</div>
-    </div>""", unsafe_allow_html=True)
-
-with s4:
-    st.markdown(f"""
-    <div class="stat-card">
-        <div class="stat-label">HIDDEN</div>
-        <div class="stat-value">{hidden_count}</div>
-        <div class="stat-sub">제외 처리 소재</div>
-    </div>""", unsafe_allow_html=True)
-
-
-# =========================================================
-# Keyword tags
-# =========================================================
+# ── Keyword tags ──
 if st.session_state.search_history:
-    tags_html = '<div class="tag-wrap">'
-    for kw in st.session_state.search_history[-15:]:
-        count = sum(1 for a in all_assets if a["keyword"] == kw)
-        tags_html += f'<span class="kw-tag"><span class="dot"></span>{kw} <span style="opacity:0.5">({count})</span></span>'
-    tags_html += '</div>'
-    st.markdown(tags_html, unsafe_allow_html=True)
+    html = '<div class="tag-wrap">'
+    for kw in st.session_state.search_history[-20:]:
+        cnt = sum(1 for a in all_assets if a["keyword"] == kw)
+        html += f'<span class="kw-tag"><span class="dot"></span>{kw} <span style="opacity:.5">({cnt})</span></span>'
+    html += "</div>"
+    st.markdown(html, unsafe_allow_html=True)
 
-
-# =========================================================
-# Board
-# =========================================================
-st.markdown(f"""
-<div class="section-header">
-    <div class="section-title">소재 보드</div>
-    <div class="section-count">{len(shown_assets)} assets</div>
-</div>
-""", unsafe_allow_html=True)
+# ── Board ──
+st.markdown(f"""<div class="section-header">
+  <div class="section-title">소재 보드</div>
+  <div class="section-count">{len(shown_assets)} assets · {sort_by}</div>
+</div>""", unsafe_allow_html=True)
 
 if not shown_assets:
-    st.markdown("""
-    <div class="empty-state">
+    st.markdown("""<div class="empty-state">
         <div class="empty-icon">◻</div>
         <div class="empty-title">수집된 소재가 없습니다</div>
         <div class="empty-desc">키워드를 입력하고 검색하면<br>Meta Ad Library에서 광고 소재를 실시간으로 수집합니다.</div>
-    </div>
-    """, unsafe_allow_html=True)
+    </div>""", unsafe_allow_html=True)
 else:
     cols = st.columns(col_count)
-
     for idx, item in enumerate(shown_assets):
-        col = cols[idx % col_count]
-        with col:
-            badge_class = "badge-image" if item["asset_type"] == "image" else "badge-video"
-            badge_label = "IMG" if item["asset_type"] == "image" else "VID"
-            caption_html = f'<div class="asset-caption">"{item["caption"][:60]}..."</div>' if item.get("caption") else ""
+        with cols[idx % col_count]:
+            try:
+                st.image(item["image_url"], use_container_width=True)
+            except Exception:
+                st.markdown('<div style="height:120px;background:var(--bg3);border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:11px">이미지 로드 실패</div>', unsafe_allow_html=True)
 
-            st.markdown(f'<div class="asset-card">', unsafe_allow_html=True)
-            st.image(item["image_url"], use_container_width=True)
-            st.markdown(f"""
-            <div class="asset-body">
-                <div class="asset-kw">{item["keyword"]}</div>
-                <span class="asset-type-badge {badge_class}">{badge_label}</span>
-                {caption_html}
-                <div class="asset-meta">
-                    {item["width"]} × {item["height"]}px · {item["created_at"][11:16]}
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
+            badge_cls = "badge-image" if item["asset_type"] == "image" else "badge-video"
+            badge_lbl = "IMG" if item["asset_type"] == "image" else "VID"
+            star_badge = '<span class="asset-type-badge badge-star">★</span> ' if item.get("starred") else ""
+            cap = item.get("caption", "")
+            cap_html = f'<div class="asset-caption">"{cap[:55]}{"..." if len(cap)>55 else ""}"</div>' if cap else ""
 
-            a1, a2 = st.columns(2)
-            with a1:
-                if st.button("제외", key=f"del_{item['id']}", use_container_width=True):
-                    st.session_state.hidden_asset_ids.add(item["id"])
-                    st.rerun()
-            with a2:
+            st.markdown(f"""<div class="asset-body">
+                <div class="asset-kw">{item["keyword"]} · {item["country"]}</div>
+                {star_badge}<span class="asset-type-badge {badge_cls}">{badge_lbl}</span>
+                {cap_html}
+                <div class="asset-meta">{item["width"]}×{item["height"]}px · {item["created_at"][11:16]}</div>
+            </div>""", unsafe_allow_html=True)
+
+            ba, bb, bc = st.columns(3)
+            with ba:
+                star_lbl = "★ 해제" if item.get("starred") else "☆ 저장"
+                if st.button(star_lbl, key=f"star_{item['id']}", use_container_width=True):
+                    star_toggle(item["id"]); st.rerun()
+            with bb:
+                if st.button("제외", key=f"hide_{item['id']}", use_container_width=True):
+                    st.session_state.hidden_asset_ids.add(item["id"]); st.rerun()
+            with bc:
                 st.link_button("원본 →", item["source_url"], use_container_width=True)
 
-            st.markdown('</div>', unsafe_allow_html=True)
-
-
-# =========================================================
-# Footer
-# =========================================================
-st.markdown('<div style="height:40px"></div>', unsafe_allow_html=True)
-st.markdown(f"""
-<div style="border-top:1px solid var(--border);padding-top:16px;display:flex;justify-content:space-between;align-items:center;">
-    <span style="font-family:'DM Mono',monospace;font-size:10px;color:var(--muted)">
-        AD INTEL · META AD LIBRARY INTELLIGENCE
-    </span>
-    <span style="font-family:'DM Mono',monospace;font-size:10px;color:var(--muted)">
-        세션 메모리 기반 · 로컬 저장 없음 · {time.strftime("%Y-%m-%d")}
-    </span>
-</div>
-""", unsafe_allow_html=True)
+# ── Footer ──
+st.markdown("<div style='height:40px'></div>", unsafe_allow_html=True)
+st.markdown(f"""<div style="border-top:1px solid var(--border);padding-top:14px;display:flex;justify-content:space-between;align-items:center;">
+  <span style="font-family:'DM Mono',monospace;font-size:10px;color:var(--muted)">ADINTEL v2.1 · META AD LIBRARY INTELLIGENCE</span>
+  <span style="font-family:'DM Mono',monospace;font-size:10px;color:var(--muted)">세션 메모리 기반 · {time.strftime("%Y-%m-%d")}</span>
+</div>""", unsafe_allow_html=True)
