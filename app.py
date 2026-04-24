@@ -574,11 +574,39 @@ def extract_assets_from_meta(keyword: str, country: str = "KR", max_scrolls: int
         context.route("**/*.{woff,woff2,ttf,otf,eot}", lambda r: r.abort())
         page = context.new_page()
         page.goto(url, wait_until="domcontentloaded", timeout=90000)
-        page.wait_for_timeout(3500)  # 7000 → 3500ms
+        page.wait_for_timeout(4000)  # 초기 로딩 대기
 
-        for _ in range(max_scrolls):
+        def count_cards():
+            """현재 페이지에 로드된 광고 카드 수 반환"""
+            return page.evaluate("""
+                () => document.querySelectorAll('div[class*="x8gbvx8"]').length
+                  || document.querySelectorAll('div[data-visualcompletion="ignore-dynamic"]').length
+                  || document.querySelectorAll('div._7jyr').length
+                  || document.querySelectorAll('div[class*="xh8yej3"]').length
+                  || 0
+            """)
+
+        # 스마트 스크롤: 카드가 늘어날 때까지 기다렸다가 다음 스크롤
+        prev_count = 0
+        stall_count = 0
+
+        for scroll_idx in range(max_scrolls):
             page.mouse.wheel(0, 3200)
-            page.wait_for_timeout(1100)  # 1800 → 1100ms
+
+            # 최대 3.5초 동안 새 카드 로드 대기
+            waited = 0
+            while waited < 3500:
+                page.wait_for_timeout(400)
+                waited += 400
+                cur = count_cards()
+                if cur > prev_count:
+                    prev_count = cur
+                    break
+            else:
+                stall_count += 1
+                # 2번 연속으로 카드가 안 늘면 조기 종료
+                if stall_count >= 2:
+                    break
 
         js = """
         () => {
