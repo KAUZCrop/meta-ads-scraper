@@ -658,8 +658,23 @@ def extract_assets_from_meta(keyword: str, country: str = "KR", max_scrolls: int
 # =========================================================
 # App helpers
 # =========================================================
-def merge_assets(existing_assets, new_assets):
+def merge_assets(existing_assets, new_assets, hidden_ids=None):
+    """
+    기존 소재 + 제외된 소재의 fingerprint를 모두 기억해
+    새 결과에서 중복·제외 소재를 빼고 신규 소재만 추가한다.
+    """
+    # 현재 보드에 있는 모든 소재 fingerprint (보이는 것 + 제외된 것 모두)
     existing_keys = {make_asset_fingerprint(item) for item in existing_assets}
+
+    # 제외된 소재의 fingerprint도 블랙리스트에 추가
+    if hidden_ids:
+        hidden_fps = {
+            make_asset_fingerprint(item)
+            for item in existing_assets
+            if item["id"] in hidden_ids
+        }
+        existing_keys |= hidden_fps
+
     merged = list(existing_assets)
     added_count = 0
     for item in new_assets:
@@ -839,7 +854,7 @@ if search_clicked or add_clicked:
                     max_assets=max_assets,
                 )
 
-            merged, added_count = merge_assets(st.session_state.assets, new_results)
+            merged, added_count = merge_assets(st.session_state.assets, new_results, hidden_ids=st.session_state.hidden_asset_ids)
             st.session_state.assets = merged
             st.session_state.last_error = ""
 
