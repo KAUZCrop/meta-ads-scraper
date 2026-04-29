@@ -2,6 +2,7 @@
 # AD INTEL v3.2 — Meta Ad Library Intelligence Board
 # ============================================================
 import sys, asyncio, subprocess, time, uuid, io, json, requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
 from urllib.parse import quote, urlparse
 from playwright.sync_api import sync_playwright
@@ -138,6 +139,22 @@ html,body,[class*="css"]{{font-family:'DM Sans',sans-serif;background:var(--bg)!
 .dot-off{{background:var(--mu);}}
 .banner-txt{{font-family:'DM Mono',monospace;font-size:11px;color:var(--tx2);}}
 
+/* 총합 인사이트 */
+.summary-box{{background:var(--bg2);border:2px solid var(--ac);border-radius:16px;padding:24px 28px;margin-bottom:1.5rem;}}
+.summary-head{{font-family:'Syne',sans-serif;font-size:16px;font-weight:800;color:var(--ac);margin-bottom:16px;letter-spacing:.5px;}}
+.summary-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px;}}
+.summary-item{{background:var(--bg);border:1px solid var(--bd);border-radius:10px;padding:12px 14px;}}
+.summary-item-lbl{{font-family:'DM Mono',monospace;font-size:9px;color:var(--mu);letter-spacing:1px;text-transform:uppercase;margin-bottom:6px;}}
+.summary-item-val{{font-size:13px;color:var(--tx);line-height:1.5;}}
+.summary-strategy{{background:var(--ac2);border:1px solid var(--ac2);border-radius:10px;padding:14px 16px;margin-bottom:12px;}}
+.summary-strategy-lbl{{font-family:'DM Mono',monospace;font-size:9px;color:var(--ac);letter-spacing:1px;text-transform:uppercase;margin-bottom:8px;}}
+.summary-strategy-val{{font-size:13px;color:var(--tx2);line-height:1.65;}}
+.summary-tags{{display:flex;flex-wrap:wrap;gap:6px;}}
+.summary-tag{{font-family:'DM Mono',monospace;font-size:10px;background:var(--ac2);color:var(--ac);border:1px solid var(--ac2);border-radius:4px;padding:3px 9px;}}
+.sel-bar{{display:flex;align-items:center;background:var(--bg2);border:1.5px solid var(--bd);border-radius:10px;padding:10px 16px;margin-bottom:1rem;}}
+.sel-count{{font-family:'Syne',sans-serif;font-size:14px;font-weight:800;color:var(--ac);margin-right:6px;}}
+.sel-bar-txt{{font-family:'DM Mono',monospace;font-size:11px;color:var(--tx2);}}
+
 /* 빈 상태 */
 .empty{{text-align:center;padding:80px 20px;}}
 .empty-t{{font-family:'Syne',sans-serif;font-size:16px;font-weight:700;color:var(--mu);margin-bottom:8px;}}
@@ -264,7 +281,7 @@ def analyze(image_url, keyword):
             headers={"x-api-key":API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},
             json={
                 "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 500,
+                "max_tokens": 350,
                 "messages": [{"role":"user","content":f"""광고 전략 전문가로서 Meta 광고 소재를 분석해주세요.
 
 검색 키워드: {keyword}
@@ -283,13 +300,55 @@ def analyze(image_url, keyword):
     except Exception:
         return None
 
-def auto_analyze(items):
-    """수집 직후 AI ON이면 전체 자동 분석"""
-    if not st.session_state.ai_on or not API_KEY: return items
-    for item in items:
-        if not item.get("ai"):
-            item["ai"] = analyze(item["image_url"], item["keyword"])
+def analyze_parallel(items, max_workers=6):
+    """병렬 처리로 빠른 AI 분석 (순차 대비 4~6배 빠름)"""
+    if not API_KEY: return items
+    id_map = {item["id"]: item for item in items}
+
+    def task(item):
+        return item["id"], analyze(item["image_url"], item["keyword"])
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(task, item): item["id"] for item in items if not item.get("ai")}
+        for future in as_completed(futures):
+            aid, result = future.result()
+            if result and aid in id_map:
+                id_map[aid]["ai"] = result
     return items
+
+
+def summarize_insights(analyzed_items) -> dict | None:
+    """분석된 소재들을 종합해 총합 인사이트 생성"""
+    if not API_KEY or not analyzed_items: return None
+    snippets = []
+    for a in analyzed_items[:20]:  # 최대 20개
+        ai = a.get("ai", {})
+        if not ai: continue
+        snippets.append(
+            f"- 소구:{ai.get('appeal','')} / 타겟:{ai.get('target','')} / 메시지:{ai.get('message','')}"
+        )
+    if not snippets: return None
+    try:
+        prompt = f"""광고 전략 전문가입니다. 아래는 Meta 광고 소재 분석 결과들입니다.
+
+{chr(10).join(snippets)}
+
+이 소재들을 종합해 아래 JSON만 반환 (마크다운·백틱 없이):
+{{"dominant_appeal":"가장 많이 쓰인 소구 유형 + 비율 설명","common_target":"공통 타겟 고객 요약","key_message":"반복되는 핵심 메시지 패턴","strategy":"이 광고들이 공유하는 전략적 방향 (2~3문장)","recommendations":"경쟁 우위를 위한 차별화 제안 (2~3문장)","tags":["태그1","태그2","태그3","태그4","태그5"]}}"""
+
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={{"x-api-key":API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"}},
+            json={{"model":"claude-haiku-4-5-20251001","max_tokens":600,
+                  "messages":[{{"role":"user","content":prompt}}]}},
+            timeout=30,
+        )
+        if resp.status_code != 200: return None
+        txt = resp.json()["content"][0]["text"].strip()
+        s, e = txt.find("{{"), txt.rfind("}}")+1
+        return json.loads(txt[s:e]) if s != -1 and e > 0 else None
+    except Exception:
+        return None
 
 
 # ============================================================
@@ -427,7 +486,7 @@ with st.sidebar:
 if ai_on and API_KEY:
     st.markdown("""<div class="banner">
         <div class="dot dot-on"></div>
-        <span class="banner-txt">AI 자동 분석 <b>ON</b> &nbsp;—&nbsp; 검색 직후 전체 소재 자동 분석 &nbsp;·&nbsp; Claude Haiku</span>
+        <span class="banner-txt">AI 분석 <b>ON</b> &nbsp;—&nbsp; 소재 선택 후 일괄 분석 (병렬 처리) &nbsp;·&nbsp; Claude Haiku</span>
     </div>""", unsafe_allow_html=True)
 elif ai_on and not API_KEY:
     st.markdown("""<div class="banner banner-w">
@@ -473,14 +532,6 @@ if do_new or do_add:
             # 1. 스크래핑
             with st.spinner(f"'{q}' 수집 중..."):
                 items = scrape(q, country, scrolls, max_n)
-
-            # 2. AI 자동 분석 (ON + API Key 있을 때)
-            if ai_on and API_KEY and items:
-                pb = st.progress(0, text="AI 분석 중...")
-                for i, item in enumerate(items):
-                    item["ai"] = analyze(item["image_url"], item["keyword"])
-                    pb.progress((i+1)/len(items), text=f"AI 분석 중... {i+1}/{len(items)}")
-                pb.empty()
 
             # 3. 병합
             merged, added = merge(st.session_state.assets, items)
@@ -540,21 +591,91 @@ if st.session_state.history:
     st.markdown(html, unsafe_allow_html=True)
 
 
+
+# ============================================================
+# 총합 인사이트 패널
+# ============================================================
+summary = st.session_state.get("summary")
+if summary:
+    tags_html = "".join(f'<span class="summary-tag">{t}</span>' for t in summary.get("tags",[]))
+    st.markdown(
+        '<div class="summary-box">' +
+        '<div class="summary-head">TOTAL INSIGHT â 선택 소재 종합 분석</div>' +
+        '<div class="summary-grid">' +
+        '<div class="summary-item"><div class="summary-item-lbl">DOMINANT APPEAL</div>' +
+        f'<div class="summary-item-val">{summary.get("dominant_appeal","—")}</div></div>' +
+        '<div class="summary-item"><div class="summary-item-lbl">COMMON TARGET</div>' +
+        f'<div class="summary-item-val">{summary.get("common_target","—")}</div></div>' +
+        '<div class="summary-item"><div class="summary-item-lbl">KEY MESSAGE PATTERN</div>' +
+        f'<div class="summary-item-val">{summary.get("key_message","—")}</div></div>' +
+        '<div class="summary-item"><div class="summary-item-lbl">KEYWORDS</div>' +
+        f'<div class="summary-item-val"><div class="summary-tags">{tags_html}</div></div></div>' +
+        '</div>' +
+        '<div class="summary-strategy"><div class="summary-strategy-lbl">STRATEGY</div>' +
+        f'<div class="summary-strategy-val">{summary.get("strategy","—")}</div></div>' +
+        '<div class="summary-strategy" style="margin-bottom:0"><div class="summary-strategy-lbl">RECOMMENDATIONS</div>' +
+        f'<div class="summary-strategy-val">{summary.get("recommendations","—")}</div></div>' +
+        '</div>',
+        unsafe_allow_html=True)
+    if st.button("인사이트 초기화", key="clear_summary"):
+        st.session_state.summary = None
+        st.session_state.selected = set()
+        st.rerun()
+
 # ============================================================
 # 소재 보드
 # ============================================================
-st.markdown(f'<div class="sec"><div class="sec-t">소재 보드</div>'
-            f'<div class="sec-n">{len(shown)} assets · {sort}</div></div>',
+sel = st.session_state.selected
+
+# 섹션 헤더
+st.markdown(
+    f'<div class="sec"><div class="sec-t">소재 보드</div>' +
+    f'<div class="sec-n">{len(shown)} assets · {sort}</div></div>',
+    unsafe_allow_html=True)
+
+# 선택 바 + 일괄 분석 버튼
+if ai_on and API_KEY and shown:
+    sel_items     = [a for a in st.session_state.assets if a["id"] in sel]
+    sel_unanalyzed = [a for a in sel_items if not a.get("ai")]
+    analyzed_sel  = [a for a in sel_items if a.get("ai")]
+
+    bar_c, btn_c1, btn_c2 = st.columns([4, 1, 1])
+    with bar_c:
+        st.markdown(
+            f'<div class="sel-bar"><span class="sel-count">{len(sel)}</span>' +
+            '<span class="sel-bar-txt">선택됨  ·  SELECT 버튼으로 소재를 골라주세요</span></div>',
             unsafe_allow_html=True)
+    with btn_c1:
+        if sel_unanalyzed:
+            if st.button(f"선택 분석 ({len(sel_unanalyzed)})", use_container_width=True):
+                pb = st.progress(0, text="병렬 분석 중...")
+                result_items = analyze_parallel(sel_unanalyzed, max_workers=6)
+                id_map = {a["id"]: a for a in st.session_state.assets}
+                done = 0
+                for it in result_items:
+                    if it.get("ai") and it["id"] in id_map:
+                        id_map[it["id"]]["ai"] = it["ai"]
+                        done += 1
+                pb.progress(1.0, text=f"완료! {done}개 분석")
+                pb.empty()
+                st.rerun()
+    with btn_c2:
+        if analyzed_sel:
+            if st.button(f"종합 인사이트 ({len(analyzed_sel)})", use_container_width=True):
+                with st.spinner("종합 인사이트 생성 중..."):
+                    st.session_state.summary = summarize_insights(analyzed_sel)
+                st.rerun()
 
 if not shown:
-    st.markdown('<div class="empty"><div class="empty-t">수집된 소재가 없습니다</div>'
-                '<div class="empty-d">키워드를 입력하고 검색하면<br>Meta Ad Library에서 광고 소재를 실시간으로 수집합니다.</div></div>',
-                unsafe_allow_html=True)
+    st.markdown(
+        '<div class="empty"><div class="empty-t">수집된 소재가 없습니다</div>' +
+        '<div class="empty-d">키워드를 입력하고 검색하면<br>Meta Ad Library에서 광고 소재를 실시간으로 수집합니다.</div></div>',
+        unsafe_allow_html=True)
 else:
     grid = st.columns(cols)
     for i, item in enumerate(shown):
         with grid[i % cols]:
+            is_sel = item["id"] in sel
 
             st.markdown('<div class="card">', unsafe_allow_html=True)
 
@@ -562,67 +683,73 @@ else:
             try:
                 st.image(item["image_url"], use_container_width=True)
             except Exception:
-                st.markdown('<div style="height:100px;background:var(--bg3);display:flex;'
-                            'align-items:center;justify-content:center;color:var(--mu);'
-                            'font-family:DM Mono,monospace;font-size:10px;">LOAD FAILED</div>',
-                            unsafe_allow_html=True)
+                st.markdown(
+                    '<div style="height:100px;background:var(--bg3);display:flex;' +
+                    'align-items:center;justify-content:center;color:var(--mu);' +
+                    'font-family:DM Mono,monospace;font-size:10px;">LOAD FAILED</div>',
+                    unsafe_allow_html=True)
 
-            # 메타
-            bc  = "b-img" if item["asset_type"]=="image" else "b-vid"
-            bl  = "IMG"   if item["asset_type"]=="image" else "VID"
-            sb  = '<span class="bdg b-sav">SAVED</span> ' if item.get("starred") else ""
-            ab  = '<span class="bdg b-ai">AI</span> '    if item.get("ai")      else ""
-            cap = item.get("caption","")
-            ch  = f'<div class="card-cap">"{cap[:55]}{"..." if len(cap)>55 else ""}"</div>' if cap else ""
+            # 메타 배지
+            bc  = "b-img" if item["asset_type"] == "image" else "b-vid"
+            bl  = "IMG"   if item["asset_type"] == "image" else "VID"
+            sel_b = '<span class="bdg" style="background:var(--ac);color:#fff;border-color:var(--ac)">SELECTED</span> ' if is_sel else ""
+            sv_b  = '<span class="bdg b-sav">SAVED</span> ' if item.get("starred") else ""
+            ai_b  = '<span class="bdg b-ai">AI</span> '    if item.get("ai")       else ""
+            cap = item.get("caption", "")
+            cap_h = f'<div class="card-cap">"{cap[:55]}{"..." if len(cap) > 55 else ""}"</div>' if cap else ""
 
-            st.markdown(f"""<div class="card-body">
-                <div class="card-kw">{item["keyword"]} · {item["country"]}</div>
-                {sb}{ab}<span class="bdg {bc}">{bl}</span>
-                {ch}
-                <div class="card-meta">{item["width"]}x{item["height"]}px · {item["created_at"][11:16]}</div>
-            </div>""", unsafe_allow_html=True)
+            kw_country = item["keyword"] + " / " + item["country"]
+            dims = str(item["width"]) + "x" + str(item["height"]) + "px"
+            created = item["created_at"][11:16]
+
+            st.markdown(
+                '<div class="card-body">' +
+                f'<div class="card-kw">{kw_country}</div>' +
+                sel_b + sv_b + ai_b +
+                f'<span class="bdg {bc}">{bl}</span>' +
+                cap_h +
+                f'<div class="card-meta">{dims} · {created}</div>' +
+                '</div>',
+                unsafe_allow_html=True)
 
             # AI 분석 결과
-            ai = item.get("ai")
-            if ai:
-                tags = "".join(f'<span class="ai-tag">{t}</span>' for t in ai.get("tags",[]))
-                st.markdown(f"""<div class="ai-wrap"><div class="ai-box">
-                    <div class="ai-head">APPEAL ANALYSIS</div>
-                    <div class="ai-body">
-                        <b>후크</b>&nbsp;&nbsp;&nbsp;{ai.get("hook","—")}<br>
-                        <b>소구</b>&nbsp;&nbsp;&nbsp;{ai.get("appeal","—")}<br>
-                        <b>타겟</b>&nbsp;&nbsp;&nbsp;{ai.get("target","—")}<br>
-                        <b>메시지</b>&nbsp;{ai.get("message","—")}<br>
-                        <div style="margin-top:6px">{tags}</div>
-                    </div>
-                </div></div>""", unsafe_allow_html=True)
+            ai_data = item.get("ai")
+            if ai_data:
+                tags_str = "".join(
+                    f'<span class="ai-tag">{t}</span>'
+                    for t in ai_data.get("tags", [])
+                )
+                st.markdown(
+                    '<div class="ai-wrap"><div class="ai-box">' +
+                    '<div class="ai-head">APPEAL ANALYSIS</div>' +
+                    '<div class="ai-body">' +
+                    f'<b>후크</b>&nbsp;&nbsp;&nbsp;{ai_data.get("hook","—")}<br>' +
+                    f'<b>소구</b>&nbsp;&nbsp;&nbsp;{ai_data.get("appeal","—")}<br>' +
+                    f'<b>타겟</b>&nbsp;&nbsp;&nbsp;{ai_data.get("target","—")}<br>' +
+                    f'<b>메시지</b>&nbsp;{ai_data.get("message","—")}<br>' +
+                    f'<div style="margin-top:6px">{tags_str}</div>' +
+                    '</div></div></div>',
+                    unsafe_allow_html=True)
 
             st.markdown('</div>', unsafe_allow_html=True)
 
-            # 버튼
-            can = ai_on and API_KEY and not item.get("ai")
-            btn_cols = st.columns(4 if can else 3)
-
-            with btn_cols[0]:
-                lbl = "UNSAVE" if item.get("starred") else "SAVE"
-                if st.button(lbl, key=f"s_{item['id']}", use_container_width=True):
+            # 버튼 4개
+            b1, b2, b3, b4 = st.columns(4)
+            with b1:
+                sel_lbl = "DESELECT" if is_sel else "SELECT"
+                if st.button(sel_lbl, key="sel_" + item["id"], use_container_width=True):
+                    if is_sel: st.session_state.selected.discard(item["id"])
+                    else:      st.session_state.selected.add(item["id"])
+                    st.rerun()
+            with b2:
+                sv_lbl = "UNSAVE" if item.get("starred") else "SAVE"
+                if st.button(sv_lbl, key="sv_" + item["id"], use_container_width=True):
                     toggle_star(item["id"]); st.rerun()
-            with btn_cols[1]:
-                if st.button("HIDE", key=f"h_{item['id']}", use_container_width=True):
+            with b3:
+                if st.button("HIDE", key="hd_" + item["id"], use_container_width=True):
                     st.session_state.hidden.add(item["id"]); st.rerun()
-            with btn_cols[2]:
+            with b4:
                 st.link_button("LINK", item["source_url"], use_container_width=True)
-            if can:
-                with btn_cols[3]:
-                    if st.button("ANALYZE", key=f"a_{item['id']}", use_container_width=True):
-                        with st.spinner("분석 중..."):
-                            r = analyze(item["image_url"], item["keyword"])
-                        if r:
-                            for a in st.session_state.assets:
-                                if a["id"] == item["id"]: a["ai"] = r; break
-                            st.rerun()
-                        else:
-                            st.error("분석 실패")
 
 
 # ============================================================
