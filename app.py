@@ -1,4 +1,3 @@
-cat > /mnt/user-data/outputs/app.py << 'PYEOF'
 import sys
 import asyncio
 import subprocess
@@ -795,5 +794,3 @@ st.markdown(f"""<div style="border-top:2px solid var(--border);padding-top:14px;
     {time.strftime("%Y-%m-%d")}
   </span>
 </div>""", unsafe_allow_html=True)
-PYEOF
-echo "done"
