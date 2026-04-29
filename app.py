@@ -92,13 +92,13 @@ html,body,[class*="css"]{{font-family:'DM Sans',sans-serif;background:var(--bg)!
 .srch-lbl{{font-family:'DM Mono',monospace;font-size:9px;color:var(--mu);letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;}}
 
 /* 스탯 카드 */
-.sc{{background:var(--bg);border:1.5px solid var(--bd);border-radius:12px;padding:14px 16px;position:relative;overflow:hidden;box-shadow:var(--sh);transition:.2s;}}
+.sc{{background:var(--bg);border:1.5px solid var(--bd);border-radius:12px;padding:20px 20px 18px;position:relative;overflow:hidden;box-shadow:var(--sh);transition:.2s;}}
 .sc:hover{{border-color:var(--ac);box-shadow:var(--sh2);}}
 .sc::before{{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--ac),#5b9dff);opacity:0;transition:.2s;}}
 .sc:hover::before{{opacity:1;}}
-.sc-lbl{{font-family:'DM Mono',monospace;font-size:9px;color:var(--mu);letter-spacing:1px;text-transform:uppercase;margin-bottom:6px;}}
-.sc-val{{font-family:'Syne',sans-serif;font-size:26px;font-weight:800;color:var(--tx);line-height:1;}}
-.sc-sub{{font-size:11px;color:var(--mu);margin-top:4px;}}
+.sc-lbl{{font-family:'DM Mono',monospace;font-size:9px;color:var(--mu);letter-spacing:1px;text-transform:uppercase;margin-bottom:10px;}}
+.sc-val{{font-family:'Syne',sans-serif;font-size:32px;font-weight:800;color:var(--tx);line-height:1;}}
+.sc-sub{{font-size:11px;color:var(--mu);margin-top:8px;}}
 
 /* 키워드 태그 */
 .tags{{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:1.2rem;}}
