@@ -34,6 +34,7 @@ st.set_page_config(page_title="AD INTEL", page_icon="◼", layout="wide")
 for k, v in {
     "assets": [], "hidden": set(), "history": [],
     "log": [], "ai_on": False, "dark": False,
+    "selected": set(), "summary": None,
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
