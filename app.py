@@ -21,7 +21,19 @@ def get_api_key():
     except Exception:
         return ""
 
+def get_anthropic_model():
+    """
+    Claude Vision 분석용 모델.
+    Streamlit Secrets에 ANTHROPIC_MODEL을 넣으면 원하는 모델로 교체 가능.
+    예: ANTHROPIC_MODEL = "claude-3-5-sonnet-latest"
+    """
+    try:
+        return st.secrets.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest")
+    except Exception:
+        return "claude-3-5-sonnet-latest"
+
 API_KEY = get_api_key()
+ANTHROPIC_MODEL = get_anthropic_model()
 
 st.set_page_config(page_title="AD INTEL", page_icon="◼", layout="wide")
 
@@ -286,17 +298,18 @@ def scrape(keyword, country, scrolls, limit):
             return out;
         }""")
 
-        # ── 브라우저 세션으로 이미지 병렬 다운로드 (Meta CDN 인증 우회) ──
+        # ── 브라우저 세션으로 실제 소재 이미지/비디오 포스터를 base64로 수집 ──
+        # URL이 바뀌지 않는 모달 구조여도, 화면에 로드된 img/video poster 자체를 가져오므로 분석 가능
         img_urls = [
             r["src"] for r in raw
-            if r.get("src") and r.get("type") == "image"
+            if r.get("src") and r.get("type") in ("image", "video_poster")
         ][:limit]
 
         b64_map = {}
         if img_urls:
             try:
                 result = page.evaluate("""async (urls) => {
-                    const CHUNK = 8;
+                    const CHUNK = 6;
                     const out = {};
                     for (let i = 0; i < urls.length; i += CHUNK) {
                         const chunk = urls.slice(i, i + CHUNK);
@@ -304,12 +317,17 @@ def scrape(keyword, country, scrolls, limit):
                             try {
                                 const r = await fetch(url, {credentials: 'include'});
                                 if (!r.ok) return;
+                                const ct = (r.headers.get('content-type') || '').split(';')[0].trim();
                                 const buf = await r.arrayBuffer();
                                 const bytes = new Uint8Array(buf);
                                 let bin = '';
-                                for (let j = 0; j < bytes.byteLength; j++)
+                                for (let j = 0; j < bytes.byteLength; j++) {
                                     bin += String.fromCharCode(bytes[j]);
-                                out[url] = btoa(bin);
+                                }
+                                out[url] = {
+                                    data: btoa(bin),
+                                    media_type: ct || 'image/jpeg'
+                                };
                             } catch(e) {}
                         }));
                     }
@@ -341,7 +359,9 @@ def scrape(keyword, country, scrolls, limit):
             "created_at": now,
             "starred":    False,
             "ai":         None,
-            "img_b64":    b64_map.get(src, ""),  # 브라우저로 캡처한 base64
+            "img_b64":    (b64_map.get(src) or {}).get("data", ""),
+            "media_type": (b64_map.get(src) or {}).get("media_type", "image/jpeg"),
+            "vision_ok":  bool((b64_map.get(src) or {}).get("data")),
         }
         fp = make_fp(asset)
         if fp in seen: continue
@@ -352,48 +372,90 @@ def scrape(keyword, country, scrolls, limit):
 # ============================================================
 # AI 분석
 # ============================================================
+def normalize_media_type(media_type: str, image_url: str = "") -> str:
+    """Anthropic Vision에서 허용하는 이미지 media_type만 반환"""
+    allowed = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+    mt = (media_type or "").split(";")[0].strip().lower()
+
+    if mt in allowed:
+        return mt
+
+    u = (image_url or "").lower()
+    if ".png" in u:
+        return "image/png"
+    if ".webp" in u:
+        return "image/webp"
+    if ".gif" in u:
+        return "image/gif"
+    return "image/jpeg"
+
+
+def bytes_to_media_type(img_bytes: bytes, image_url: str = "") -> str:
+    """이미지 bytes 헤더 기준 media_type 추정"""
+    if img_bytes.startswith(b"\x89PNG"):
+        return "image/png"
+    if img_bytes.startswith(b"GIF"):
+        return "image/gif"
+    if img_bytes.startswith(b"RIFF") and b"WEBP" in img_bytes[:20]:
+        return "image/webp"
+    return normalize_media_type("image/jpeg", image_url)
+
+
+def ensure_item_image_payload(item: dict) -> tuple[str, str] | tuple[None, None]:
+    """
+    분석 직전 실제 이미지 payload 확보.
+    1순위: scrape 단계에서 브라우저 세션으로 확보한 img_b64
+    2순위: image_url 직접 다운로드 후 base64 변환
+    실패하면 None 반환 → 임의 추정 분석 금지
+    """
+    b64 = item.get("img_b64") or ""
+    media_type = normalize_media_type(item.get("media_type", ""), item.get("image_url", ""))
+
+    if b64:
+        return b64, media_type
+
+    img_bytes = fetch_image_bytes(item.get("image_url", ""))
+    if not img_bytes:
+        return None, None
+
+    import base64
+    item["img_b64"] = base64.b64encode(img_bytes).decode("utf-8")
+    item["media_type"] = bytes_to_media_type(img_bytes, item.get("image_url", ""))
+    item["vision_ok"] = True
+    return item["img_b64"], item["media_type"]
+
+
 def analyze(item):
-    """img_b64 있으면 Claude Vision으로 이미지 직접 분석, 없으면 텍스트 fallback"""
+    """
+    Claude Vision 기반 소재 분석.
+    이미지 payload가 없으면 분석하지 않는다.
+    키워드/URL 기반 추정 분석은 의도적으로 제거.
+    """
     if not API_KEY:
         return {"_error": "API Key 없음"}
-    try:
-        b64 = item.get("img_b64", "")
 
-        if b64:
-            prompt = (
-                "당신은 광고 전략 전문가입니다. 이 Meta 광고 이미지를 분석해주세요.\n\n"
-                f"검색 키워드: {item['keyword']}\n\n"
-                "이미지를 직접 보고 분석해주세요.\n"
-                "아래 JSON만 반환 (마크다운·백틱 없이 순수 JSON):\n"
-                '{"hook":"이미지에서 첫 시선을 잡는 핵심 요소",'
-                '"copy":"이미지 안에 보이는 텍스트/카피 (그대로 옮겨쓰기)",'
-                '"appeal":"소구포인트 유형 + 근거 (감성/이성/사회적증거/희소성/혜택)",'
-                '"tone":"색감·분위기·비주얼 스타일",'
-                '"target":"추정 타겟 (연령·성별·관심사)",'
-                '"message":"핵심 메시지 한 줄",'
-                '"tags":["태그1","태그2","태그3"]}'
-            )
-            content = [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
-                {"type": "text", "text": prompt},
-            ]
-            model = "claude-sonnet-4-6"
-        else:
-            # 이미지 없을 때 — 키워드 기반 텍스트 분석
-            prompt = (
-                "당신은 광고 전략 전문가입니다. 아래 키워드로 Meta에서 검색된 광고 소재를 추정 분석해주세요.\n\n"
-                f"검색 키워드: {item['keyword']}\n\n"
-                "아래 JSON만 반환 (마크다운·백틱 없이 순수 JSON):\n"
-                '{"hook":"이 키워드 광고의 일반적 후크 패턴",'
-                '"copy":"",'
-                '"appeal":"소구포인트 유형 추정",'
-                '"tone":"일반적 톤 추정",'
-                '"target":"추정 타겟",'
-                '"message":"핵심 메시지 추정",'
-                '"tags":["태그1","태그2","태그3"]}'
-            )
-            content = [{"type": "text", "text": prompt}]
-            model = "claude-haiku-4-5-20251001"
+    try:
+        b64, media_type = ensure_item_image_payload(item)
+        if not b64:
+            return {"_error": "이미지 payload 확보 실패 — 임의 분석 방지를 위해 분석하지 않음"}
+
+        prompt = (
+            "당신은 광고 소재 분석가입니다.\n"
+            "반드시 첨부된 광고 이미지에서 실제로 보이는 정보만 근거로 분석하세요.\n"
+            "검색 키워드는 참고 정보일 뿐이며, 이미지에 없는 내용은 추정하지 마세요.\n"
+            "이미지에서 확인되지 않는 항목은 반드시 '확인 불가'라고 쓰세요.\n\n"
+            f"검색 키워드: {item.get('keyword','')}\n"
+            f"소재 타입: {item.get('asset_type','')}\n\n"
+            "아래 JSON만 반환하세요. 마크다운/백틱/설명 금지:\n"
+            '{"hook":"이미지에서 첫 시선을 잡는 실제 요소",'
+            '"copy":"이미지 안에 보이는 텍스트/카피를 가능한 그대로 옮겨쓰기. 없으면 확인 불가",'
+            '"appeal":"이미지 근거 기반 소구포인트 유형 + 근거. 근거 부족 시 확인 불가",'
+            '"tone":"색감·구도·분위기·비주얼 스타일",'
+            '"target":"이미지에서 추정 가능한 타겟. 근거 부족 시 확인 불가",'
+            '"message":"이미지 기준 핵심 메시지 한 줄",'
+            '"evidence":["분석 근거1","분석 근거2","분석 근거3"],'
+            '"tags":["태그1","태그2","태그3"]}'
+        )
 
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -402,34 +464,64 @@ def analyze(item):
                 "anthropic-version": "2023-06-01",
                 "content-type":      "application/json",
             },
-            json={"model": model, "max_tokens": 600, "messages": [{"role": "user", "content": content}]},
-            timeout=30,
+            json={
+                "model": ANTHROPIC_MODEL,
+                "max_tokens": 800,
+                "temperature": 0,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": b64,
+                            },
+                        },
+                        {"type": "text", "text": prompt},
+                    ],
+                }],
+            },
+            timeout=40,
         )
+
         if resp.status_code != 200:
-            return {"_error": f"API {resp.status_code}: {resp.text[:200]}"}
+            return {"_error": f"API {resp.status_code}: {resp.text[:300]}"}
+
         txt = resp.json()["content"][0]["text"].strip()
         s, e = txt.find("{"), txt.rfind("}") + 1
         if s == -1 or e == 0:
-            return {"_error": f"JSON 파싱 실패: {txt[:100]}"}
-        return json.loads(txt[s:e])
+            return {"_error": f"JSON 파싱 실패: {txt[:160]}"}
+
+        result = json.loads(txt[s:e])
+        result["_vision"] = True
+        return result
+
     except Exception as ex:
-        return {"_error": str(ex)[:200]}
+        return {"_error": str(ex)[:300]}
 
 
-def analyze_parallel(items, max_workers=6):
-    if not API_KEY: return items
+def analyze_parallel(items, max_workers=4):
+    if not API_KEY:
+        return items
+
     id_map = {item["id"]: item for item in items}
+
     def task(item):
         return item["id"], analyze(item)
+
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {ex.submit(task, item): item["id"] for item in items if not item.get("ai")}
         for future in as_completed(futures):
             try:
-                aid, result = future.result(timeout=40)
+                aid, result = future.result(timeout=60)
                 if result and aid in id_map:
                     id_map[aid]["ai"] = result
             except Exception as ex:
-                pass
+                aid = futures.get(future)
+                if aid in id_map:
+                    id_map[aid]["ai"] = {"_error": str(ex)[:300]}
     return items
 
 
@@ -441,11 +533,16 @@ def test_api():
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]},
+            json={
+                "model": ANTHROPIC_MODEL,
+                "max_tokens": 20,
+                "temperature": 0,
+                "messages": [{"role": "user", "content": "API connection test"}],
+            },
             timeout=10,
         )
         if resp.status_code == 200:
-            return True, "API 정상 연결됨"
+            return True, f"API 정상 연결됨 · model={ANTHROPIC_MODEL}"
         return False, f"API 오류 {resp.status_code}: {resp.text[:300]}"
     except Exception as ex:
         return False, f"연결 실패: {ex}"
