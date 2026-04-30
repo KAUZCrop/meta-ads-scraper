@@ -520,43 +520,112 @@ def scrape(keyword, country, scrolls, limit):
 # ============================================================
 # AI 분석
 # ============================================================
+def fetch_image_b64(url: str):
+    """이미지 URL → (base64, media_type). 실패 시 None"""
+    try:
+        import base64
+        resp = requests.get(url, timeout=8, headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://www.facebook.com/",
+        })
+        if resp.status_code != 200 or len(resp.content) < 500:
+            return None
+        ct = resp.headers.get("content-type", "image/jpeg")
+        if "png"  in ct: mt = "image/png"
+        elif "gif"  in ct: mt = "image/gif"
+        elif "webp" in ct: mt = "image/webp"
+        else:               mt = "image/jpeg"
+        return base64.standard_b64encode(resp.content).decode("utf-8"), mt
+    except Exception:
+        return None
+
+
 def analyze(item):
+    """
+    Claude Vision으로 광고 소재 분석
+    1. 이미지 내 카피 추출
+    2. 톤앤매너 분석
+    3. 소구포인트 인사이트
+    """
     if not API_KEY: return None
     try:
-        # 수집된 카피 정보 조합
-        copy_parts = []
-        if item.get("advertiser"): copy_parts.append(f"광고주: {item['advertiser']}")
-        if item.get("headline"):   copy_parts.append(f"헤드라인: {item['headline']}")
-        if item.get("body"):       copy_parts.append(f"본문: {item['body']}")
-        if item.get("cta"):        copy_parts.append(f"CTA: {item['cta']}")
-        copy_context = "\n".join(copy_parts) if copy_parts else "카피 없음"
+        # ── 프롬프트 구성 ──
+        meta_ctx = ""
+        parts = []
+        if item.get("advertiser"): parts.append(f"광고주: {item['advertiser']}")
+        if item.get("start_date"): parts.append(f"집행 시작: {item['start_date']}")
+        if item.get("platforms"):  parts.append(f"플랫폼: {item['platforms']}")
+        if parts:
+            meta_ctx = "\n[메타 정보]\n" + "\n".join(parts)
 
-        prompt = (
-            "당신은 광고 전략 전문가입니다. 아래 Meta 광고 소재를 분석해주세요.\n\n"
-            f"[검색 키워드]\n{item['keyword']}\n\n"
-            f"[수집된 광고 카피]\n{copy_context}\n\n"
-            "위 정보를 바탕으로 아래 JSON만 반환하세요 (마크다운·백틱 없이 순수 JSON):\n"
-            '{"hook":"첫 시선을 잡는 핵심 요소 (카피 기반으로 구체적으로)",'
-            '"appeal":"소구포인트 유형과 근거 (감성/이성/사회적증거/희소성/혜택 중 선택 + 카피에서 근거 인용)",'
-            '"target":"타겟 고객 추정 (연령·성별·관심사·상황)",'
-            '"message":"핵심 메시지 한 줄 요약",'
-            '"copy_strength":"카피의 강점 (잘 된 점)",'
-            '"copy_weakness":"카피의 약점 또는 개선점",'
-            '"tags":["태그1","태그2","태그3"]}'
+        prompt_text = (
+            "당신은 광고 전략 전문가이자 크리에이티브 디렉터입니다.\n"
+            "아래 Meta 광고 소재 이미지를 보고 세 가지를 분석해주세요.\n\n"
+            f"[검색 키워드] {item['keyword']}"
+            + meta_ctx +
+            "\n\n"
+            "반드시 아래 JSON 형식으로만 답하세요 (마크다운·백틱 없이 순수 JSON):\n"
+            "{\n"
+            '  "copy_analysis": {\n'
+            '    "visible_text": "이미지에서 실제로 보이는 텍스트/카피 전체 (그대로 옮겨쓰기)",\n'
+            '    "hook": "첫 시선을 잡는 핵심 문구 또는 비주얼 요소",\n'
+            '    "headline": "메인 헤드라인 (있다면)",\n'
+            '    "cta": "CTA 버튼 또는 행동 유도 문구 (있다면)",\n'
+            '    "appeal": "소구포인트 유형 — 감성/이성/사회적증거/희소성/혜택/공포 중 선택 + 근거"\n'
+            '  },\n'
+            '  "tone_manner": {\n'
+            '    "mood": "전체적인 분위기 (예: 고급스러운, 친근한, 역동적인, 미니멀한 등)",\n'
+            '    "color_tone": "주요 색상과 색감이 주는 인상",\n'
+            '    "visual_style": "비주얼 스타일 (예: 제품 중심, 라이프스타일, UGC, 인포그래픽 등)",\n'
+            '    "typography": "폰트/텍스트 스타일의 특징 (있다면)",\n'
+            '    "target_feel": "이 광고가 타겟에게 주려는 감정이나 느낌"\n'
+            '  },\n'
+            '  "insight": {\n'
+            '    "target": "추정 타겟 고객 (연령·성별·관심사·상황 구체적으로)",\n'
+            '    "message": "이 광고가 전달하려는 핵심 메시지 한 줄",\n'
+            '    "strategy": "이 소재의 광고 전략적 의도 (왜 이렇게 만들었는가)",\n'
+            '    "strength": "이 소재의 강점",\n'
+            '    "weakness": "이 소재의 약점 또는 개선 제안",\n'
+            '    "tags": ["태그1","태그2","태그3","태그4"]\n'
+            '  }\n'
+            "}"
         )
+
+        # ── 이미지 base64 시도 ──
+        img_result = fetch_image_b64(item["image_url"])
+
+        if img_result:
+            b64, mt = img_result
+            content = [
+                {
+                    "type": "image",
+                    "source": {
+                        "type":       "base64",
+                        "media_type": mt,
+                        "data":       b64,
+                    }
+                },
+                {"type": "text", "text": prompt_text}
+            ]
+        else:
+            # 이미지 로드 실패 시 텍스트만으로 분석
+            content = [{"type": "text", "text": prompt_text}]
+
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={
-                "x-api-key": API_KEY,
+                "x-api-key":         API_KEY,
                 "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
+                "content-type":      "application/json",
             },
             json={
-                "model":      "claude-haiku-4-5-20251001",
-                "max_tokens": 600,
-                "messages":   [{"role": "user", "content": prompt}],
+                "model":      "claude-haiku-4-5-20251001",  # vision 지원
+                "max_tokens": 900,
+                "messages":   [{"role": "user", "content": content}],
             },
-            timeout=25,
+            timeout=30,
         )
         if resp.status_code != 200: return None
         txt = resp.json()["content"][0]["text"].strip()
@@ -564,6 +633,7 @@ def analyze(item):
         return json.loads(txt[s:e]) if s != -1 and e > 0 else None
     except Exception:
         return None
+
 
 def analyze_parallel(items, max_workers=6):
     if not API_KEY: return items
@@ -1230,28 +1300,51 @@ else:
 
             ai_data = item.get("ai")
             if ai_data:
-                tags_str = "".join(f'<span class="ai-tag">{t}</span>' for t in ai_data.get("tags", []))
-                strength = ai_data.get("copy_strength", "")
-                weakness = ai_data.get("copy_weakness", "")
-                sw_html = ""
-                if strength or weakness:
-                    sw_html = (
-                        f'<div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--ac2);">'
-                        + (f'<div style="font-size:11px;color:var(--ok);margin-bottom:3px;">▲ {strength}</div>' if strength else "")
-                        + (f'<div style="font-size:11px;color:var(--er);">▼ {weakness}</div>' if weakness else "")
-                        + '</div>'
-                    )
+                copy_a  = ai_data.get("copy_analysis") or {}
+                tone    = ai_data.get("tone_manner")   or {}
+                insight = ai_data.get("insight")       or {}
+                tags    = insight.get("tags") or ai_data.get("tags") or []
+                tags_html = "".join(f'<span class="ai-tag">{t}</span>' for t in tags)
+
+                def row(label, val):
+                    if not val: return ""
+                    return (f'<div style="margin-bottom:5px;">'
+                            f'<span style="font-size:10px;font-weight:700;'
+                            f'color:var(--ac);min-width:70px;display:inline-block">'
+                            f'{label}</span>'
+                            f'<span style="font-size:11px;color:var(--tx2);">{val}</span>'
+                            f'</div>')
+
                 st.markdown(
                     '<div class="ai-wrap"><div class="ai-box">'
-                    '<div class="ai-head">APPEAL ANALYSIS</div>'
-                    '<div class="ai-body">'
-                    f'<b>후크</b>&nbsp;&nbsp;&nbsp;{ai_data.get("hook","—")}<br>'
-                    f'<b>소구</b>&nbsp;&nbsp;&nbsp;{ai_data.get("appeal","—")}<br>'
-                    f'<b>타겟</b>&nbsp;&nbsp;&nbsp;{ai_data.get("target","—")}<br>'
-                    f'<b>메시지</b>&nbsp;{ai_data.get("message","—")}<br>'
-                    f'<div style="margin-top:6px">{tags_str}</div>'
-                    + sw_html +
-                    '</div></div></div>',
+
+                    # ── 1. 카피 분석 ──
+                    '<div class="ai-head" style="margin-bottom:8px;">📝 카피 분석</div>'
+                    + row("노출 카피", copy_a.get("visible_text","")[:120])
+                    + row("후크",     copy_a.get("hook",""))
+                    + row("헤드라인", copy_a.get("headline",""))
+                    + row("CTA",      copy_a.get("cta",""))
+                    + row("소구",     copy_a.get("appeal",""))
+
+                    # ── 2. 톤앤매너 ──
+                    + '<div style="border-top:1px solid var(--ac2);margin:10px 0 8px;"></div>'
+                    '<div class="ai-head" style="margin-bottom:8px;">🎨 톤앤매너</div>'
+                    + row("분위기",   tone.get("mood",""))
+                    + row("색감",     tone.get("color_tone",""))
+                    + row("비주얼",   tone.get("visual_style",""))
+                    + row("감정",     tone.get("target_feel",""))
+
+                    # ── 3. 인사이트 ──
+                    + '<div style="border-top:1px solid var(--ac2);margin:10px 0 8px;"></div>'
+                    '<div class="ai-head" style="margin-bottom:8px;">💡 인사이트</div>'
+                    + row("타겟",     insight.get("target",""))
+                    + row("메시지",   insight.get("message",""))
+                    + row("전략",     insight.get("strategy",""))
+                    + (f'<div style="font-size:11px;color:var(--ok);margin-bottom:3px;">▲ {insight.get("strength","")}</div>' if insight.get("strength") else "")
+                    + (f'<div style="font-size:11px;color:var(--er);margin-bottom:6px;">▼ {insight.get("weakness","")}</div>' if insight.get("weakness") else "")
+                    + (f'<div style="margin-top:6px">{tags_html}</div>' if tags_html else "")
+
+                    + '</div></div>',
                     unsafe_allow_html=True)
 
             st.markdown('</div>', unsafe_allow_html=True)
