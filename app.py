@@ -534,6 +534,55 @@ def _anthropic_model() -> str:
     except Exception:
         return "claude-haiku-4-5-20251001"
 
+def _safe_join(value, sep=", "):
+    """list/dict/string 값을 UI에 안전하게 표시하기 위한 간단 변환"""
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return sep.join(str(v) for v in value if v is not None and str(v).strip())
+    if isinstance(value, dict):
+        return sep.join(f"{k}: {v}" for k, v in value.items())
+    return str(value)
+
+
+def _normalize_ai_result(data: dict) -> dict:
+    """신규 구조형 JSON을 기존 UI/PPT에서도 깨지지 않게 top-level 필드로 보강"""
+    if not isinstance(data, dict):
+        return {"_error": "AI 응답이 JSON object가 아닙니다."}
+
+    vf = data.get("visual_facts") or {}
+    ma = data.get("marketing_analysis") or {}
+    scores = data.get("conversion_elements") or {}
+
+    visible_text = vf.get("visible_text", data.get("copy", ""))
+    objects = vf.get("objects", [])
+    colors = vf.get("colors", [])
+    appeal_type = ma.get("appeal_type", data.get("appeal", ""))
+
+    data["copy"] = data.get("copy") or _safe_join(visible_text, " / ") or "확인 불가"
+    data["hook"] = data.get("hook") or ma.get("hook_type") or "확인 불가"
+    data["appeal"] = data.get("appeal") or _safe_join(appeal_type) or "확인 불가"
+    data["tone"] = data.get("tone") or _safe_join(colors) or "확인 불가"
+    data["target"] = data.get("target") or ma.get("target") or "확인 불가"
+    data["message"] = data.get("message") or ma.get("message") or "확인 불가"
+    data["evidence"] = data.get("evidence") or ma.get("evidence") or "확인 불가"
+    data["main_visual"] = data.get("main_visual") or _safe_join(objects) or vf.get("product_focus") or "확인 불가"
+    data["layout_type"] = data.get("layout_type") or vf.get("layout_type") or "확인 불가"
+    data["scores"] = scores
+
+    tags = data.get("tags") or []
+    if not tags:
+        base_tags = []
+        for v in [appeal_type, vf.get("layout_type"), objects[:2] if isinstance(objects, list) else objects]:
+            if isinstance(v, list):
+                base_tags += [str(x) for x in v if x]
+            elif v:
+                base_tags.append(str(v))
+        data["tags"] = base_tags[:5]
+
+    return data
+
+
 def analyze(item):
     """모달/요소 스크린샷 base64가 있을 때만 Claude Vision 분석. 추정 fallback 없음."""
     if not API_KEY:
@@ -545,22 +594,60 @@ def analyze(item):
 
     try:
         prompt = f"""
-당신은 광고 소재 분석가입니다. 첨부된 이미지는 Meta 광고 라이브러리에서 캡처한 실제 소재 화면입니다.
-반드시 첨부 이미지에서 확인 가능한 내용만 분석하세요. 보이지 않는 정보는 추정하지 말고 '확인 불가'라고 쓰세요.
+당신은 광고 소재 리서치 분석가입니다.
+첨부 이미지는 Meta 광고 라이브러리에서 캡처한 실제 광고 소재 화면입니다.
+
+중요 원칙:
+- 절대 추상적 해석부터 하지 마세요.
+- 반드시 이미지에서 실제로 보이는 요소를 먼저 객관적으로 추출하세요.
+- 이미지에 없는 정보는 추정하지 말고 "확인 불가"라고 작성하세요.
+- "귀여운", "감성적", "프리미엄" 같은 표현은 이미지 근거가 있을 때만 사용하세요.
+- 모든 분석은 visual_facts에 적은 요소를 근거로 해야 합니다.
+- JSON 외 마크다운, 설명문, 백틱은 절대 출력하지 마세요.
 
 검색 키워드: {item['keyword']}
 캡처 방식: {item.get('capture_source', 'unknown')}
 
-아래 JSON만 반환하세요. 마크다운/백틱 금지:
-{{"hook":"이미지에서 첫 시선을 잡는 핵심 요소",
-"copy":"이미지 안에 보이는 텍스트/카피를 그대로 옮겨쓰기. 없으면 확인 불가",
-"main_visual":"이미지에서 확인되는 주요 비주얼 요소",
-"appeal":"소구포인트 유형 + 이미지 근거. 감성/이성/사회적증거/희소성/혜택 중 선택",
-"tone":"색감·분위기·비주얼 스타일",
-"target":"이미지 근거로 추정 가능한 타겟. 근거 부족 시 확인 불가",
-"message":"이미지 내 텍스트와 비주얼 기준 핵심 메시지 한 줄",
-"evidence":"위 분석의 근거가 되는 이미지 내 요소",
-"tags":["태그1","태그2","태그3"]}}
+반드시 아래 JSON 구조로만 반환하세요:
+{{
+  "visual_facts": {{
+    "visible_text": ["이미지 안에 실제로 보이는 문구를 줄 단위로 정확히 작성"],
+    "objects": ["실제 보이는 제품/인물/소품/아이콘/배경 요소"],
+    "colors": ["메인 컬러", "보조 컬러"],
+    "layout_type": "제품 단독형/모델 사용형/Before-After형/리뷰형/가격혜택형/카드뉴스형/문제제기형/기능설명형/브랜드필름형 중 가장 가까운 유형",
+    "product_focus": "제품이 어떻게 강조되는지",
+    "price_visible": true,
+    "discount_visible": true,
+    "human_visible": false,
+    "brand_visible": "보이면 브랜드명, 없으면 확인 불가"
+  }},
+  "marketing_analysis": {{
+    "hook_type": "가격강조/비주얼강조/문제제기/혜택강조/비교강조/후기강조/한정성강조/확인 불가 중 하나",
+    "appeal_type": ["가격", "혜택"],
+    "target": "이미지 근거로 추정 가능한 타겟. 근거 부족 시 확인 불가",
+    "message": "이미지 내 텍스트와 비주얼 기준 핵심 메시지 한 줄",
+    "cta_strength": 1,
+    "evidence": "판단 근거가 된 실제 이미지 요소를 구체적으로 작성"
+  }},
+  "conversion_elements": {{
+    "price_emphasis": 1,
+    "product_visibility": 1,
+    "readability": 1,
+    "discount_visibility": 1,
+    "visual_clarity": 1,
+    "overall_conversion_power": 1,
+    "score_reason": "각 점수를 준 핵심 근거"
+  }},
+  "creative_diagnosis": {{
+    "strengths": ["이미지 근거 기반 장점"],
+    "weaknesses": ["이미지 근거 기반 약점"],
+    "improvement_direction": "소재 개선 방향 1문장"
+  }},
+  "tags": ["태그1", "태그2", "태그3"]
+}}
+
+점수 기준:
+1 = 매우 약함, 2 = 약함, 3 = 보통, 4 = 강함, 5 = 매우 강함
 """
         content = [
             {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
@@ -576,11 +663,11 @@ def analyze(item):
             },
             json={
                 "model": _anthropic_model(),
-                "max_tokens": 700,
+                "max_tokens": 1200,
                 "temperature": 0,
                 "messages": [{"role": "user", "content": content}],
             },
-            timeout=40,
+            timeout=50,
         )
         if resp.status_code != 200:
             return {"_error": f"API {resp.status_code}: {resp.text[:300]}"}
@@ -589,10 +676,9 @@ def analyze(item):
         s, e = txt.find("{"), txt.rfind("}") + 1
         if s == -1 or e == 0:
             return {"_error": f"Claude가 JSON이 아닌 응답을 반환했습니다. 캡처가 공백/비광고 영역일 가능성이 큽니다. 응답: {txt[:180]}"}
-        return json.loads(txt[s:e])
+        return _normalize_ai_result(json.loads(txt[s:e]))
     except Exception as ex:
         return {"_error": str(ex)[:300]}
-
 
 def analyze_parallel(items, max_workers=6):
     if not API_KEY: return items
@@ -1285,19 +1371,43 @@ else:
                 else:
                     has_img = bool(item.get("img_b64"))
                     tags_str = "".join(f'<span class="ai-tag">{t}</span>' for t in ai_data.get("tags", []))
-                    copy_line = f'<b>카피</b>&nbsp;&nbsp;&nbsp;{ai_data["copy"]}<br>' if ai_data.get("copy") else ""
-                    tone_line = f'<b>톤&매너</b>&nbsp;{ai_data["tone"]}<br>' if ai_data.get("tone") else ""
+                    vf = ai_data.get("visual_facts", {}) or {}
+                    ma = ai_data.get("marketing_analysis", {}) or {}
+                    ce = ai_data.get("conversion_elements", {}) or {}
+                    cd = ai_data.get("creative_diagnosis", {}) or {}
+
+                    visible_text = _safe_join(vf.get("visible_text", []), " / ") or ai_data.get("copy", "—")
+                    objects = _safe_join(vf.get("objects", [])) or ai_data.get("main_visual", "—")
+                    colors = _safe_join(vf.get("colors", [])) or ai_data.get("tone", "—")
+                    strengths = _safe_join(cd.get("strengths", [])) or "—"
+                    weaknesses = _safe_join(cd.get("weaknesses", [])) or "—"
+                    score_line = (
+                        f'가격 {ce.get("price_emphasis", "—")} / '
+                        f'제품 {ce.get("product_visibility", "—")} / '
+                        f'가독성 {ce.get("readability", "—")} / '
+                        f'할인 {ce.get("discount_visibility", "—")} / '
+                        f'명확도 {ce.get("visual_clarity", "—")} / '
+                        f'전환력 {ce.get("overall_conversion_power", "—")}'
+                    )
                     img_badge = '<span class="bdg b-ai" style="font-size:8px">IMG분석</span> ' if has_img else '<span class="bdg" style="background:var(--bg3);color:var(--mu);font-size:8px">텍스트추정</span> '
                     st.markdown(
                         '<div class="ai-wrap"><div class="ai-box">'
-                        f'<div class="ai-head">APPEAL ANALYSIS {img_badge}</div>'
+                        f'<div class="ai-head">STRUCTURED CREATIVE ANALYSIS {img_badge}</div>'
                         '<div class="ai-body">'
-                        f'<b>후크</b>&nbsp;&nbsp;&nbsp;{ai_data.get("hook","—")}<br>'
-                        + copy_line
-                        + f'<b>소구</b>&nbsp;&nbsp;&nbsp;{ai_data.get("appeal","—")}<br>'
-                        + tone_line
-                        + f'<b>타겟</b>&nbsp;&nbsp;&nbsp;{ai_data.get("target","—")}<br>'
-                        f'<b>메시지</b>&nbsp;{ai_data.get("message","—")}<br>'
+                        f'<b>실제문구</b>&nbsp;{visible_text}<br>'
+                        f'<b>비주얼</b>&nbsp;&nbsp;&nbsp;{objects}<br>'
+                        f'<b>레이아웃</b>&nbsp;{ai_data.get("layout_type", vf.get("layout_type", "—"))}<br>'
+                        f'<b>후크</b>&nbsp;&nbsp;&nbsp;{ai_data.get("hook", ma.get("hook_type", "—"))}<br>'
+                        f'<b>소구</b>&nbsp;&nbsp;&nbsp;{ai_data.get("appeal", "—")}<br>'
+                        f'<b>톤&매너</b>&nbsp;{colors}<br>'
+                        f'<b>타겟</b>&nbsp;&nbsp;&nbsp;{ai_data.get("target", "—")}<br>'
+                        f'<b>메시지</b>&nbsp;{ai_data.get("message", "—")}<br>'
+                        f'<b>근거</b>&nbsp;&nbsp;&nbsp;{ai_data.get("evidence", "—")}<br>'
+                        f'<b>점수</b>&nbsp;&nbsp;&nbsp;{score_line}<br>'
+                        f'<b>점수근거</b>&nbsp;{ce.get("score_reason", "—")}<br>'
+                        f'<b>장점</b>&nbsp;&nbsp;&nbsp;{strengths}<br>'
+                        f'<b>약점</b>&nbsp;&nbsp;&nbsp;{weaknesses}<br>'
+                        f'<b>개선</b>&nbsp;&nbsp;&nbsp;{cd.get("improvement_direction", "—")}<br>'
                         f'<div style="margin-top:6px">{tags_str}</div>'
                         '</div></div></div>',
                         unsafe_allow_html=True)
