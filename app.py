@@ -25,12 +25,12 @@ def get_anthropic_model():
     """
     Claude Vision 분석용 모델.
     Streamlit Secrets에 ANTHROPIC_MODEL을 넣으면 원하는 모델로 교체 가능.
-    예: ANTHROPIC_MODEL = "claude-3-5-sonnet-latest"
+    예: ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
     """
     try:
-        return st.secrets.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest")
+        return st.secrets.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
     except Exception:
-        return "claude-3-5-sonnet-latest"
+        return "claude-haiku-4-5-20251001"
 
 API_KEY = get_api_key()
 ANTHROPIC_MODEL = get_anthropic_model()
