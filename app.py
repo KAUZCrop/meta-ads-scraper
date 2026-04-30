@@ -199,8 +199,6 @@ a{{color:var(--ac)!important;}}
 # 스크래퍼 (기존 원본)
 # ============================================================
 def valid(w, h):
-    # 크기 정보가 아예 없으면(0,0) 일단 통과 — URL 패턴으로 필터
-    if w == 0 and h == 0: return True
     if w < 180 or h < 180: return False
     r = w / h if h else 0
     return 0.25 <= r <= 3.0
@@ -222,170 +220,32 @@ def scrape(keyword, country, scrolls, limit):
         "https://www.facebook.com/ads/library/"
         f"?active_status=all&ad_type=all&country={country}&q={quote(keyword)}"
     )
-
-    # ── GraphQL JSON 재귀 파싱 ──
-    def deep_find(obj, keys):
-        """JSON 안에서 특정 키를 재귀적으로 찾아 첫 번째 값 반환"""
-        if isinstance(obj, dict):
-            for k in keys:
-                if k in obj and obj[k]:
-                    return obj[k]
-            for v in obj.values():
-                result = deep_find(v, keys)
-                if result: return result
-        elif isinstance(obj, list):
-            for item in obj:
-                result = deep_find(item, keys)
-                if result: return result
-        return None
-
-    def extract_text(val):
-        if isinstance(val, dict):
-            return val.get("text") or val.get("content") or ""
-        elif isinstance(val, list):
-            parts = []
-            for v in val:
-                t = extract_text(v)
-                if t: parts.append(t)
-            return " ".join(parts)
-        return str(val) if val else ""
-
-    def parse_ad_node(node: dict) -> list[dict]:
-        """광고 노드에서 이미지+카피 추출"""
-        results = []
-        if not isinstance(node, dict): return results
-
-        advertiser  = str(node.get("page_name") or node.get("advertiser_name") or "")
-        start_ts    = node.get("start_date") or node.get("ad_delivery_start_time") or 0
-        end_ts      = node.get("end_date")   or node.get("ad_delivery_stop_time") or 0
-        platforms   = node.get("publisher_platforms") or []
-
-        try:
-            import datetime
-            start_date = datetime.datetime.fromtimestamp(int(start_ts)).strftime("%Y-%m-%d") if start_ts else ""
-            end_date   = datetime.datetime.fromtimestamp(int(end_ts)).strftime("%Y-%m-%d")   if end_ts   else ""
-        except Exception:
-            start_date = end_date = ""
-
-        platform_str = ", ".join(platforms) if isinstance(platforms, list) else ""
-
-        # 광고 크리에이티브 목록
-        creatives = node.get("ads") or node.get("ad_creatives") or [node]
-
-        for ad in creatives:
-            if not isinstance(ad, dict): continue
-            snap = ad.get("snapshot") or {}
-
-            # 카피 본문
-            body_raw = (ad.get("body") or snap.get("body") or
-                        ad.get("ad_creative_bodies") or "")
-            body = extract_text(body_raw)[:400]
-
-            # 헤드라인
-            hl_raw = (ad.get("title") or snap.get("title") or
-                      ad.get("ad_creative_link_titles") or
-                      snap.get("link_title") or "")
-            headline = extract_text(hl_raw)[:120]
-
-            # CTA
-            cta = str(ad.get("cta_text") or snap.get("cta_text") or
-                      ad.get("call_to_action_type") or "")[:40]
-
-            base = dict(
-                advertiser=advertiser, headline=headline,
-                body=body, cta=cta,
-                start_date=start_date, end_date=end_date,
-                platforms=platform_str,
-            )
-
-            # 이미지
-            imgs = (ad.get("images") or snap.get("images") or
-                    ad.get("ad_creative_images") or [])
-            for img in imgs:
-                if not isinstance(img, dict): continue
-                url = (img.get("original_image_url") or img.get("url") or
-                       img.get("resized_image_url") or "")
-                if url:
-                    results.append({**base, "type": "image", "src": url})
-
-            # 비디오 썸네일
-            vids = (ad.get("videos") or snap.get("videos") or
-                    ad.get("ad_creative_videos") or [])
-            for vid in vids:
-                if not isinstance(vid, dict): continue
-                url = (vid.get("video_preview_image_url") or
-                       vid.get("thumbnail") or "")
-                if url:
-                    results.append({**base, "type": "video_poster", "src": url})
-
-        return results
-
-    def parse_graphql_body(raw_bytes: bytes) -> list[dict]:
-        results = []
-        try:
-            text = raw_bytes.decode("utf-8", errors="ignore")
-        except Exception:
-            return results
-
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or not line.startswith("{"): continue
-            try:
-                data = json.loads(line)
-                # edges 탐색
-                def walk(obj):
-                    if isinstance(obj, dict):
-                        if "edges" in obj:
-                            for edge in obj.get("edges", []):
-                                node = edge.get("node", {})
-                                if "page_name" in node or "ads" in node:
-                                    results.extend(parse_ad_node(node))
-                        for v in obj.values():
-                            walk(v)
-                    elif isinstance(obj, list):
-                        for item in obj:
-                            walk(item)
-                walk(data)
-            except Exception:
-                pass
-        return results
-
-    # ── Playwright 실행 ──
-    gql_results = []
-    captured_bodies = []  # route에서 캡처한 응답 바이트 목록
-
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=[
             "--no-sandbox", "--disable-dev-shm-usage", "--disable-extensions",
-            "--disable-plugins", "--no-first-run", "--disable-default-apps",
+            "--disable-plugins", "--disable-background-networking",
+            "--no-first-run", "--disable-default-apps",
         ])
         ctx = browser.new_context(viewport={"width": 1440, "height": 2000})
         ctx.route("**/*.{woff,woff2,ttf,otf,eot}", lambda r: r.abort())
-
-        # GraphQL 요청을 route로 가로채서 응답 바이트 저장
-        def handle_graphql(route):
-            try:
-                resp = route.fetch()
-                body = resp.body()
-                captured_bodies.append(body)
-                route.fulfill(response=resp)
-            except Exception:
-                try:
-                    route.continue_()
-                except Exception:
-                    pass
-
-        ctx.route("**/api/graphql*", handle_graphql)
-        ctx.route("**/graphql*",     handle_graphql)
-
         page = ctx.new_page()
         page.goto(search_url, wait_until="domcontentloaded", timeout=90000)
         page.wait_for_timeout(4000)
 
         def card_count():
-            return page.evaluate(
-                "() => document.querySelectorAll('img[src*=\"fbcdn\"]').length"
-            )
+            return page.evaluate("""() => {
+                const sels = [
+                    'div[class*="x8gbvx8"]',
+                    'div[data-visualcompletion="ignore-dynamic"]',
+                    'div._7jyr',
+                    'div[class*="xh8yej3"]'
+                ];
+                for (const s of sels) {
+                    const n = document.querySelectorAll(s).length;
+                    if (n > 0) return n;
+                }
+                return document.querySelectorAll('img[src*="fbcdn"]').length;
+            }""")
 
         prev, stalls = 0, 0
         for _ in range(scrolls):
@@ -401,348 +261,75 @@ def scrape(keyword, country, scrolls, limit):
                 stalls += 1
                 if stalls >= 2: break
 
-        # DOM에서 이미지 + 카피 동시 수집 (카드 단위)
-        dom_data = page.evaluate("""() => {
+        raw = page.evaluate("""() => {
             const out = [];
-
-            // 전체 텍스트 블록 수집
-            function getText(el) {
-                try { return (el.innerText || el.textContent || '').trim(); }
-                catch(e) { return ''; }
-            }
-
-            // 이미지 전체
-            const imgMap = {};
-            for (const img of document.querySelectorAll('img[src*="fbcdn"]')) {
+            for (const img of document.querySelectorAll('img')) {
                 const src = img.currentSrc || img.src || '';
-                if (!src) continue;
-                // 가장 가까운 텍스트 블록 찾기
-                let parent = img.parentElement;
-                let body = '', headline = '', advertiser = '', cta = '';
-                for (let i = 0; i < 8 && parent; i++) {
-                    const divs = parent.querySelectorAll('div[dir="auto"]');
-                    const texts = [];
-                    for (const d of divs) {
-                        const t = getText(d);
-                        if (t && t.length > 3) texts.push(t);
-                    }
-                    if (texts.length > 0) {
-                        body = texts.slice(0, 3).join(' | ').substring(0, 400);
-                        break;
-                    }
-                    parent = parent.parentElement;
-                }
+                if (!src || src.startsWith('data:')) continue;
                 out.push({
                     type: 'image', src,
                     w: img.naturalWidth  || img.width  || 0,
                     h: img.naturalHeight || img.height || 0,
-                    body, headline, advertiser, cta
+                    alt: img.alt || ''
                 });
             }
-
-            // 비디오 썸네일
             for (const v of document.querySelectorAll('video')) {
-                if (!v.poster) continue;
+                const poster = v.poster || '';
+                if (!poster) continue;
                 out.push({
-                    type: 'video_poster', src: v.poster,
-                    w: v.videoWidth || v.clientWidth || 0,
+                    type: 'video_poster', src: poster,
+                    w: v.videoWidth  || v.clientWidth  || 0,
                     h: v.videoHeight || v.clientHeight || 0,
-                    body: '', headline: '', advertiser: '', cta: ''
+                    alt: ''
                 });
             }
             return out;
         }""")
-
-        # ── 브라우저 fetch로 이미지 base64 캡처 (Meta CDN 우회) ──
-        # 브라우저 컨텍스트 안에서 실행되므로 쿠키·헤더 자동 포함
-        img_urls = [d["src"] for d in dom_data if d.get("src") and d.get("type") == "image"]
-        img_urls = img_urls[:limit]  # 최대 limit개만
-
-        img_b64_map = {}
-        if img_urls:
-            try:
-                results = page.evaluate("""async (urls) => {
-                    const out = {};
-                    const fetchOne = async (url) => {
-                        try {
-                            const resp = await fetch(url, {credentials: 'include'});
-                            if (!resp.ok) return null;
-                            const buf = await resp.arrayBuffer();
-                            const bytes = new Uint8Array(buf);
-                            let binary = '';
-                            for (let i = 0; i < bytes.byteLength; i++) {
-                                binary += String.fromCharCode(bytes[i]);
-                            }
-                            return btoa(binary);
-                        } catch(e) { return null; }
-                    };
-                    // 병렬로 최대 5개씩 처리
-                    const chunkSize = 5;
-                    for (let i = 0; i < urls.length; i += chunkSize) {
-                        const chunk = urls.slice(i, i + chunkSize);
-                        const results = await Promise.all(chunk.map(fetchOne));
-                        chunk.forEach((url, idx) => {
-                            if (results[idx]) out[url] = results[idx];
-                        });
-                    }
-                    return out;
-                }""", img_urls)
-                if isinstance(results, dict):
-                    img_b64_map = results
-            except Exception:
-                pass
-
         ctx.close(); browser.close()
 
-    # ── GraphQL 파싱 ──
-    for body_bytes in captured_bodies:
-        gql_results.extend(parse_graphql_body(body_bytes))
-
-    # GraphQL 이미지 URL → 카피 매핑
-    gql_map = {}  # src → 카피 정보
-    for g in gql_results:
-        src = g.get("src", "")
-        if src:
-            gql_map[src] = g
-
-    # ── 최종 수집 ──
-    now = time.strftime("%Y-%m-%d %H:%M:%S")
-    seen, collected = set(), []
-
-    for d in dom_data:
+    seen, collected, now = set(), [], time.strftime("%Y-%m-%d %H:%M:%S")
+    for r in raw:
         if len(collected) >= limit: break
-        src = (d.get("src") or "").strip()
-        if not src: continue
-        w, h = int(d.get("w") or 0), int(d.get("h") or 0)
-        if not valid(w, h): continue
-
-        # GraphQL 카피 우선, 없으면 DOM 카피 사용
-        gql = gql_map.get(src, {})
-        advertiser = gql.get("advertiser") or d.get("advertiser") or ""
-        headline   = gql.get("headline")   or d.get("headline")   or ""
-        body       = gql.get("body")       or d.get("body")       or ""
-        cta        = gql.get("cta")        or d.get("cta")        or ""
-        start_date = gql.get("start_date") or ""
-        end_date   = gql.get("end_date")   or ""
-        platforms  = gql.get("platforms")  or ""
-
+        src = (r.get("src") or "").strip()
+        w, h = int(r.get("w") or 0), int(r.get("h") or 0)
+        if not src or not valid(w, h): continue
         asset = {
             "id":         str(uuid.uuid4()),
             "keyword":    keyword,
             "country":    country,
-            "asset_type": d.get("type", "image"),
+            "asset_type": r.get("type", "image"),
             "image_url":  src,
             "source_url": search_url,
-            "caption":    "",
-            "advertiser": advertiser,
-            "headline":   headline,
-            "body":       body,
-            "cta":        cta,
-            "start_date": start_date,
-            "end_date":   end_date,
-            "platforms":  platforms,
+            "caption":    (r.get("alt") or "").strip(),
             "width":      w,
             "height":     h,
             "created_at": now,
             "starred":    False,
             "ai":         None,
-            "img_b64":    img_b64_map.get(src, ""),  # 브라우저로 캡처한 base64
         }
-        fp_key = make_fp(asset)
-        if fp_key in seen: continue
-        seen.add(fp_key)
-        collected.append(asset)
-
+        fp = make_fp(asset)
+        if fp in seen: continue
+        seen.add(fp); collected.append(asset)
     return collected
-
 
 
 # ============================================================
 # AI 분석
 # ============================================================
-def fetch_image_b64(url: str):
-    """이미지 URL → (base64, media_type). 실패 시 None"""
-    try:
-        import base64
-        resp = requests.get(url, timeout=8, headers={
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/120.0.0.0 Safari/537.36",
-            "Referer": "https://www.facebook.com/",
-        })
-        if resp.status_code != 200 or len(resp.content) < 500:
-            return None
-        ct = resp.headers.get("content-type", "image/jpeg")
-        if "png"  in ct: mt = "image/png"
-        elif "gif"  in ct: mt = "image/gif"
-        elif "webp" in ct: mt = "image/webp"
-        else:               mt = "image/jpeg"
-        return base64.standard_b64encode(resp.content).decode("utf-8"), mt
-    except Exception:
-        return None
-
-
-def analyze(item):
-    """
-    Claude Vision으로 광고 소재 분석
-    1. 이미지 내 카피 추출
-    2. 톤앤매너 분석
-    3. 소구포인트 인사이트
-    """
+def analyze(image_url, keyword):
     if not API_KEY: return None
     try:
-        # ── 프롬프트 구성 ──
-        meta_ctx = ""
-        parts = []
-        if item.get("advertiser"): parts.append(f"광고주: {item['advertiser']}")
-        if item.get("start_date"): parts.append(f"집행 시작: {item['start_date']}")
-        if item.get("platforms"):  parts.append(f"플랫폼: {item['platforms']}")
-        if parts:
-            meta_ctx = "\n[메타 정보]\n" + "\n".join(parts)
-
-        prompt_text = (
-            "당신은 광고 전략 전문가이자 크리에이티브 디렉터입니다.\n"
-            "아래 Meta 광고 소재 이미지를 보고 세 가지를 분석해주세요.\n\n"
-            f"[검색 키워드] {item['keyword']}"
-            + meta_ctx +
-            "\n\n"
-            "반드시 아래 JSON 형식으로만 답하세요 (마크다운·백틱 없이 순수 JSON):\n"
-            "{\n"
-            '  "copy_analysis": {\n'
-            '    "visible_text": "이미지에서 실제로 보이는 텍스트/카피 전체 (그대로 옮겨쓰기)",\n'
-            '    "hook": "첫 시선을 잡는 핵심 문구 또는 비주얼 요소",\n'
-            '    "headline": "메인 헤드라인 (있다면)",\n'
-            '    "cta": "CTA 버튼 또는 행동 유도 문구 (있다면)",\n'
-            '    "appeal": "소구포인트 유형 — 감성/이성/사회적증거/희소성/혜택/공포 중 선택 + 근거"\n'
-            '  },\n'
-            '  "tone_manner": {\n'
-            '    "mood": "전체적인 분위기 (예: 고급스러운, 친근한, 역동적인, 미니멀한 등)",\n'
-            '    "color_tone": "주요 색상과 색감이 주는 인상",\n'
-            '    "visual_style": "비주얼 스타일 (예: 제품 중심, 라이프스타일, UGC, 인포그래픽 등)",\n'
-            '    "typography": "폰트/텍스트 스타일의 특징 (있다면)",\n'
-            '    "target_feel": "이 광고가 타겟에게 주려는 감정이나 느낌"\n'
-            '  },\n'
-            '  "insight": {\n'
-            '    "target": "추정 타겟 고객 (연령·성별·관심사·상황 구체적으로)",\n'
-            '    "message": "이 광고가 전달하려는 핵심 메시지 한 줄",\n'
-            '    "strategy": "이 소재의 광고 전략적 의도 (왜 이렇게 만들었는가)",\n'
-            '    "strength": "이 소재의 강점",\n'
-            '    "weakness": "이 소재의 약점 또는 개선 제안",\n'
-            '    "tags": ["태그1","태그2","태그3","태그4"]\n'
-            '  }\n'
-            "}"
-        )
-
-        # ── 이미지 base64 확보 (저장된 것 우선, 없으면 다운로드 시도) ──
-        b64, mt = "", "image/jpeg"
-
-        if item.get("img_b64"):
-            # 스크래핑 시 브라우저로 캡처한 base64 사용
-            b64 = item["img_b64"]
-            mt  = "image/jpeg"
-        else:
-            # fallback: requests로 시도
-            img_result = fetch_image_b64(item["image_url"])
-            if img_result:
-                b64, mt = img_result
-
-        if b64:
-            content = [
-                {
-                    "type": "image",
-                    "source": {
-                        "type":       "base64",
-                        "media_type": mt,
-                        "data":       b64,
-                    }
-                },
-                {"type": "text", "text": prompt_text}
-            ]
-        else:
-            content = [{"type": "text", "text": prompt_text}]
-
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key":         API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type":      "application/json",
-            },
-            json={
-                "model":      "claude-haiku-4-5-20251001",  # vision 지원
-                "max_tokens": 900,
-                "messages":   [{"role": "user", "content": content}],
-            },
-            timeout=30,
-        )
-        if resp.status_code != 200: return None
-        txt = resp.json()["content"][0]["text"].strip()
-        s, e = txt.find("{"), txt.rfind("}") + 1
-        return json.loads(txt[s:e]) if s != -1 and e > 0 else None
-    except Exception:
-        return None
-
-
-def analyze_parallel(items, max_workers=3):
-    """
-    병렬 분석 - 이미지 다운로드와 API 호출 동시 진행
-    실패 시 재시도 1회 + 텍스트 fallback 보장
-    """
-    if not API_KEY: return items
-    id_map = {item["id"]: item for item in items}
-
-    def task(item):
-        # 1차 시도 (이미지 포함)
-        result = analyze(item)
-        if result:
-            return item["id"], result
-        # 2차 시도 - 잠깐 대기 후 재시도
-        time.sleep(1.5)
-        result = analyze(item)
-        if result:
-            return item["id"], result
-        # 3차 - 이미지 없이 키워드+메타정보만으로 강제 분석
-        result = analyze_text_only(item)
-        return item["id"], result
-
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {
-            ex.submit(task, item): item["id"]
-            for item in items if not item.get("ai")
-        }
-        for future in as_completed(futures):
-            try:
-                aid, result = future.result(timeout=60)
-                if result and aid in id_map:
-                    id_map[aid]["ai"] = result
-            except Exception:
-                pass
-    return items
-
-
-def analyze_text_only(item):
-    """이미지 없이 키워드·메타정보만으로 분석 (최후 fallback)"""
-    if not API_KEY: return None
-    try:
-        parts = [f"검색 키워드: {item['keyword']}"]
-        if item.get("advertiser"): parts.append(f"광고주: {item['advertiser']}")
-        if item.get("headline"):   parts.append(f"헤드라인: {item['headline']}")
-        if item.get("body"):       parts.append(f"본문: {item['body']}")
-        if item.get("cta"):        parts.append(f"CTA: {item['cta']}")
-        if item.get("platforms"):  parts.append(f"플랫폼: {item['platforms']}")
-
         prompt = (
-            "광고 전략 전문가입니다. 아래 정보로 광고 소재를 분석해주세요.\n\n"
-            + "\n".join(parts) +
-            "\n\n이미지를 직접 볼 수 없으니 수집된 텍스트 정보 기반으로 최대한 분석해주세요.\n"
-            "아래 JSON만 반환 (마크다운·백틱 없이):\n"
-            '{"copy_analysis":{"visible_text":"수집된 카피 요약","hook":"추정 후크",'
-            '"headline":"헤드라인","cta":"CTA","appeal":"소구포인트 유형+근거"},'
-            '"tone_manner":{"mood":"추정 분위기","color_tone":"알 수 없음",'
-            '"visual_style":"알 수 없음","typography":"알 수 없음","target_feel":"추정 감정"},'
-            '"insight":{"target":"타겟 추정","message":"핵심 메시지",'
-            '"strategy":"전략 추정","strength":"강점","weakness":"약점",'
-            '"tags":["태그1","태그2","태그3"]}}'
+            "광고 전략 전문가로서 Meta 광고 소재를 분석해주세요.\n\n"
+            f"검색 키워드: {keyword}\n"
+            f"이미지 URL: {image_url}\n\n"
+            "이미지를 직접 볼 수 없어도 키워드와 URL 패턴으로 분석해주세요.\n"
+            "아래 JSON만 반환 (마크다운·백틱 없이 순수 JSON):\n"
+            '{"hook":"첫 시선을 잡는 요소 (1문장)",'
+            '"appeal":"소구포인트 유형 + 설명 (감성/이성/사회적증거/희소성/혜택 분류)",'
+            '"target":"추정 타겟 (연령·성별·관심사)",'
+            '"message":"핵심 메시지 (1문장)",'
+            '"tags":["태그1","태그2","태그3"]}'
         )
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -753,10 +340,10 @@ def analyze_text_only(item):
             },
             json={
                 "model":      "claude-haiku-4-5-20251001",
-                "max_tokens": 700,
+                "max_tokens": 400,
                 "messages":   [{"role": "user", "content": prompt}],
             },
-            timeout=20,
+            timeout=25,
         )
         if resp.status_code != 200: return None
         txt = resp.json()["content"][0]["text"].strip()
@@ -764,6 +351,19 @@ def analyze_text_only(item):
         return json.loads(txt[s:e]) if s != -1 and e > 0 else None
     except Exception:
         return None
+
+def analyze_parallel(items, max_workers=6):
+    if not API_KEY: return items
+    id_map = {item["id"]: item for item in items}
+    def task(item):
+        return item["id"], analyze(item["image_url"], item["keyword"])
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(task, item): item["id"] for item in items if not item.get("ai")}
+        for future in as_completed(futures):
+            aid, result = future.result()
+            if result and aid in id_map:
+                id_map[aid]["ai"] = result
+    return items
 
 def summarize_insights(analyzed_items):
     if not API_KEY or not analyzed_items: return None
@@ -851,8 +451,8 @@ def toggle_star(aid):
 
 def to_csv(items):
     import csv
-    fields = ["keyword","country","asset_type","advertiser","headline","body","cta",
-              "image_url","source_url","caption","width","height","created_at","starred"]
+    fields = ["keyword","country","asset_type","image_url","source_url",
+              "caption","width","height","created_at","starred"]
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=fields)
     w.writeheader()
@@ -1336,33 +936,13 @@ if ai_on and API_KEY and shown:
     with btn_c1:
         if sel_unanalyzed:
             if st.button(f"선택 분석 ({len(sel_unanalyzed)})", use_container_width=True):
-                pb = st.progress(0, text=f"분석 중... 0 / {len(sel_unanalyzed)}")
+                pb = st.progress(0, text="병렬 분석 중...")
+                result_items = analyze_parallel(sel_unanalyzed, max_workers=6)
                 id_map = {a["id"]: a for a in st.session_state.assets}
                 done = 0
-
-                def do_one(item):
-                    result = analyze(item)
-                    if result: return item["id"], result
-                    time.sleep(1)
-                    result = analyze(item)
-                    if result: return item["id"], result
-                    return item["id"], analyze_text_only(item)
-
-                with ThreadPoolExecutor(max_workers=3) as ex:
-                    futures = {ex.submit(do_one, item): item for item in sel_unanalyzed}
-                    for future in as_completed(futures):
-                        try:
-                            aid, result = future.result(timeout=60)
-                            if result and aid in id_map:
-                                id_map[aid]["ai"] = result
-                            done += 1
-                            pb.progress(
-                                done / len(sel_unanalyzed),
-                                text=f"분석 중... {done} / {len(sel_unanalyzed)}"
-                            )
-                        except Exception:
-                            done += 1
-
+                for it in result_items:
+                    if it.get("ai") and it["id"] in id_map:
+                        id_map[it["id"]]["ai"] = it["ai"]; done += 1
                 pb.progress(1.0, text=f"완료! {done}개 분석")
                 pb.empty()
                 st.rerun()
@@ -1413,75 +993,32 @@ else:
             sel_b = '<span class="bdg" style="background:var(--ac);color:#fff;border-color:var(--ac)">SEL</span> ' if is_sel else ""
             sv_b  = '<span class="bdg b-sav">★</span> ' if item.get("starred") else ""
             ai_b  = '<span class="bdg b-ai">AI</span> ' if item.get("ai")      else ""
-
-            # 카피 정보
-            adv  = item.get("advertiser", "")
-            hl   = item.get("headline", "")
-            body = item.get("body", "")
-            cta  = item.get("cta", "")
-
-            adv_html  = f'<div style="font-size:10px;font-weight:700;color:var(--ac);margin-bottom:2px;">{adv}</div>' if adv else ""
-            hl_html   = f'<div style="font-size:12px;font-weight:600;color:var(--tx);margin-bottom:3px;line-height:1.3;">{hl[:60]}{"..." if len(hl)>60 else ""}</div>' if hl else ""
-            body_html = f'<div style="font-size:11px;color:var(--tx2);line-height:1.45;margin-bottom:4px;opacity:.85;">{body[:120]}{"..." if len(body)>120 else ""}</div>' if body else ""
-            cta_html  = f'<span style="display:inline-block;font-size:9px;font-weight:700;background:var(--ac2);color:var(--ac);border-radius:4px;padding:2px 7px;margin-top:2px;">{cta}</span>' if cta else ""
+            cap   = item.get("caption", "")
+            cap_h = f'<div class="card-cap">"{cap[:55]}{"..." if len(cap) > 55 else ""}"</div>' if cap else ""
 
             st.markdown(
                 '<div class="card-body">'
                 f'<div class="card-kw">{item["keyword"]} · {item["country"]}</div>'
                 + sel_b + sv_b + ai_b +
                 f'<span class="bdg {bc}">{bl}</span>'
-                + adv_html + hl_html + body_html + cta_html +
-                f'<div class="card-meta" style="margin-top:6px;">{item["width"]}x{item["height"]}px · {item["created_at"][11:16]}</div>'
+                + cap_h +
+                f'<div class="card-meta">{item["width"]}x{item["height"]}px · {item["created_at"][11:16]}</div>'
                 '</div>',
                 unsafe_allow_html=True)
 
             ai_data = item.get("ai")
             if ai_data:
-                copy_a  = ai_data.get("copy_analysis") or {}
-                tone    = ai_data.get("tone_manner")   or {}
-                insight = ai_data.get("insight")       or {}
-                tags    = insight.get("tags") or ai_data.get("tags") or []
-                tags_html = "".join(f'<span class="ai-tag">{t}</span>' for t in tags)
-
-                def row(label, val):
-                    if not val: return ""
-                    return (f'<div style="margin-bottom:5px;">'
-                            f'<span style="font-size:10px;font-weight:700;'
-                            f'color:var(--ac);min-width:70px;display:inline-block">'
-                            f'{label}</span>'
-                            f'<span style="font-size:11px;color:var(--tx2);">{val}</span>'
-                            f'</div>')
-
+                tags_str = "".join(f'<span class="ai-tag">{t}</span>' for t in ai_data.get("tags", []))
                 st.markdown(
                     '<div class="ai-wrap"><div class="ai-box">'
-
-                    # ── 1. 카피 분석 ──
-                    '<div class="ai-head" style="margin-bottom:8px;">📝 카피 분석</div>'
-                    + row("노출 카피", copy_a.get("visible_text","")[:120])
-                    + row("후크",     copy_a.get("hook",""))
-                    + row("헤드라인", copy_a.get("headline",""))
-                    + row("CTA",      copy_a.get("cta",""))
-                    + row("소구",     copy_a.get("appeal",""))
-
-                    # ── 2. 톤앤매너 ──
-                    + '<div style="border-top:1px solid var(--ac2);margin:10px 0 8px;"></div>'
-                    '<div class="ai-head" style="margin-bottom:8px;">🎨 톤앤매너</div>'
-                    + row("분위기",   tone.get("mood",""))
-                    + row("색감",     tone.get("color_tone",""))
-                    + row("비주얼",   tone.get("visual_style",""))
-                    + row("감정",     tone.get("target_feel",""))
-
-                    # ── 3. 인사이트 ──
-                    + '<div style="border-top:1px solid var(--ac2);margin:10px 0 8px;"></div>'
-                    '<div class="ai-head" style="margin-bottom:8px;">💡 인사이트</div>'
-                    + row("타겟",     insight.get("target",""))
-                    + row("메시지",   insight.get("message",""))
-                    + row("전략",     insight.get("strategy",""))
-                    + (f'<div style="font-size:11px;color:var(--ok);margin-bottom:3px;">▲ {insight.get("strength","")}</div>' if insight.get("strength") else "")
-                    + (f'<div style="font-size:11px;color:var(--er);margin-bottom:6px;">▼ {insight.get("weakness","")}</div>' if insight.get("weakness") else "")
-                    + (f'<div style="margin-top:6px">{tags_html}</div>' if tags_html else "")
-
-                    + '</div></div>',
+                    '<div class="ai-head">APPEAL ANALYSIS</div>'
+                    '<div class="ai-body">'
+                    f'<b>후크</b>&nbsp;&nbsp;&nbsp;{ai_data.get("hook","—")}<br>'
+                    f'<b>소구</b>&nbsp;&nbsp;&nbsp;{ai_data.get("appeal","—")}<br>'
+                    f'<b>타겟</b>&nbsp;&nbsp;&nbsp;{ai_data.get("target","—")}<br>'
+                    f'<b>메시지</b>&nbsp;{ai_data.get("message","—")}<br>'
+                    f'<div style="margin-top:6px">{tags_str}</div>'
+                    '</div></div></div>',
                     unsafe_allow_html=True)
 
             st.markdown('</div>', unsafe_allow_html=True)
