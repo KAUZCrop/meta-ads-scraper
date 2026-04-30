@@ -263,25 +263,115 @@ def scrape(keyword, country, scrolls, limit):
 
         raw = page.evaluate("""() => {
             const out = [];
-            for (const img of document.querySelectorAll('img')) {
-                const src = img.currentSrc || img.src || '';
-                if (!src || src.startsWith('data:')) continue;
-                out.push({
-                    type: 'image', src,
-                    w: img.naturalWidth  || img.width  || 0,
-                    h: img.naturalHeight || img.height || 0,
-                    alt: img.alt || ''
-                });
+
+            // ── Meta Ad Library 카드 셀렉터 (여러 버전 대응) ──
+            const CARD_SELS = [
+                'div[class*="_7jyr"]',
+                'div[class*="x1dr75xp"]',
+                'div[class*="xh8yej3"]',
+                'div[data-visualcompletion="ignore-dynamic"]',
+            ];
+
+            let cards = [];
+            for (const sel of CARD_SELS) {
+                const found = Array.from(document.querySelectorAll(sel));
+                if (found.length > 2) { cards = found; break; }
             }
-            for (const v of document.querySelectorAll('video')) {
-                const poster = v.poster || '';
-                if (!poster) continue;
-                out.push({
-                    type: 'video_poster', src: poster,
-                    w: v.videoWidth  || v.clientWidth  || 0,
-                    h: v.videoHeight || v.clientHeight || 0,
-                    alt: ''
-                });
+
+            // 카드 단위로 수집 실패 시 이미지 fallback
+            if (cards.length === 0) {
+                for (const img of document.querySelectorAll('img')) {
+                    const src = img.currentSrc || img.src || '';
+                    if (!src || src.startsWith('data:')) continue;
+                    out.push({
+                        type: 'image', src,
+                        w: img.naturalWidth  || img.width  || 0,
+                        h: img.naturalHeight || img.height || 0,
+                        advertiser: '', headline: '', body: '', cta: ''
+                    });
+                }
+                for (const v of document.querySelectorAll('video')) {
+                    if (!v.poster) continue;
+                    out.push({
+                        type: 'video_poster', src: v.poster,
+                        w: v.videoWidth || v.clientWidth || 0,
+                        h: v.videoHeight || v.clientHeight || 0,
+                        advertiser: '', headline: '', body: '', cta: ''
+                    });
+                }
+                return out;
+            }
+
+            for (const card of cards) {
+                // ── 광고주명 ──
+                let advertiser = '';
+                const advEl = card.querySelector('a[href*="facebook.com"] strong')
+                    || card.querySelector('a[role="link"] strong')
+                    || card.querySelector('span[dir="auto"] strong')
+                    || card.querySelector('h2 span')
+                    || card.querySelector('h3 span');
+                if (advEl) advertiser = advEl.innerText.trim();
+
+                // ── 광고 카피 (body) ──
+                let body = '';
+                // 여러 텍스트 컨테이너 시도
+                const textCandidates = card.querySelectorAll(
+                    'div[data-ad-preview="message"], ' +
+                    'div[class*="xdj266r"], ' +
+                    'div[class*="_4bl9"], ' +
+                    'div[dir="auto"][class*="x1iorvi4"], ' +
+                    'div[dir="auto"][style*="white-space"]'
+                );
+                const textParts = [];
+                for (const el of textCandidates) {
+                    const t = el.innerText.trim();
+                    if (t && t.length > 5 && !textParts.includes(t)) {
+                        textParts.push(t);
+                    }
+                }
+                body = textParts.slice(0, 3).join(' | ').substring(0, 300);
+
+                // ── 헤드라인 ──
+                let headline = '';
+                const hlEl = card.querySelector(
+                    'div[class*="_8m3n"] span, ' +
+                    'div[class*="xt0psk2"], ' +
+                    'h2[class*="x1heor9g"], ' +
+                    '[role="heading"]'
+                );
+                if (hlEl) headline = hlEl.innerText.trim().substring(0, 120);
+
+                // ── CTA 버튼 ──
+                let cta = '';
+                const ctaEl = card.querySelector(
+                    'div[class*="_6lz"] a, ' +
+                    'a[role="button"], ' +
+                    'div[class*="x1i10hfl"][role="button"]'
+                );
+                if (ctaEl) cta = ctaEl.innerText.trim().substring(0, 40);
+
+                // ── 이미지 ──
+                for (const img of card.querySelectorAll('img')) {
+                    const src = img.currentSrc || img.src || '';
+                    if (!src || src.startsWith('data:')) continue;
+                    out.push({
+                        type: 'image', src,
+                        w: img.naturalWidth  || img.width  || 0,
+                        h: img.naturalHeight || img.height || 0,
+                        advertiser, headline, body, cta
+                    });
+                }
+
+                // ── 비디오 썸네일 ──
+                for (const v of card.querySelectorAll('video')) {
+                    if (!v.poster) continue;
+                    out.push({
+                        type: 'video_poster', src: v.poster,
+                        w: v.videoWidth || v.clientWidth || 0,
+                        h: v.videoHeight || v.clientHeight || 0,
+                        advertiser, headline, body, cta
+                    });
+                }
             }
             return out;
         }""")
@@ -301,6 +391,10 @@ def scrape(keyword, country, scrolls, limit):
             "image_url":  src,
             "source_url": search_url,
             "caption":    (r.get("alt") or "").strip(),
+            "advertiser": (r.get("advertiser") or "").strip(),
+            "headline":   (r.get("headline") or "").strip(),
+            "body":       (r.get("body") or "").strip(),
+            "cta":        (r.get("cta") or "").strip(),
             "width":      w,
             "height":     h,
             "created_at": now,
@@ -316,19 +410,28 @@ def scrape(keyword, country, scrolls, limit):
 # ============================================================
 # AI 분석
 # ============================================================
-def analyze(image_url, keyword):
+def analyze(item):
     if not API_KEY: return None
     try:
+        # 수집된 카피 정보 조합
+        copy_parts = []
+        if item.get("advertiser"): copy_parts.append(f"광고주: {item['advertiser']}")
+        if item.get("headline"):   copy_parts.append(f"헤드라인: {item['headline']}")
+        if item.get("body"):       copy_parts.append(f"본문: {item['body']}")
+        if item.get("cta"):        copy_parts.append(f"CTA: {item['cta']}")
+        copy_context = "\n".join(copy_parts) if copy_parts else "카피 없음"
+
         prompt = (
-            "광고 전략 전문가로서 Meta 광고 소재를 분석해주세요.\n\n"
-            f"검색 키워드: {keyword}\n"
-            f"이미지 URL: {image_url}\n\n"
-            "이미지를 직접 볼 수 없어도 키워드와 URL 패턴으로 분석해주세요.\n"
-            "아래 JSON만 반환 (마크다운·백틱 없이 순수 JSON):\n"
-            '{"hook":"첫 시선을 잡는 요소 (1문장)",'
-            '"appeal":"소구포인트 유형 + 설명 (감성/이성/사회적증거/희소성/혜택 분류)",'
-            '"target":"추정 타겟 (연령·성별·관심사)",'
-            '"message":"핵심 메시지 (1문장)",'
+            "당신은 광고 전략 전문가입니다. 아래 Meta 광고 소재를 분석해주세요.\n\n"
+            f"[검색 키워드]\n{item['keyword']}\n\n"
+            f"[수집된 광고 카피]\n{copy_context}\n\n"
+            "위 정보를 바탕으로 아래 JSON만 반환하세요 (마크다운·백틱 없이 순수 JSON):\n"
+            '{"hook":"첫 시선을 잡는 핵심 요소 (카피 기반으로 구체적으로)",'
+            '"appeal":"소구포인트 유형과 근거 (감성/이성/사회적증거/희소성/혜택 중 선택 + 카피에서 근거 인용)",'
+            '"target":"타겟 고객 추정 (연령·성별·관심사·상황)",'
+            '"message":"핵심 메시지 한 줄 요약",'
+            '"copy_strength":"카피의 강점 (잘 된 점)",'
+            '"copy_weakness":"카피의 약점 또는 개선점",'
             '"tags":["태그1","태그2","태그3"]}'
         )
         resp = requests.post(
@@ -340,7 +443,7 @@ def analyze(image_url, keyword):
             },
             json={
                 "model":      "claude-haiku-4-5-20251001",
-                "max_tokens": 400,
+                "max_tokens": 600,
                 "messages":   [{"role": "user", "content": prompt}],
             },
             timeout=25,
@@ -356,7 +459,7 @@ def analyze_parallel(items, max_workers=6):
     if not API_KEY: return items
     id_map = {item["id"]: item for item in items}
     def task(item):
-        return item["id"], analyze(item["image_url"], item["keyword"])
+        return item["id"], analyze(item)
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {ex.submit(task, item): item["id"] for item in items if not item.get("ai")}
         for future in as_completed(futures):
@@ -451,8 +554,8 @@ def toggle_star(aid):
 
 def to_csv(items):
     import csv
-    fields = ["keyword","country","asset_type","image_url","source_url",
-              "caption","width","height","created_at","starred"]
+    fields = ["keyword","country","asset_type","advertiser","headline","body","cta",
+              "image_url","source_url","caption","width","height","created_at","starred"]
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=fields)
     w.writeheader()
@@ -993,22 +1096,41 @@ else:
             sel_b = '<span class="bdg" style="background:var(--ac);color:#fff;border-color:var(--ac)">SEL</span> ' if is_sel else ""
             sv_b  = '<span class="bdg b-sav">★</span> ' if item.get("starred") else ""
             ai_b  = '<span class="bdg b-ai">AI</span> ' if item.get("ai")      else ""
-            cap   = item.get("caption", "")
-            cap_h = f'<div class="card-cap">"{cap[:55]}{"..." if len(cap) > 55 else ""}"</div>' if cap else ""
+
+            # 카피 정보
+            adv  = item.get("advertiser", "")
+            hl   = item.get("headline", "")
+            body = item.get("body", "")
+            cta  = item.get("cta", "")
+
+            adv_html  = f'<div style="font-size:10px;font-weight:700;color:var(--ac);margin-bottom:2px;">{adv}</div>' if adv else ""
+            hl_html   = f'<div style="font-size:12px;font-weight:600;color:var(--tx);margin-bottom:3px;line-height:1.3;">{hl[:60]}{"..." if len(hl)>60 else ""}</div>' if hl else ""
+            body_html = f'<div style="font-size:11px;color:var(--tx2);line-height:1.45;margin-bottom:4px;opacity:.85;">{body[:120]}{"..." if len(body)>120 else ""}</div>' if body else ""
+            cta_html  = f'<span style="display:inline-block;font-size:9px;font-weight:700;background:var(--ac2);color:var(--ac);border-radius:4px;padding:2px 7px;margin-top:2px;">{cta}</span>' if cta else ""
 
             st.markdown(
                 '<div class="card-body">'
                 f'<div class="card-kw">{item["keyword"]} · {item["country"]}</div>'
                 + sel_b + sv_b + ai_b +
                 f'<span class="bdg {bc}">{bl}</span>'
-                + cap_h +
-                f'<div class="card-meta">{item["width"]}x{item["height"]}px · {item["created_at"][11:16]}</div>'
+                + adv_html + hl_html + body_html + cta_html +
+                f'<div class="card-meta" style="margin-top:6px;">{item["width"]}x{item["height"]}px · {item["created_at"][11:16]}</div>'
                 '</div>',
                 unsafe_allow_html=True)
 
             ai_data = item.get("ai")
             if ai_data:
                 tags_str = "".join(f'<span class="ai-tag">{t}</span>' for t in ai_data.get("tags", []))
+                strength = ai_data.get("copy_strength", "")
+                weakness = ai_data.get("copy_weakness", "")
+                sw_html = ""
+                if strength or weakness:
+                    sw_html = (
+                        f'<div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--ac2);">'
+                        + (f'<div style="font-size:11px;color:var(--ok);margin-bottom:3px;">▲ {strength}</div>' if strength else "")
+                        + (f'<div style="font-size:11px;color:var(--er);">▼ {weakness}</div>' if weakness else "")
+                        + '</div>'
+                    )
                 st.markdown(
                     '<div class="ai-wrap"><div class="ai-box">'
                     '<div class="ai-head">APPEAL ANALYSIS</div>'
@@ -1018,6 +1140,7 @@ else:
                     f'<b>타겟</b>&nbsp;&nbsp;&nbsp;{ai_data.get("target","—")}<br>'
                     f'<b>메시지</b>&nbsp;{ai_data.get("message","—")}<br>'
                     f'<div style="margin-top:6px">{tags_str}</div>'
+                    + sw_html +
                     '</div></div></div>',
                     unsafe_allow_html=True)
 
