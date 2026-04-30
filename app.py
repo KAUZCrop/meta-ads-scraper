@@ -67,11 +67,11 @@ DARK = """
 }"""
 
 st.markdown(f"""<style>
-@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@700;800&family=DM+Sans:wght@400;500&display=swap');
+@import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css');
 
 {DARK if D else LIGHT}
 
-html,body,[class*="css"]{{font-family:'DM Sans',sans-serif;background:var(--bg)!important;color:var(--tx)!important;}}
+html,body,[class*="css"]{{font-family:'Pretendard',sans-serif;background:var(--bg)!important;color:var(--tx)!important;}}
 .stApp{{background:var(--bg)!important;}}
 [data-testid="stHeader"]{{background:var(--bg)!important;border-bottom:1px solid var(--bd);}}
 [data-testid="stSidebar"]{{background:var(--bg2)!important;border-right:1px solid var(--bd)!important;}}
@@ -81,45 +81,45 @@ html,body,[class*="css"]{{font-family:'DM Sans',sans-serif;background:var(--bg)!
 /* 헤더 */
 .hdr{{margin-bottom:2rem;padding-bottom:1.2rem;border-bottom:2px solid var(--bd);}}
 .hdr-row{{display:flex;align-items:center;gap:10px;}}
-.logo{{font-family:'Syne',sans-serif;font-size:22px;font-weight:800;letter-spacing:-.5px;color:var(--tx);}}
+.logo{{font-family:'Pretendard',sans-serif;font-size:22px;font-weight:800;letter-spacing:-.5px;color:var(--tx);}}
 .logo b{{color:var(--ac);}}
-.ver{{font-family:'DM Mono',monospace;font-size:10px;color:var(--mu);border:1px solid var(--bd2);padding:2px 8px;border-radius:4px;background:var(--bg3);}}
-.sub{{font-family:'DM Mono',monospace;font-size:10px;color:var(--mu);letter-spacing:2px;margin-top:8px;}}
+.ver{{font-family:'Pretendard',monospace;font-size:10px;color:var(--mu);border:1px solid var(--bd2);padding:2px 8px;border-radius:4px;background:var(--bg3);}}
+.sub{{font-family:'Pretendard',monospace;font-size:10px;color:var(--mu);letter-spacing:2px;margin-top:8px;}}
 
 /* 사이드바 라벨 */
-.slbl{{font-family:'DM Mono',monospace;font-size:9px;color:var(--mu);letter-spacing:1.5px;text-transform:uppercase;margin:8px 0 6px;}}
+.slbl{{font-family:'Pretendard',monospace;font-size:9px;color:var(--mu);letter-spacing:1.5px;text-transform:uppercase;margin:8px 0 6px;}}
 
 /* 검색창 */
 .srch{{background:var(--bg2);border:1.5px solid var(--bd);border-radius:14px;padding:16px 20px;margin-bottom:1.2rem;}}
-.srch-lbl{{font-family:'DM Mono',monospace;font-size:9px;color:var(--mu);letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;}}
+.srch-lbl{{font-family:'Pretendard',monospace;font-size:9px;color:var(--mu);letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;}}
 
 /* 스탯 카드 */
 .sc{{background:var(--bg);border:1.5px solid var(--bd);border-radius:12px;padding:20px 20px 18px;position:relative;overflow:hidden;box-shadow:var(--sh);transition:.2s;}}
 .sc:hover{{border-color:var(--ac);box-shadow:var(--sh2);}}
 .sc::before{{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--ac),#5b9dff);opacity:0;transition:.2s;}}
 .sc:hover::before{{opacity:1;}}
-.sc-lbl{{font-family:'DM Mono',monospace;font-size:9px;color:var(--mu);letter-spacing:1px;text-transform:uppercase;margin-bottom:10px;}}
-.sc-val{{font-family:'Syne',sans-serif;font-size:32px;font-weight:800;color:var(--tx);line-height:1;}}
+.sc-lbl{{font-family:'Pretendard',monospace;font-size:9px;color:var(--mu);letter-spacing:1px;text-transform:uppercase;margin-bottom:10px;}}
+.sc-val{{font-family:'Pretendard',sans-serif;font-size:32px;font-weight:800;color:var(--tx);line-height:1;}}
 .sc-sub{{font-size:11px;color:var(--mu);margin-top:8px;}}
 
 /* 키워드 태그 */
 .tags{{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:1.2rem;}}
-.tag{{font-family:'DM Mono',monospace;font-size:11px;background:var(--ac2);border:1px solid var(--ac2);color:var(--ac);padding:4px 10px;border-radius:20px;display:inline-flex;align-items:center;gap:6px;}}
+.tag{{font-family:'Pretendard',monospace;font-size:11px;background:var(--ac2);border:1px solid var(--ac2);color:var(--ac);padding:4px 10px;border-radius:20px;display:inline-flex;align-items:center;gap:6px;}}
 .tag-dot{{width:5px;height:5px;border-radius:50%;background:var(--ok);}}
 
 /* 섹션 헤더 */
 .sec{{display:flex;align-items:center;justify-content:space-between;margin-bottom:.8rem;padding-bottom:10px;border-bottom:1.5px solid var(--bd);}}
-.sec-t{{font-family:'Syne',sans-serif;font-size:13px;font-weight:800;color:var(--tx);letter-spacing:.5px;text-transform:uppercase;}}
-.sec-n{{font-family:'DM Mono',monospace;font-size:11px;color:var(--mu);}}
+.sec-t{{font-family:'Pretendard',sans-serif;font-size:13px;font-weight:800;color:var(--tx);letter-spacing:.5px;text-transform:uppercase;}}
+.sec-n{{font-family:'Pretendard',monospace;font-size:11px;color:var(--mu);}}
 
 /* 소재 카드 */
 .card{{border:1.5px solid var(--bd);border-radius:12px;overflow:hidden;margin-bottom:10px;background:var(--bg);box-shadow:var(--sh);transition:.2s;}}
 .card:hover{{border-color:var(--ac);box-shadow:var(--sh2);}}
 .card-body{{padding:10px 12px;border-top:1px solid var(--bd);background:var(--bg2);}}
-.card-kw{{font-family:'DM Mono',monospace;font-size:10px;color:var(--ac);letter-spacing:.8px;text-transform:uppercase;margin-bottom:4px;}}
+.card-kw{{font-family:'Pretendard',monospace;font-size:10px;color:var(--ac);letter-spacing:.8px;text-transform:uppercase;margin-bottom:4px;}}
 .card-meta{{font-size:11px;color:var(--mu);margin-top:4px;}}
 .card-cap{{font-size:11px;color:var(--tx2);margin:4px 0;opacity:.8;font-style:italic;line-height:1.4;}}
-.bdg{{display:inline-block;font-family:'DM Mono',monospace;font-size:9px;padding:2px 7px;border-radius:20px;margin:0 2px 4px 0;font-weight:500;}}
+.bdg{{display:inline-block;font-family:'Pretendard',monospace;font-size:9px;padding:2px 7px;border-radius:20px;margin:0 2px 4px 0;font-weight:500;}}
 .b-img{{background:var(--ac2);color:var(--ac);border:1px solid var(--ac2);}}
 .b-vid{{background:rgba(124,92,255,.12);color:#7c5cff;border:1px solid rgba(124,92,255,.2);}}
 .b-sav{{background:rgba(255,184,79,.12);color:var(--wn);border:1px solid rgba(255,184,79,.2);}}
@@ -128,7 +128,7 @@ html,body,[class*="css"]{{font-family:'DM Sans',sans-serif;background:var(--bg)!
 /* AI 분석 박스 */
 .ai-wrap{{padding:0 12px 12px;background:var(--bg2);}}
 .ai-box{{background:var(--ac2);border:1px solid var(--ac2);border-radius:10px;padding:10px 12px;}}
-.ai-head{{font-family:'DM Mono',monospace;font-size:9px;color:var(--ac);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:8px;}}
+.ai-head{{font-family:'Pretendard',monospace;font-size:9px;color:var(--ac);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:8px;}}
 .ai-body{{font-size:12px;color:var(--tx2);line-height:1.75;}}
 .ai-tag{{display:inline-block;font-size:10px;background:var(--ac2);color:var(--ac);border-radius:4px;padding:1px 6px;margin:2px 2px 0 0;}}
 
@@ -138,42 +138,42 @@ html,body,[class*="css"]{{font-family:'DM Sans',sans-serif;background:var(--bg)!
 .dot{{width:8px;height:8px;border-radius:50%;flex-shrink:0;}}
 .dot-on{{background:var(--ok);box-shadow:0 0 6px var(--ok);}}
 .dot-off{{background:var(--mu);}}
-.banner-txt{{font-family:'DM Mono',monospace;font-size:11px;color:var(--tx2);}}
+.banner-txt{{font-family:'Pretendard',monospace;font-size:11px;color:var(--tx2);}}
 
 /* 총합 인사이트 */
 .summary-box{{background:var(--bg2);border:2px solid var(--ac);border-radius:16px;padding:24px 28px;margin-bottom:1.5rem;}}
-.summary-head{{font-family:'Syne',sans-serif;font-size:16px;font-weight:800;color:var(--ac);margin-bottom:16px;letter-spacing:.5px;}}
+.summary-head{{font-family:'Pretendard',sans-serif;font-size:16px;font-weight:800;color:var(--ac);margin-bottom:16px;letter-spacing:.5px;}}
 .summary-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px;}}
 .summary-item{{background:var(--bg);border:1px solid var(--bd);border-radius:10px;padding:12px 14px;}}
-.summary-item-lbl{{font-family:'DM Mono',monospace;font-size:9px;color:var(--mu);letter-spacing:1px;text-transform:uppercase;margin-bottom:6px;}}
+.summary-item-lbl{{font-family:'Pretendard',monospace;font-size:9px;color:var(--mu);letter-spacing:1px;text-transform:uppercase;margin-bottom:6px;}}
 .summary-item-val{{font-size:13px;color:var(--tx);line-height:1.5;}}
 .summary-strategy{{background:var(--ac2);border:1px solid var(--ac2);border-radius:10px;padding:14px 16px;margin-bottom:12px;}}
-.summary-strategy-lbl{{font-family:'DM Mono',monospace;font-size:9px;color:var(--ac);letter-spacing:1px;text-transform:uppercase;margin-bottom:8px;}}
+.summary-strategy-lbl{{font-family:'Pretendard',monospace;font-size:9px;color:var(--ac);letter-spacing:1px;text-transform:uppercase;margin-bottom:8px;}}
 .summary-strategy-val{{font-size:13px;color:var(--tx2);line-height:1.65;}}
 .summary-tags{{display:flex;flex-wrap:wrap;gap:6px;}}
-.summary-tag{{font-family:'DM Mono',monospace;font-size:10px;background:var(--ac2);color:var(--ac);border:1px solid var(--ac2);border-radius:4px;padding:3px 9px;}}
+.summary-tag{{font-family:'Pretendard',monospace;font-size:10px;background:var(--ac2);color:var(--ac);border:1px solid var(--ac2);border-radius:4px;padding:3px 9px;}}
 .sel-bar{{display:flex;align-items:center;background:var(--bg2);border:1.5px solid var(--bd);border-radius:10px;padding:10px 16px;margin-bottom:1rem;}}
-.sel-count{{font-family:'Syne',sans-serif;font-size:14px;font-weight:800;color:var(--ac);margin-right:6px;}}
-.sel-bar-txt{{font-family:'DM Mono',monospace;font-size:11px;color:var(--tx2);}}
+.sel-count{{font-family:'Pretendard',sans-serif;font-size:14px;font-weight:800;color:var(--ac);margin-right:6px;}}
+.sel-bar-txt{{font-family:'Pretendard',monospace;font-size:11px;color:var(--tx2);}}
 
 /* 빈 상태 */
 .empty{{text-align:center;padding:80px 20px;}}
-.empty-t{{font-family:'Syne',sans-serif;font-size:16px;font-weight:700;color:var(--mu);margin-bottom:8px;}}
+.empty-t{{font-family:'Pretendard',sans-serif;font-size:16px;font-weight:700;color:var(--mu);margin-bottom:8px;}}
 .empty-d{{font-size:13px;color:var(--mu);line-height:1.6;}}
 
 /* 로그 */
-.log{{font-family:'DM Mono',monospace;font-size:11px;color:var(--mu);padding:4px 0;border-bottom:1px solid var(--bd);}}
+.log{{font-family:'Pretendard',monospace;font-size:11px;color:var(--mu);padding:4px 0;border-bottom:1px solid var(--bd);}}
 .log .ts{{color:var(--ac);margin-right:8px;}}
 .log .ok{{color:var(--ok);}}
 .log .er{{color:var(--er);}}
 
 /* 버튼 */
-.stButton>button{{font-family:'DM Mono',monospace!important;font-size:11px!important;border-radius:8px!important;border:1.5px solid var(--bd2)!important;background:var(--bg)!important;color:var(--tx2)!important;height:34px!important;transition:.15s!important;letter-spacing:.3px!important;}}
+.stButton>button{{font-family:'Pretendard',monospace!important;font-size:11px!important;border-radius:8px!important;border:1.5px solid var(--bd2)!important;background:var(--bg)!important;color:var(--tx2)!important;height:34px!important;transition:.15s!important;letter-spacing:.3px!important;}}
 .stButton>button:hover{{border-color:var(--ac)!important;color:var(--ac)!important;background:var(--ac2)!important;}}
-.stDownloadButton>button{{font-family:'DM Mono',monospace!important;font-size:11px!important;border-radius:8px!important;border:1.5px solid var(--bd2)!important;background:var(--bg)!important;color:var(--tx2)!important;}}
+.stDownloadButton>button{{font-family:'Pretendard',monospace!important;font-size:11px!important;border-radius:8px!important;border:1.5px solid var(--bd2)!important;background:var(--bg)!important;color:var(--tx2)!important;}}
 
 /* 입력 */
-.stTextInput input{{background:var(--bg)!important;border:1.5px solid var(--bd2)!important;border-radius:10px!important;color:var(--tx)!important;font-family:'DM Sans',sans-serif!important;}}
+.stTextInput input{{background:var(--bg)!important;border:1.5px solid var(--bd2)!important;border-radius:10px!important;color:var(--tx)!important;font-family:'Pretendard',sans-serif!important;}}
 .stTextInput input:focus{{border-color:var(--ac)!important;box-shadow:0 0 0 3px var(--ac2)!important;}}
 div[data-baseweb="select"]>div{{background:var(--bg)!important;border-color:var(--bd2)!important;border-radius:8px!important;color:var(--tx)!important;}}
 
@@ -318,36 +318,61 @@ def analyze_parallel(items, max_workers=6):
     return items
 
 
-def summarize_insights(analyzed_items) -> dict | None:
+def summarize_insights(analyzed_items):
     """분석된 소재들을 종합해 총합 인사이트 생성"""
-    if not API_KEY or not analyzed_items: return None
+    if not API_KEY or not analyzed_items:
+        return None
     snippets = []
-    for a in analyzed_items[:20]:  # 최대 20개
-        ai = a.get("ai", {})
-        if not ai: continue
+    for a in analyzed_items[:20]:
+        ai = a.get("ai") or {}
+        if not ai:
+            continue
         snippets.append(
-            f"- 소구:{ai.get('appeal','')} / 타겟:{ai.get('target','')} / 메시지:{ai.get('message','')}"
+            "- 소구:" + ai.get("appeal","") +
+            " / 타겟:" + ai.get("target","") +
+            " / 메시지:" + ai.get("message","")
         )
-    if not snippets: return None
+    if not snippets:
+        return None
+
+    json_schema = (
+        '{"dominant_appeal":"가장 많이 쓰인 소구 유형 + 비율 설명",'
+        '"common_target":"공통 타겟 고객 요약",'
+        '"key_message":"반복되는 핵심 메시지 패턴",'
+        '"strategy":"이 광고들이 공유하는 전략적 방향 (2~3문장)",'
+        '"recommendations":"경쟁 우위를 위한 차별화 제안 (2~3문장)",'
+        '"tags":["태그1","태그2","태그3","태그4","태그5"]}'
+    )
+    prompt = (
+        "광고 전략 전문가입니다. 아래는 Meta 광고 소재 분석 결과들입니다.\n\n" +
+        "\n".join(snippets) +
+        "\n\n이 소재들을 종합해 아래 JSON만 반환 (마크다운/백틱 없이 순수 JSON):\n" +
+        json_schema
+    )
     try:
-        prompt = f"""광고 전략 전문가입니다. 아래는 Meta 광고 소재 분석 결과들입니다.
-
-{chr(10).join(snippets)}
-
-이 소재들을 종합해 아래 JSON만 반환 (마크다운·백틱 없이):
-{{"dominant_appeal":"가장 많이 쓰인 소구 유형 + 비율 설명","common_target":"공통 타겟 고객 요약","key_message":"반복되는 핵심 메시지 패턴","strategy":"이 광고들이 공유하는 전략적 방향 (2~3문장)","recommendations":"경쟁 우위를 위한 차별화 제안 (2~3문장)","tags":["태그1","태그2","태그3","태그4","태그5"]}}"""
-
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
-            headers={{"x-api-key":API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"}},
-            json={{"model":"claude-haiku-4-5-20251001","max_tokens":600,
-                  "messages":[{{"role":"user","content":prompt}}]}},
+            headers={
+                "x-api-key": API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 700,
+                "messages": [{"role": "user", "content": prompt}],
+            },
             timeout=30,
         )
-        if resp.status_code != 200: return None
+        if resp.status_code != 200:
+            return None
         txt = resp.json()["content"][0]["text"].strip()
-        s, e = txt.find("{{"), txt.rfind("}}")+1
-        return json.loads(txt[s:e]) if s != -1 and e > 0 else None
+        # JSON 블록 추출
+        s = txt.find("{")
+        e = txt.rfind("}") + 1
+        if s == -1 or e == 0:
+            return None
+        return json.loads(txt[s:e])
     except Exception:
         return None
 
@@ -687,7 +712,7 @@ else:
                 st.markdown(
                     '<div style="height:100px;background:var(--bg3);display:flex;' +
                     'align-items:center;justify-content:center;color:var(--mu);' +
-                    'font-family:DM Mono,monospace;font-size:10px;">LOAD FAILED</div>',
+                    'font-family:Pretendard,monospace;font-size:10px;">LOAD FAILED</div>',
                     unsafe_allow_html=True)
 
             # 메타 배지
@@ -761,10 +786,10 @@ th = "DARK" if D else "LIGHT"
 ai_s = "AI ON · Haiku" if (ai_on and API_KEY) else "AI OFF"
 st.markdown(f"""<div style="border-top:2px solid var(--bd);padding-top:14px;
     display:flex;justify-content:space-between;">
-  <span style="font-family:'DM Mono',monospace;font-size:10px;color:var(--mu)">
+  <span style="font-family:'Pretendard',monospace;font-size:10px;color:var(--mu)">
     ADINTEL v3.2 · {th} · {ai_s}
   </span>
-  <span style="font-family:'DM Mono',monospace;font-size:10px;color:var(--mu)">
+  <span style="font-family:'Pretendard',monospace;font-size:10px;color:var(--mu)">
     {time.strftime("%Y-%m-%d")}
   </span>
 </div>""", unsafe_allow_html=True)
