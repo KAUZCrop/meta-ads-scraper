@@ -228,47 +228,91 @@ def _close_modal(page):
     except Exception:
         pass
 
-def _capture_modal_or_element_b64(page, img_index: int, asset_type: str = "image") -> tuple[str, str]:
-    """
-    1순위: 소재 클릭 후 열린 모달(dialog) 화면을 메모리 screenshot → base64
-    2순위: 모달 실패 시 현재 이미지/비디오 요소 자체를 screenshot → base64
-    파일 저장 없음. 메모리에서 바로 처리.
-    """
+def _is_valid_screenshot(img_bytes: bytes | None) -> bool:
+    """완전 공백/너무 작은 캡처를 1차로 걸러냅니다."""
+    if not img_bytes or len(img_bytes) < 3000:
+        return False
     try:
-        locator = page.locator("img").nth(img_index) if asset_type == "image" else page.locator("video").nth(img_index)
-        locator.scroll_into_view_if_needed(timeout=5000)
-        page.wait_for_timeout(500)
+        from PIL import Image, ImageStat
+        im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        w, h = im.size
+        if w < 120 or h < 120:
+            return False
+        stat = ImageStat.Stat(im.resize((32, 32)))
+        # RGB 표준편차가 너무 낮으면 거의 단색/공백으로 판단
+        if max(stat.stddev) < 3:
+            return False
+        return True
+    except Exception:
+        # PIL이 없으면 사이즈 체크만 통과시킴
+        return True
 
-        # 1) 모달 열기 시도
-        try:
-            locator.click(timeout=4000, force=True)
-            page.wait_for_timeout(1200)
+def _find_media_handle_by_url(page, target_url: str, asset_type: str = "image"):
+    """DOM index가 아니라 URL path 기준으로 실제 렌더링된 img/video element를 찾습니다."""
+    target_key = _url_key(target_url)
+    try:
+        handle = page.evaluate_handle("""({targetKey, assetType}) => {
+            const key = (u) => {
+                try { const p = new URL(u); return p.host + p.pathname; }
+                catch(e) { return u || ''; }
+            };
+            const nodes = assetType === 'video_poster'
+                ? Array.from(document.querySelectorAll('video'))
+                : Array.from(document.querySelectorAll('img'));
+            for (const el of nodes) {
+                const src = assetType === 'video_poster'
+                    ? (el.poster || '')
+                    : (el.currentSrc || el.src || '');
+                if (src && key(src) === targetKey) return el;
+            }
+            return null;
+        }""", {"targetKey": target_key, "assetType": asset_type})
+        return handle.as_element()
+    except Exception:
+        return None
 
-            dialog = page.locator('div[role="dialog"]').last
-            if dialog.count() > 0 and dialog.is_visible():
-                shot = dialog.screenshot(type="jpeg", quality=60, timeout=12000)
-                _close_modal(page)
-                b64 = _bytes_to_b64(shot)
-                if b64:
-                    return b64, "modal_screenshot"
-        except Exception:
-            _close_modal(page)
+def _capture_media_by_url_b64(page, target_url: str, asset_type: str = "image") -> tuple[str, str]:
+    """
+    선택 소재만 URL path 기준으로 다시 찾아 캡처합니다.
+    1순위: 클릭 후 열린 모달(dialog) screenshot
+    2순위: 실제 이미지/비디오 요소 screenshot
+    파일 저장 없음. 메모리에서 바로 base64 처리.
+    """
+    element = _find_media_handle_by_url(page, target_url, asset_type)
+    if not element:
+        return "", "element_not_found"
 
-        # 2) fallback: 화면에 렌더링된 이미지 요소 자체 캡처
-        try:
-            locator.scroll_into_view_if_needed(timeout=5000)
-            page.wait_for_timeout(300)
-            shot = locator.screenshot(type="jpeg", quality=70, timeout=10000)
-            b64 = _bytes_to_b64(shot)
-            if b64:
-                return b64, "element_screenshot"
-        except Exception:
-            pass
-
+    try:
+        element.scroll_into_view_if_needed(timeout=7000)
+        page.wait_for_timeout(700)
     except Exception:
         pass
 
-    return "", "capture_failed"
+    # 1) 모달 열기 후 dialog 캡처
+    try:
+        element.click(timeout=5000, force=True)
+        page.wait_for_timeout(1600)
+        dialog = page.locator('div[role="dialog"]').last
+        if dialog.count() > 0 and dialog.is_visible():
+            shot = dialog.screenshot(type="jpeg", quality=55, timeout=15000)
+            _close_modal(page)
+            if _is_valid_screenshot(shot):
+                return _bytes_to_b64(shot), "modal_screenshot"
+    except Exception:
+        _close_modal(page)
+
+    # 2) fallback: 요소 자체 캡처
+    try:
+        element = _find_media_handle_by_url(page, target_url, asset_type) or element
+        element.scroll_into_view_if_needed(timeout=7000)
+        page.wait_for_timeout(500)
+        shot = element.screenshot(type="jpeg", quality=65, timeout=12000)
+        if _is_valid_screenshot(shot):
+            return _bytes_to_b64(shot), "element_screenshot"
+    except Exception:
+        pass
+
+    return "", "blank_or_capture_failed"
 
 def scrape(keyword, country, scrolls, limit):
     """
@@ -459,13 +503,13 @@ def capture_screenshots_for_items(items, scrolls=8):
                         item["capture_source"] = "selected_asset_not_found"
                         continue
                     asset_type = r.get("type", "image")
-                    img_b64, capture_source = _capture_modal_or_element_b64(
+                    img_b64, capture_source = _capture_media_by_url_b64(
                         page,
-                        int(r.get("idx") or 0),
+                        item.get("image_url", ""),
                         "image" if asset_type == "image" else "video_poster",
                     )
                     item["img_b64"] = img_b64
-                    item["capture_source"] = capture_source if img_b64 else "capture_failed"
+                    item["capture_source"] = capture_source if img_b64 else capture_source
             except Exception as ex:
                 for item in group_items:
                     if not item.get("img_b64"):
@@ -544,7 +588,7 @@ def analyze(item):
         txt = resp.json()["content"][0]["text"].strip()
         s, e = txt.find("{"), txt.rfind("}") + 1
         if s == -1 or e == 0:
-            return {"_error": f"JSON 파싱 실패: {txt[:150]}"}
+            return {"_error": f"Claude가 JSON이 아닌 응답을 반환했습니다. 캡처가 공백/비광고 영역일 가능성이 큽니다. 응답: {txt[:180]}"}
         return json.loads(txt[s:e])
     except Exception as ex:
         return {"_error": str(ex)[:300]}
