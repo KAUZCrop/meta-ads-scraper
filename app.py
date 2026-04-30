@@ -1,7 +1,7 @@
 # ============================================================
 # AD INTEL v3.2 — Meta Ad Library Intelligence Board
 # ============================================================
-import sys, asyncio, subprocess, time, uuid, io, json, requests
+import sys, asyncio, subprocess, time, uuid, io, json, requests, base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
 from urllib.parse import quote, urlparse
@@ -196,10 +196,11 @@ a{{color:var(--ac)!important;}}
 
 
 # ============================================================
-# 스크래퍼 (기존 원본)
+# 스크래퍼 — 모달/요소 스크린샷 기반 이미지 payload 확보
 # ============================================================
 def valid(w, h):
-    if w < 180 or h < 180: return False
+    if w < 180 or h < 180:
+        return False
     r = w / h if h else 0
     return 0.25 <= r <= 3.0
 
@@ -213,6 +214,61 @@ def make_fp(item):
         item.get("width", 0),
         item.get("height", 0),
     )
+
+def _bytes_to_b64(img_bytes: bytes | None) -> str:
+    if not img_bytes:
+        return ""
+    return base64.b64encode(img_bytes).decode("utf-8")
+
+def _close_modal(page):
+    """Meta 모달을 닫기 위한 안전 처리"""
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(300)
+    except Exception:
+        pass
+
+def _capture_modal_or_element_b64(page, img_index: int, asset_type: str = "image") -> tuple[str, str]:
+    """
+    1순위: 소재 클릭 후 열린 모달(dialog) 화면을 메모리 screenshot → base64
+    2순위: 모달 실패 시 현재 이미지/비디오 요소 자체를 screenshot → base64
+    파일 저장 없음. 메모리에서 바로 처리.
+    """
+    try:
+        locator = page.locator("img").nth(img_index) if asset_type == "image" else page.locator("video").nth(img_index)
+        locator.scroll_into_view_if_needed(timeout=5000)
+        page.wait_for_timeout(500)
+
+        # 1) 모달 열기 시도
+        try:
+            locator.click(timeout=4000, force=True)
+            page.wait_for_timeout(1200)
+
+            dialog = page.locator('div[role="dialog"]').last
+            if dialog.count() > 0 and dialog.is_visible():
+                shot = dialog.screenshot(type="jpeg", quality=60, timeout=12000)
+                _close_modal(page)
+                b64 = _bytes_to_b64(shot)
+                if b64:
+                    return b64, "modal_screenshot"
+        except Exception:
+            _close_modal(page)
+
+        # 2) fallback: 화면에 렌더링된 이미지 요소 자체 캡처
+        try:
+            locator.scroll_into_view_if_needed(timeout=5000)
+            page.wait_for_timeout(300)
+            shot = locator.screenshot(type="jpeg", quality=70, timeout=10000)
+            b64 = _bytes_to_b64(shot)
+            if b64:
+                return b64, "element_screenshot"
+        except Exception:
+            pass
+
+    except Exception:
+        pass
+
+    return "", "capture_failed"
 
 def scrape(keyword, country, scrolls, limit):
     ensure_browser()
@@ -230,7 +286,7 @@ def scrape(keyword, country, scrolls, limit):
         ctx.route("**/*.{woff,woff2,ttf,otf,eot}", lambda r: r.abort())
         page = ctx.new_page()
         page.goto(search_url, wait_until="domcontentloaded", timeout=90000)
-        page.wait_for_timeout(4000)
+        page.wait_for_timeout(4500)
 
         def card_count():
             return page.evaluate("""() => {
@@ -256,147 +312,126 @@ def scrape(keyword, country, scrolls, limit):
                 waited += 400
                 cur = card_count()
                 if cur > prev:
-                    prev = cur; stalls = 0; break
+                    prev = cur
+                    stalls = 0
+                    break
             else:
                 stalls += 1
-                if stalls >= 2: break
+                if stalls >= 2:
+                    break
 
         raw = page.evaluate("""() => {
             const out = [];
-            for (const img of document.querySelectorAll('img')) {
+            const imgs = Array.from(document.querySelectorAll('img'));
+            imgs.forEach((img, idx) => {
                 const src = img.currentSrc || img.src || '';
-                if (!src || src.startsWith('data:')) continue;
+                if (!src || src.startsWith('data:')) return;
                 out.push({
-                    type: 'image', src,
+                    type: 'image', src, idx,
                     w: img.naturalWidth  || img.width  || 0,
                     h: img.naturalHeight || img.height || 0,
                     alt: img.alt || ''
                 });
-            }
-            for (const v of document.querySelectorAll('video')) {
+            });
+            const vids = Array.from(document.querySelectorAll('video'));
+            vids.forEach((v, idx) => {
                 const poster = v.poster || '';
-                if (!poster) continue;
+                if (!poster) return;
                 out.push({
-                    type: 'video_poster', src: poster,
+                    type: 'video_poster', src: poster, idx,
                     w: v.videoWidth  || v.clientWidth  || 0,
                     h: v.videoHeight || v.clientHeight || 0,
                     alt: ''
                 });
-            }
+            });
             return out;
         }""")
 
-        # ── 브라우저 세션으로 이미지 병렬 다운로드 (Meta CDN 인증 우회) ──
-        img_urls = [
-            r["src"] for r in raw
-            if r.get("src") and r.get("type") == "image"
-        ][:limit]
+        seen, collected, now = set(), [], time.strftime("%Y-%m-%d %H:%M:%S")
+        for r in raw:
+            if len(collected) >= limit:
+                break
+            src = (r.get("src") or "").strip()
+            w, h = int(r.get("w") or 0), int(r.get("h") or 0)
+            if not src or not valid(w, h):
+                continue
 
-        b64_map = {}
-        if img_urls:
-            try:
-                result = page.evaluate("""async (urls) => {
-                    const CHUNK = 8;
-                    const out = {};
-                    for (let i = 0; i < urls.length; i += CHUNK) {
-                        const chunk = urls.slice(i, i + CHUNK);
-                        await Promise.all(chunk.map(async url => {
-                            try {
-                                const r = await fetch(url, {credentials: 'include'});
-                                if (!r.ok) return;
-                                const buf = await r.arrayBuffer();
-                                const bytes = new Uint8Array(buf);
-                                let bin = '';
-                                for (let j = 0; j < bytes.byteLength; j++)
-                                    bin += String.fromCharCode(bytes[j]);
-                                out[url] = btoa(bin);
-                            } catch(e) {}
-                        }));
-                    }
-                    return out;
-                }""", img_urls)
-                if isinstance(result, dict):
-                    b64_map = result
-            except Exception:
-                pass
+            asset_type = r.get("type", "image")
+            img_b64, capture_source = _capture_modal_or_element_b64(
+                page,
+                int(r.get("idx") or 0),
+                "image" if asset_type == "image" else "video_poster",
+            )
 
-        ctx.close(); browser.close()
+            asset = {
+                "id":             str(uuid.uuid4()),
+                "keyword":        keyword,
+                "country":        country,
+                "asset_type":     asset_type,
+                "image_url":      src,
+                "source_url":     search_url,
+                "caption":        (r.get("alt") or "").strip(),
+                "width":          w,
+                "height":         h,
+                "created_at":     now,
+                "starred":        False,
+                "ai":             None,
+                "img_b64":        img_b64,
+                "capture_source": capture_source,
+            }
+            fp = make_fp(asset)
+            if fp in seen:
+                continue
+            seen.add(fp)
+            collected.append(asset)
 
-    seen, collected, now = set(), [], time.strftime("%Y-%m-%d %H:%M:%S")
-    for r in raw:
-        if len(collected) >= limit: break
-        src = (r.get("src") or "").strip()
-        w, h = int(r.get("w") or 0), int(r.get("h") or 0)
-        if not src or not valid(w, h): continue
-        asset = {
-            "id":         str(uuid.uuid4()),
-            "keyword":    keyword,
-            "country":    country,
-            "asset_type": r.get("type", "image"),
-            "image_url":  src,
-            "source_url": search_url,
-            "caption":    (r.get("alt") or "").strip(),
-            "width":      w,
-            "height":     h,
-            "created_at": now,
-            "starred":    False,
-            "ai":         None,
-            "img_b64":    b64_map.get(src, ""),  # 브라우저로 캡처한 base64
-        }
-        fp = make_fp(asset)
-        if fp in seen: continue
-        seen.add(fp); collected.append(asset)
+        ctx.close()
+        browser.close()
+
     return collected
 
 
 # ============================================================
 # AI 분석
 # ============================================================
+def _anthropic_model() -> str:
+    try:
+        return st.secrets.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+    except Exception:
+        return "claude-haiku-4-5-20251001"
+
 def analyze(item):
-    """Claude Vision 전용 분석. 실제 이미지 base64가 없으면 추정 분석하지 않고 실패 처리."""
+    """모달/요소 스크린샷 base64가 있을 때만 Claude Vision 분석. 추정 fallback 없음."""
     if not API_KEY:
         return {"_error": "API Key 없음"}
 
+    b64 = item.get("img_b64", "")
+    if not b64:
+        return {"_error": "모달/요소 스크린샷 확보 실패: 실제 이미지 payload가 없어 분석하지 않았습니다."}
+
     try:
-        b64 = (item.get("img_b64") or "").strip()
+        prompt = f"""
+당신은 광고 소재 분석가입니다. 첨부된 이미지는 Meta 광고 라이브러리에서 캡처한 실제 소재 화면입니다.
+반드시 첨부 이미지에서 확인 가능한 내용만 분석하세요. 보이지 않는 정보는 추정하지 말고 '확인 불가'라고 쓰세요.
 
-        # 핵심: 이미지가 없으면 키워드/URL 기반 추정 분석을 절대 하지 않음
-        if not b64:
-            return {
-                "_error": "이미지 payload 없음: 실제 소재 이미지를 확보하지 못해 분석하지 않았습니다. 검색/수집 단계에서 img_b64 확보가 필요합니다."
-            }
+검색 키워드: {item['keyword']}
+캡처 방식: {item.get('capture_source', 'unknown')}
 
-        prompt = (
-            "당신은 광고 소재 분석가입니다.\n"
-            "반드시 첨부된 이미지에서 실제로 확인 가능한 정보만 분석하세요.\n"
-            "이미지에 보이지 않는 내용, URL, 검색 키워드 기반 추정은 금지합니다.\n"
-            "확인 불가한 항목은 '확인 불가'라고 작성하세요.\n\n"
-            f"검색 키워드: {item['keyword']}\n\n"
-            "아래 JSON만 반환하세요. 마크다운·백틱·설명 문장 금지:\n"
-            '{"hook":"이미지에서 첫 시선을 잡는 핵심 요소",'
-            '"copy":"이미지 안에 실제로 보이는 텍스트/카피. 없으면 확인 불가",'
-            '"appeal":"소구포인트 유형 + 이미지 내 근거. 감성/이성/사회적증거/희소성/혜택 중 선택",'
-            '"tone":"색감·분위기·비주얼 스타일",'
-            '"target":"이미지만 보고 추정 가능한 타겟. 근거 부족 시 확인 불가",'
-            '"message":"이미지 기준 핵심 메시지 한 줄",'
-            '"evidence":"위 분석을 뒷받침하는 이미지 내 구체 근거",'
-            '"tags":["태그1","태그2","태그3"]}'
-        )
-
+아래 JSON만 반환하세요. 마크다운/백틱 금지:
+{{"hook":"이미지에서 첫 시선을 잡는 핵심 요소",
+"copy":"이미지 안에 보이는 텍스트/카피를 그대로 옮겨쓰기. 없으면 확인 불가",
+"main_visual":"이미지에서 확인되는 주요 비주얼 요소",
+"appeal":"소구포인트 유형 + 이미지 근거. 감성/이성/사회적증거/희소성/혜택 중 선택",
+"tone":"색감·분위기·비주얼 스타일",
+"target":"이미지 근거로 추정 가능한 타겟. 근거 부족 시 확인 불가",
+"message":"이미지 내 텍스트와 비주얼 기준 핵심 메시지 한 줄",
+"evidence":"위 분석의 근거가 되는 이미지 내 요소",
+"tags":["태그1","태그2","태그3"]}}
+"""
         content = [
-            {
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/jpeg",
-                    "data": b64,
-                },
-            },
+            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
             {"type": "text", "text": prompt},
         ]
-
-        # Secrets에서 모델 교체 가능. 기본값은 이전 404 방지를 위해 하이쿠로 둠.
-        model = st.secrets.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -406,14 +441,13 @@ def analyze(item):
                 "content-type":      "application/json",
             },
             json={
-                "model": model,
+                "model": _anthropic_model(),
                 "max_tokens": 700,
                 "temperature": 0,
                 "messages": [{"role": "user", "content": content}],
             },
-            timeout=30,
+            timeout=40,
         )
-
         if resp.status_code != 200:
             return {"_error": f"API {resp.status_code}: {resp.text[:300]}"}
 
@@ -421,11 +455,10 @@ def analyze(item):
         s, e = txt.find("{"), txt.rfind("}") + 1
         if s == -1 or e == 0:
             return {"_error": f"JSON 파싱 실패: {txt[:150]}"}
-
         return json.loads(txt[s:e])
-
     except Exception as ex:
-        return {"_error": str(ex)[:200]}
+        return {"_error": str(ex)[:300]}
+
 
 def analyze_parallel(items, max_workers=6):
     if not API_KEY: return items
@@ -466,7 +499,7 @@ def summarize_insights(analyzed_items):
     snippets = []
     for a in analyzed_items[:20]:
         ai = a.get("ai") or {}
-        if not ai or ai.get("_error"): continue
+        if not ai: continue
         snippets.append(
             "- 소구:" + ai.get("appeal", "") +
             " / 타겟:" + ai.get("target", "") +
@@ -513,10 +546,6 @@ def summarize_insights(analyzed_items):
 # ============================================================
 # 유틸
 # ============================================================
-def is_ai_ok(item):
-    ai = item.get("ai") or {}
-    return bool(ai) and not ai.get("_error")
-
 def merge(existing, new_items):
     known = {make_fp(a) for a in existing}
     known |= {make_fp(a) for a in existing if a["id"] in st.session_state.hidden}
@@ -533,7 +562,7 @@ def get_visible(ftype, fkw, fstar, fai):
     if ftype != "전체":        items = [a for a in items if a["asset_type"] == ftype]
     if fkw and fkw != "전체": items = [a for a in items if a["keyword"] == fkw]
     if fstar:                  items = [a for a in items if a.get("starred")]
-    if fai:                    items = [a for a in items if is_ai_ok(a)]
+    if fai:                    items = [a for a in items if a.get("ai")]
     return items
 
 def do_reset():
@@ -722,7 +751,6 @@ def to_pptx(items: list, summary: dict | None = None) -> bytes:
                 ("소구",   ai.get("appeal",  "—")),
                 ("타겟",   ai.get("target",  "—")),
                 ("메시지", ai.get("message", "—")),
-                ("근거",   ai.get("evidence", "—")),
             ]
             y_pos = 1.6
             for label, val in fields_ai:
@@ -817,7 +845,7 @@ with st.sidebar:
     if ai_on:
         if API_KEY:
             st.success("API Key 연결됨")
-            st.caption("선택 소재만 분석 · Vision only · 이미지 없으면 분석 안 함")
+            st.caption("선택 소재만 분석 · Haiku · 소재당 ~1원")
             if st.button("API 연결 테스트", use_container_width=True):
                 ok, msg = test_api()
                 if ok: st.success(msg)
@@ -878,7 +906,7 @@ with st.sidebar:
 if ai_on and API_KEY:
     st.markdown("""<div class="banner">
         <div class="dot dot-on"></div>
-        <span class="banner-txt">AI 분석 <b>ON</b> &nbsp;—&nbsp; 소재 선택 후 일괄 분석 &nbsp;·&nbsp; Claude Vision (병렬 처리)</span>
+        <span class="banner-txt">AI 분석 <b>ON</b> &nbsp;—&nbsp; 소재 선택 후 일괄 분석 &nbsp;·&nbsp; Claude Haiku (병렬 처리)</span>
     </div>""", unsafe_allow_html=True)
 elif ai_on and not API_KEY:
     st.markdown("""<div class="banner banner-w">
@@ -963,7 +991,7 @@ for col, (lbl, val, sub) in zip(st.columns(6), [
     ("KEYWORDS", len(set(a["keyword"] for a in all_a)), "검색어"),
     ("STARRED",  sum(1 for a in all_a if a.get("starred")), "즐겨찾기"),
     ("HIDDEN",   len(st.session_state.hidden), "제외"),
-    ("AI",       sum(1 for a in all_a if is_ai_ok(a)), "분석 완료"),
+    ("AI",       sum(1 for a in all_a if a.get("ai")), "분석 완료"),
 ]):
     col.markdown(
         f'<div class="sc"><div class="sc-lbl">{lbl}</div>'
@@ -1029,8 +1057,8 @@ st.markdown(
 
 if ai_on and API_KEY and shown:
     sel_items      = [a for a in st.session_state.assets if a["id"] in sel]
-    sel_unanalyzed = [a for a in sel_items if not is_ai_ok(a)]
-    analyzed_sel   = [a for a in sel_items if is_ai_ok(a)]
+    sel_unanalyzed = [a for a in sel_items if not a.get("ai")]
+    analyzed_sel   = [a for a in sel_items if a.get("ai")]
 
     bar_c, btn_c1, btn_c2, btn_c3 = st.columns([3, 1, 1, 1])
     with bar_c:
@@ -1045,7 +1073,7 @@ if ai_on and API_KEY and shown:
                 # analyze_parallel이 items 딕셔너리를 직접 수정하므로
                 # st.session_state.assets의 동일 객체가 업데이트됨
                 analyze_parallel(sel_unanalyzed, max_workers=6)
-                done = sum(1 for it in sel_unanalyzed if is_ai_ok(it))
+                done = sum(1 for it in sel_unanalyzed if it.get("ai"))
                 pb.progress(1.0, text=f"완료! {done}개 분석")
                 pb.empty()
                 st.rerun()
@@ -1095,7 +1123,7 @@ else:
             bl   = "IMG"   if item["asset_type"] == "image" else "VID"
             sel_b = '<span class="bdg" style="background:var(--ac);color:#fff;border-color:var(--ac)">SEL</span> ' if is_sel else ""
             sv_b  = '<span class="bdg b-sav">★</span> ' if item.get("starred") else ""
-            ai_b  = '<span class="bdg b-ai">AI</span> ' if is_ai_ok(item)      else ""
+            ai_b  = '<span class="bdg b-ai">AI</span> ' if item.get("ai")      else ""
             cap   = item.get("caption", "")
             cap_h = f'<div class="card-cap">"{cap[:55]}{"..." if len(cap) > 55 else ""}"</div>' if cap else ""
 
@@ -1105,7 +1133,7 @@ else:
                 + sel_b + sv_b + ai_b +
                 f'<span class="bdg {bc}">{bl}</span>'
                 + cap_h +
-                f'<div class="card-meta">{item["width"]}x{item["height"]}px · {item["created_at"][11:16]}</div>'
+                f'<div class="card-meta">{item["width"]}x{item["height"]}px · {item["created_at"][11:16]} · {item.get("capture_source","-")}</div>'
                 '</div>',
                 unsafe_allow_html=True)
 
@@ -1124,7 +1152,6 @@ else:
                     tags_str = "".join(f'<span class="ai-tag">{t}</span>' for t in ai_data.get("tags", []))
                     copy_line = f'<b>카피</b>&nbsp;&nbsp;&nbsp;{ai_data["copy"]}<br>' if ai_data.get("copy") else ""
                     tone_line = f'<b>톤&매너</b>&nbsp;{ai_data["tone"]}<br>' if ai_data.get("tone") else ""
-                    evidence_line = f'<b>근거</b>&nbsp;&nbsp;&nbsp;{ai_data["evidence"]}<br>' if ai_data.get("evidence") else ""
                     img_badge = '<span class="bdg b-ai" style="font-size:8px">IMG분석</span> ' if has_img else '<span class="bdg" style="background:var(--bg3);color:var(--mu);font-size:8px">텍스트추정</span> '
                     st.markdown(
                         '<div class="ai-wrap"><div class="ai-box">'
@@ -1134,7 +1161,6 @@ else:
                         + copy_line
                         + f'<b>소구</b>&nbsp;&nbsp;&nbsp;{ai_data.get("appeal","—")}<br>'
                         + tone_line
-                        + evidence_line
                         + f'<b>타겟</b>&nbsp;&nbsp;&nbsp;{ai_data.get("target","—")}<br>'
                         f'<b>메시지</b>&nbsp;{ai_data.get("message","—")}<br>'
                         f'<div style="margin-top:6px">{tags_str}</div>'
@@ -1165,7 +1191,7 @@ else:
 # ============================================================
 st.markdown("<div style='height:40px'></div>", unsafe_allow_html=True)
 th   = "DARK" if D else "LIGHT"
-ai_s = "AI ON · Vision only" if (ai_on and API_KEY) else "AI OFF"
+ai_s = "AI ON · Haiku" if (ai_on and API_KEY) else "AI OFF"
 st.markdown(
     f'<div style="border-top:2px solid var(--bd);padding-top:14px;display:flex;justify-content:space-between;">'
     f'<span style="font-family:Pretendard,sans-serif;font-size:10px;color:var(--mu)">ADINTEL v3.2 · {th} · {ai_s}</span>'
