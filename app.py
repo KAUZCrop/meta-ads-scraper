@@ -285,6 +285,41 @@ def scrape(keyword, country, scrolls, limit):
             }
             return out;
         }""")
+
+        # ── 브라우저 세션으로 이미지 병렬 다운로드 (Meta CDN 인증 우회) ──
+        img_urls = [
+            r["src"] for r in raw
+            if r.get("src") and r.get("type") == "image"
+        ][:limit]
+
+        b64_map = {}
+        if img_urls:
+            try:
+                result = page.evaluate("""async (urls) => {
+                    const CHUNK = 8;
+                    const out = {};
+                    for (let i = 0; i < urls.length; i += CHUNK) {
+                        const chunk = urls.slice(i, i + CHUNK);
+                        await Promise.all(chunk.map(async url => {
+                            try {
+                                const r = await fetch(url, {credentials: 'include'});
+                                if (!r.ok) return;
+                                const buf = await r.arrayBuffer();
+                                const bytes = new Uint8Array(buf);
+                                let bin = '';
+                                for (let j = 0; j < bytes.byteLength; j++)
+                                    bin += String.fromCharCode(bytes[j]);
+                                out[url] = btoa(bin);
+                            } catch(e) {}
+                        }));
+                    }
+                    return out;
+                }""", img_urls)
+                if isinstance(result, dict):
+                    b64_map = result
+            except Exception:
+                pass
+
         ctx.close(); browser.close()
 
     seen, collected, now = set(), [], time.strftime("%Y-%m-%d %H:%M:%S")
@@ -306,6 +341,7 @@ def scrape(keyword, country, scrolls, limit):
             "created_at": now,
             "starred":    False,
             "ai":         None,
+            "img_b64":    b64_map.get(src, ""),  # 브라우저로 캡처한 base64
         }
         fp = make_fp(asset)
         if fp in seen: continue
@@ -316,34 +352,54 @@ def scrape(keyword, country, scrolls, limit):
 # ============================================================
 # AI 분석
 # ============================================================
-def analyze(image_url, keyword):
+def analyze(item):
+    """img_b64 있으면 Claude Vision으로 이미지 직접 분석, 없으면 텍스트 fallback"""
     if not API_KEY: return None
     try:
         prompt = (
-            "광고 전략 전문가로서 Meta 광고 소재를 분석해주세요.\n\n"
-            f"검색 키워드: {keyword}\n"
-            f"이미지 URL: {image_url}\n\n"
-            "이미지를 직접 볼 수 없어도 키워드와 URL 패턴으로 분석해주세요.\n"
+            "당신은 광고 전략 전문가입니다. 이 Meta 광고 이미지를 분석해주세요.\n\n"
+            f"검색 키워드: {item['keyword']}\n\n"
+            "이미지 안의 텍스트, 색상, 구성, 인물 등을 직접 보고 분석해주세요.\n"
             "아래 JSON만 반환 (마크다운·백틱 없이 순수 JSON):\n"
-            '{"hook":"첫 시선을 잡는 요소 (1문장)",'
-            '"appeal":"소구포인트 유형 + 설명 (감성/이성/사회적증거/희소성/혜택 분류)",'
-            '"target":"추정 타겟 (연령·성별·관심사)",'
-            '"message":"핵심 메시지 (1문장)",'
+            '{"hook":"이미지에서 첫 시선을 잡는 핵심 요소 (텍스트나 비주얼 구체적으로)",'
+            '"copy":"이미지 안에 보이는 텍스트/카피 (그대로 옮겨쓰기, 없으면 빈 문자열)",'
+            '"appeal":"소구포인트 유형 + 근거 (감성/이성/사회적증거/희소성/혜택 분류)",'
+            '"tone":"색감·분위기·비주얼 스타일 (예: 따뜻한 노란 톤, 미니멀, 라이프스타일)",'
+            '"target":"추정 타겟 (연령·성별·관심사 구체적으로)",'
+            '"message":"핵심 메시지 한 줄",'
             '"tags":["태그1","태그2","태그3"]}'
         )
+
+        b64 = item.get("img_b64", "")
+        if b64:
+            content = [
+                {
+                    "type": "image",
+                    "source": {
+                        "type":       "base64",
+                        "media_type": "image/jpeg",
+                        "data":       b64,
+                    },
+                },
+                {"type": "text", "text": prompt},
+            ]
+        else:
+            # 이미지 없을 때 텍스트만으로 분석
+            content = [{"type": "text", "text": prompt}]
+
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={
-                "x-api-key": API_KEY,
+                "x-api-key":         API_KEY,
                 "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
+                "content-type":      "application/json",
             },
             json={
                 "model":      "claude-haiku-4-5-20251001",
-                "max_tokens": 400,
-                "messages":   [{"role": "user", "content": prompt}],
+                "max_tokens": 600,
+                "messages":   [{"role": "user", "content": content}],
             },
-            timeout=25,
+            timeout=30,
         )
         if resp.status_code != 200: return None
         txt = resp.json()["content"][0]["text"].strip()
@@ -356,13 +412,16 @@ def analyze_parallel(items, max_workers=6):
     if not API_KEY: return items
     id_map = {item["id"]: item for item in items}
     def task(item):
-        return item["id"], analyze(item["image_url"], item["keyword"])
+        return item["id"], analyze(item)
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {ex.submit(task, item): item["id"] for item in items if not item.get("ai")}
         for future in as_completed(futures):
-            aid, result = future.result()
-            if result and aid in id_map:
-                id_map[aid]["ai"] = result
+            try:
+                aid, result = future.result()
+                if result and aid in id_map:
+                    id_map[aid]["ai"] = result
+            except Exception:
+                pass
     return items
 
 def summarize_insights(analyzed_items):
@@ -1009,13 +1068,17 @@ else:
             ai_data = item.get("ai")
             if ai_data:
                 tags_str = "".join(f'<span class="ai-tag">{t}</span>' for t in ai_data.get("tags", []))
+                copy_line = f'<b>카피</b>&nbsp;&nbsp;&nbsp;{ai_data["copy"]}<br>' if ai_data.get("copy") else ""
+                tone_line = f'<b>톤&매너</b>&nbsp;{ai_data["tone"]}<br>' if ai_data.get("tone") else ""
                 st.markdown(
                     '<div class="ai-wrap"><div class="ai-box">'
                     '<div class="ai-head">APPEAL ANALYSIS</div>'
                     '<div class="ai-body">'
                     f'<b>후크</b>&nbsp;&nbsp;&nbsp;{ai_data.get("hook","—")}<br>'
-                    f'<b>소구</b>&nbsp;&nbsp;&nbsp;{ai_data.get("appeal","—")}<br>'
-                    f'<b>타겟</b>&nbsp;&nbsp;&nbsp;{ai_data.get("target","—")}<br>'
+                    + copy_line
+                    + f'<b>소구</b>&nbsp;&nbsp;&nbsp;{ai_data.get("appeal","—")}<br>'
+                    + tone_line
+                    + f'<b>타겟</b>&nbsp;&nbsp;&nbsp;{ai_data.get("target","—")}<br>'
                     f'<b>메시지</b>&nbsp;{ai_data.get("message","—")}<br>'
                     f'<div style="margin-top:6px">{tags_str}</div>'
                     '</div></div></div>',
