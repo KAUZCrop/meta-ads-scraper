@@ -354,38 +354,46 @@ def scrape(keyword, country, scrolls, limit):
 # ============================================================
 def analyze(item):
     """img_b64 있으면 Claude Vision으로 이미지 직접 분석, 없으면 텍스트 fallback"""
-    if not API_KEY: return None
+    if not API_KEY:
+        return {"_error": "API Key 없음"}
     try:
-        prompt = (
-            "당신은 광고 전략 전문가입니다. 이 Meta 광고 이미지를 분석해주세요.\n\n"
-            f"검색 키워드: {item['keyword']}\n\n"
-            "이미지 안의 텍스트, 색상, 구성, 인물 등을 직접 보고 분석해주세요.\n"
-            "아래 JSON만 반환 (마크다운·백틱 없이 순수 JSON):\n"
-            '{"hook":"이미지에서 첫 시선을 잡는 핵심 요소 (텍스트나 비주얼 구체적으로)",'
-            '"copy":"이미지 안에 보이는 텍스트/카피 (그대로 옮겨쓰기, 없으면 빈 문자열)",'
-            '"appeal":"소구포인트 유형 + 근거 (감성/이성/사회적증거/희소성/혜택 분류)",'
-            '"tone":"색감·분위기·비주얼 스타일 (예: 따뜻한 노란 톤, 미니멀, 라이프스타일)",'
-            '"target":"추정 타겟 (연령·성별·관심사 구체적으로)",'
-            '"message":"핵심 메시지 한 줄",'
-            '"tags":["태그1","태그2","태그3"]}'
-        )
-
         b64 = item.get("img_b64", "")
+
         if b64:
+            prompt = (
+                "당신은 광고 전략 전문가입니다. 이 Meta 광고 이미지를 분석해주세요.\n\n"
+                f"검색 키워드: {item['keyword']}\n\n"
+                "이미지를 직접 보고 분석해주세요.\n"
+                "아래 JSON만 반환 (마크다운·백틱 없이 순수 JSON):\n"
+                '{"hook":"이미지에서 첫 시선을 잡는 핵심 요소",'
+                '"copy":"이미지 안에 보이는 텍스트/카피 (그대로 옮겨쓰기)",'
+                '"appeal":"소구포인트 유형 + 근거 (감성/이성/사회적증거/희소성/혜택)",'
+                '"tone":"색감·분위기·비주얼 스타일",'
+                '"target":"추정 타겟 (연령·성별·관심사)",'
+                '"message":"핵심 메시지 한 줄",'
+                '"tags":["태그1","태그2","태그3"]}'
+            )
             content = [
-                {
-                    "type": "image",
-                    "source": {
-                        "type":       "base64",
-                        "media_type": "image/jpeg",
-                        "data":       b64,
-                    },
-                },
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
                 {"type": "text", "text": prompt},
             ]
+            model = "claude-sonnet-4-6"
         else:
-            # 이미지 없을 때 텍스트만으로 분석
+            # 이미지 없을 때 — 키워드 기반 텍스트 분석
+            prompt = (
+                "당신은 광고 전략 전문가입니다. 아래 키워드로 Meta에서 검색된 광고 소재를 추정 분석해주세요.\n\n"
+                f"검색 키워드: {item['keyword']}\n\n"
+                "아래 JSON만 반환 (마크다운·백틱 없이 순수 JSON):\n"
+                '{"hook":"이 키워드 광고의 일반적 후크 패턴",'
+                '"copy":"",'
+                '"appeal":"소구포인트 유형 추정",'
+                '"tone":"일반적 톤 추정",'
+                '"target":"추정 타겟",'
+                '"message":"핵심 메시지 추정",'
+                '"tags":["태그1","태그2","태그3"]}'
+            )
             content = [{"type": "text", "text": prompt}]
+            model = "claude-haiku-4-5-20251001"
 
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -394,19 +402,19 @@ def analyze(item):
                 "anthropic-version": "2023-06-01",
                 "content-type":      "application/json",
             },
-            json={
-                "model":      "claude-sonnet-4-6" if b64 else "claude-haiku-4-5-20251001",
-                "max_tokens": 600,
-                "messages":   [{"role": "user", "content": content}],
-            },
+            json={"model": model, "max_tokens": 600, "messages": [{"role": "user", "content": content}]},
             timeout=30,
         )
-        if resp.status_code != 200: return None
+        if resp.status_code != 200:
+            return {"_error": f"API {resp.status_code}: {resp.text[:200]}"}
         txt = resp.json()["content"][0]["text"].strip()
         s, e = txt.find("{"), txt.rfind("}") + 1
-        return json.loads(txt[s:e]) if s != -1 and e > 0 else None
-    except Exception:
-        return None
+        if s == -1 or e == 0:
+            return {"_error": f"JSON 파싱 실패: {txt[:100]}"}
+        return json.loads(txt[s:e])
+    except Exception as ex:
+        return {"_error": str(ex)[:200]}
+
 
 def analyze_parallel(items, max_workers=6):
     if not API_KEY: return items
@@ -417,12 +425,30 @@ def analyze_parallel(items, max_workers=6):
         futures = {ex.submit(task, item): item["id"] for item in items if not item.get("ai")}
         for future in as_completed(futures):
             try:
-                aid, result = future.result()
+                aid, result = future.result(timeout=40)
                 if result and aid in id_map:
                     id_map[aid]["ai"] = result
-            except Exception:
+            except Exception as ex:
                 pass
     return items
+
+
+def test_api():
+    """API 연결 테스트 — 실제 에러 메시지 반환"""
+    if not API_KEY:
+        return False, "API Key가 없습니다. Streamlit Secrets를 확인하세요."
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            return True, "API 정상 연결됨"
+        return False, f"API 오류 {resp.status_code}: {resp.text[:300]}"
+    except Exception as ex:
+        return False, f"연결 실패: {ex}"
 
 def summarize_insights(analyzed_items):
     if not API_KEY or not analyzed_items: return None
@@ -776,6 +802,10 @@ with st.sidebar:
         if API_KEY:
             st.success("API Key 연결됨")
             st.caption("선택 소재만 분석 · Haiku · 소재당 ~1원")
+            if st.button("API 연결 테스트", use_container_width=True):
+                ok, msg = test_api()
+                if ok: st.success(msg)
+                else:  st.error(msg)
         else:
             st.error("API Key 없음")
             st.caption("Streamlit Cloud > Settings > Secrets\nANTHROPIC_API_KEY = 'sk-ant-...'")
@@ -1065,22 +1095,33 @@ else:
 
             ai_data = item.get("ai")
             if ai_data:
-                tags_str = "".join(f'<span class="ai-tag">{t}</span>' for t in ai_data.get("tags", []))
-                copy_line = f'<b>카피</b>&nbsp;&nbsp;&nbsp;{ai_data["copy"]}<br>' if ai_data.get("copy") else ""
-                tone_line = f'<b>톤&매너</b>&nbsp;{ai_data["tone"]}<br>' if ai_data.get("tone") else ""
-                st.markdown(
-                    '<div class="ai-wrap"><div class="ai-box">'
-                    '<div class="ai-head">APPEAL ANALYSIS</div>'
-                    '<div class="ai-body">'
-                    f'<b>후크</b>&nbsp;&nbsp;&nbsp;{ai_data.get("hook","—")}<br>'
-                    + copy_line
-                    + f'<b>소구</b>&nbsp;&nbsp;&nbsp;{ai_data.get("appeal","—")}<br>'
-                    + tone_line
-                    + f'<b>타겟</b>&nbsp;&nbsp;&nbsp;{ai_data.get("target","—")}<br>'
-                    f'<b>메시지</b>&nbsp;{ai_data.get("message","—")}<br>'
-                    f'<div style="margin-top:6px">{tags_str}</div>'
-                    '</div></div></div>',
-                    unsafe_allow_html=True)
+                if ai_data.get("_error"):
+                    # 에러 메시지 표시
+                    st.markdown(
+                        '<div class="ai-wrap"><div class="ai-box" style="border-color:var(--er)">'
+                        f'<div class="ai-head" style="color:var(--er)">분석 오류</div>'
+                        f'<div class="ai-body" style="font-size:11px">{ai_data["_error"]}</div>'
+                        '</div></div>',
+                        unsafe_allow_html=True)
+                else:
+                    has_img = bool(item.get("img_b64"))
+                    tags_str = "".join(f'<span class="ai-tag">{t}</span>' for t in ai_data.get("tags", []))
+                    copy_line = f'<b>카피</b>&nbsp;&nbsp;&nbsp;{ai_data["copy"]}<br>' if ai_data.get("copy") else ""
+                    tone_line = f'<b>톤&매너</b>&nbsp;{ai_data["tone"]}<br>' if ai_data.get("tone") else ""
+                    img_badge = '<span class="bdg b-ai" style="font-size:8px">IMG분석</span> ' if has_img else '<span class="bdg" style="background:var(--bg3);color:var(--mu);font-size:8px">텍스트추정</span> '
+                    st.markdown(
+                        '<div class="ai-wrap"><div class="ai-box">'
+                        f'<div class="ai-head">APPEAL ANALYSIS {img_badge}</div>'
+                        '<div class="ai-body">'
+                        f'<b>후크</b>&nbsp;&nbsp;&nbsp;{ai_data.get("hook","—")}<br>'
+                        + copy_line
+                        + f'<b>소구</b>&nbsp;&nbsp;&nbsp;{ai_data.get("appeal","—")}<br>'
+                        + tone_line
+                        + f'<b>타겟</b>&nbsp;&nbsp;&nbsp;{ai_data.get("target","—")}<br>'
+                        f'<b>메시지</b>&nbsp;{ai_data.get("message","—")}<br>'
+                        f'<div style="margin-top:6px">{tags_str}</div>'
+                        '</div></div></div>',
+                        unsafe_allow_html=True)
 
             st.markdown('</div>', unsafe_allow_html=True)
 
