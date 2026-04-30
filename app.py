@@ -395,7 +395,7 @@ def analyze(item):
                 "content-type":      "application/json",
             },
             json={
-                "model":      "claude-haiku-4-5-20251001",
+                "model":      "claude-sonnet-4-6" if b64 else "claude-haiku-4-5-20251001",
                 "max_tokens": 600,
                 "messages":   [{"role": "user", "content": content}],
             },
@@ -995,13 +995,11 @@ if ai_on and API_KEY and shown:
     with btn_c1:
         if sel_unanalyzed:
             if st.button(f"선택 분석 ({len(sel_unanalyzed)})", use_container_width=True):
-                pb = st.progress(0, text="병렬 분석 중...")
-                result_items = analyze_parallel(sel_unanalyzed, max_workers=6)
-                id_map = {a["id"]: a for a in st.session_state.assets}
-                done = 0
-                for it in result_items:
-                    if it.get("ai") and it["id"] in id_map:
-                        id_map[it["id"]]["ai"] = it["ai"]; done += 1
+                pb = st.progress(0, text="분석 중...")
+                # analyze_parallel이 items 딕셔너리를 직접 수정하므로
+                # st.session_state.assets의 동일 객체가 업데이트됨
+                analyze_parallel(sel_unanalyzed, max_workers=6)
+                done = sum(1 for it in sel_unanalyzed if it.get("ai"))
                 pb.progress(1.0, text=f"완료! {done}개 분석")
                 pb.empty()
                 st.rerun()
