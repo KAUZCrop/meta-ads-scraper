@@ -214,12 +214,19 @@ def make_fp(item):
         item.get("height", 0),
     )
 
-def scrape(keyword, country, scrolls, limit):
+def scrape(keyword, country, scrolls, limit, search_type="keyword"):
     ensure_browser()
-    search_url = (
-        "https://www.facebook.com/ads/library/"
-        f"?active_status=all&ad_type=all&country={country}&q={quote(keyword)}"
-    )
+
+    if search_type == "advertiser":
+        search_url = (
+            "https://www.facebook.com/ads/library/"
+            f"?active_status=all&ad_type=all&country={country}&search_type=page&q={quote(keyword)}"
+        )
+    else:
+        search_url = (
+            "https://www.facebook.com/ads/library/"
+            f"?active_status=all&ad_type=all&country={country}&q={quote(keyword)}"
+        )
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=[
             "--no-sandbox", "--disable-dev-shm-usage", "--disable-extensions",
@@ -263,6 +270,22 @@ def scrape(keyword, country, scrolls, limit):
 
         raw = page.evaluate("""() => {
             const out = [];
+
+            function getDate(el) {
+                let node = el;
+                for (let i = 0; i < 12 && node; i++) {
+                    const txt = node.innerText || node.textContent || '';
+                    // 한국어: 2025년 3월 15일
+                    const kr = txt.match(/(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일/);
+                    if (kr) return kr[1]+'-'+kr[2].padStart(2,'0')+'-'+kr[3].padStart(2,'0');
+                    // 영어: March 15, 2025
+                    const en = txt.match(/(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s*\d{4}/i);
+                    if (en) { const d=new Date(en[0]); if(!isNaN(d)) return d.toISOString().split('T')[0]; }
+                    node = node.parentElement;
+                }
+                return '';
+            }
+
             for (const img of document.querySelectorAll('img')) {
                 const src = img.currentSrc || img.src || '';
                 if (!src || src.startsWith('data:')) continue;
@@ -270,7 +293,8 @@ def scrape(keyword, country, scrolls, limit):
                     type: 'image', src,
                     w: img.naturalWidth  || img.width  || 0,
                     h: img.naturalHeight || img.height || 0,
-                    alt: img.alt || ''
+                    alt: img.alt || '',
+                    start_date: getDate(img)
                 });
             }
             for (const v of document.querySelectorAll('video')) {
@@ -280,7 +304,8 @@ def scrape(keyword, country, scrolls, limit):
                     type: 'video_poster', src: poster,
                     w: v.videoWidth  || v.clientWidth  || 0,
                     h: v.videoHeight || v.clientHeight || 0,
-                    alt: ''
+                    alt: '',
+                    start_date: ''
                 });
             }
             return out;
@@ -301,6 +326,7 @@ def scrape(keyword, country, scrolls, limit):
             "image_url":  src,
             "source_url": search_url,
             "caption":    (r.get("alt") or "").strip(),
+            "start_date": (r.get("start_date") or "").strip(),
             "width":      w,
             "height":     h,
             "created_at": now,
@@ -738,7 +764,7 @@ with st.sidebar:
     fstar = st.toggle("즐겨찾기만", value=False)
     fai   = st.toggle("AI 분석된 것만", value=False)
     cols  = st.select_slider("열 수", options=[2,3,4,5], value=4)
-    sort  = st.selectbox("정렬", ["최신순","오래된순","키워드순","즐겨찾기순"], label_visibility="collapsed")
+    sort  = st.selectbox("정렬", ["최신순","오래된순","키워드순","즐겨찾기순","집행기간순"], label_visibility="collapsed")
     st.markdown("---")
 
     st.markdown('<div class="slbl">EXPORT</div>', unsafe_allow_html=True)
@@ -787,10 +813,21 @@ elif ai_on and not API_KEY:
 # ============================================================
 st.markdown('<div class="srch">', unsafe_allow_html=True)
 st.markdown('<div class="srch-lbl">KEYWORD SEARCH</div>', unsafe_allow_html=True)
+
+# 검색 타입 (키워드 vs 광고주명)
+search_type = st.radio(
+    "검색 타입",
+    ["키워드 검색", "광고주명 검색"],
+    horizontal=True,
+    label_visibility="collapsed",
+)
+st_type = "advertiser" if search_type == "광고주명 검색" else "keyword"
+st.caption("광고주명 검색: 특정 브랜드가 집행 중인 광고만 수집" if st_type == "advertiser" else "키워드 검색: 해당 키워드가 포함된 광고 수집")
+
 c1, c2, c3 = st.columns([5, 1, 1])
 with c1:
     kw = st.text_input("kw",
-        placeholder="예: 캐리어, 공기청정기, 스킨케어, 다이어트",
+        placeholder="예: 무무키 (광고주명) / 스킨케어 (키워드)",
         label_visibility="collapsed",
         on_change=lambda: st.session_state.update({"_enter": True}))
 with c2:
@@ -820,7 +857,7 @@ if do_new or do_add:
                 st.session_state.selected = set()
 
             with st.spinner(f"'{q}' 수집 중 — Meta Ad Library 실시간 접근..."):
-                items = scrape(q, country, scrolls, max_n)
+                items = scrape(q, country, scrolls, max_n, st_type)
 
             merged, added = merge(st.session_state.assets, items)
             st.session_state.assets = merged
@@ -848,6 +885,7 @@ if sort == "최신순":     shown = sorted(shown, key=lambda a: a["created_at"],
 elif sort == "오래된순": shown = sorted(shown, key=lambda a: a["created_at"])
 elif sort == "키워드순": shown = sorted(shown, key=lambda a: a["keyword"])
 elif sort == "즐겨찾기순": shown = sorted(shown, key=lambda a: (not a.get("starred"), a["created_at"]))
+elif sort == "집행기간순": shown = sorted(shown, key=lambda a: a.get("start_date") or "9999", reverse=False)
 
 ic = sum(1 for a in shown if a["asset_type"] == "image")
 vc = sum(1 for a in shown if a["asset_type"] == "video_poster")
@@ -878,6 +916,65 @@ if st.session_state.history:
         html += f'<span class="tag"><span class="tag-dot"></span>{h} <span style="opacity:.5">({n})</span></span>'
     html += "</div>"
     st.markdown(html, unsafe_allow_html=True)
+
+
+# ============================================================
+# 트렌드 차트
+# ============================================================
+if len(all_a) > 0:
+    with st.expander("📊 트렌드 차트", expanded=False):
+        tc1, tc2 = st.columns(2)
+
+        with tc1:
+            # 키워드별 소재 수
+            kw_counts = {}
+            for a in all_a:
+                kw_counts[a["keyword"]] = kw_counts.get(a["keyword"], 0) + 1
+            if kw_counts:
+                st.markdown("**키워드별 소재 수**")
+                st.bar_chart(kw_counts)
+
+        with tc2:
+            # 이미지 vs 영상 + 집행기간 있는 소재 수
+            type_counts = {
+                "이미지": sum(1 for a in all_a if a["asset_type"] == "image"),
+                "영상": sum(1 for a in all_a if a["asset_type"] == "video_poster"),
+            }
+            st.markdown("**소재 타입 분포**")
+            st.bar_chart(type_counts)
+
+            dated = sum(1 for a in all_a if a.get("start_date"))
+            if dated > 0:
+                st.caption(f"집행기간 확인된 소재: {dated}개 / {len(all_a)}개")
+
+
+# ============================================================
+# 비교 뷰
+# ============================================================
+sel_for_compare = [a for a in st.session_state.assets if a["id"] in st.session_state.selected]
+if 2 <= len(sel_for_compare) <= 4:
+    with st.expander(f"🔍 비교 뷰 — {len(sel_for_compare)}개 선택 소재", expanded=False):
+        cmp_cols = st.columns(len(sel_for_compare))
+        for ci, item in enumerate(sel_for_compare):
+            with cmp_cols[ci]:
+                try:
+                    st.image(item["image_url"], use_container_width=True)
+                except Exception:
+                    st.markdown("이미지 로드 실패")
+                st.markdown(f"**{item['keyword']}** · {item['country']}")
+                if item.get("start_date"):
+                    st.caption(f"집행 시작: {item['start_date']}")
+                ai = item.get("ai")
+                if ai:
+                    st.markdown(f"**소구** {ai.get('appeal','—')}")
+                    st.markdown(f"**타겟** {ai.get('target','—')}")
+                    st.markdown(f"**메시지** {ai.get('message','—')}")
+                    tags = ai.get("tags", [])
+                    if tags:
+                        st.markdown(" ".join(f"`{t}`" for t in tags))
+                else:
+                    st.caption("AI 분석 없음")
+
 
 
 # ============================================================
@@ -996,13 +1093,16 @@ else:
             cap   = item.get("caption", "")
             cap_h = f'<div class="card-cap">"{cap[:55]}{"..." if len(cap) > 55 else ""}"</div>' if cap else ""
 
+            start_d = item.get("start_date","")
+            date_str = f" · 집행시작 {start_d}" if start_d else ""
+
             st.markdown(
                 '<div class="card-body">'
                 f'<div class="card-kw">{item["keyword"]} · {item["country"]}</div>'
                 + sel_b + sv_b + ai_b +
                 f'<span class="bdg {bc}">{bl}</span>'
                 + cap_h +
-                f'<div class="card-meta">{item["width"]}x{item["height"]}px · {item["created_at"][11:16]}</div>'
+                f'<div class="card-meta">{item["width"]}x{item["height"]}px · {item["created_at"][11:16]}{date_str}</div>'
                 '</div>',
                 unsafe_allow_html=True)
 
