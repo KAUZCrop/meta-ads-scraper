@@ -656,6 +656,75 @@ def _normalize_ai_result(data: dict) -> dict:
     return data
 
 
+
+def _extract_ocr_with_claude(img_b64: str) -> dict:
+    """Claude Vision을 OCR 전용으로 1차 호출. 광고 해석 없이 실제 문구만 추출."""
+    if not API_KEY or not img_b64:
+        return {"texts": [], "raw": "", "_error": "OCR 입력 이미지 없음"}
+    try:
+        ocr_prompt = """
+당신은 광고 이미지 OCR 추출기입니다.
+광고 분석, 해석, 추정은 절대 하지 마세요.
+이미지 안에 실제로 보이는 글자만 최대한 그대로 추출하세요.
+
+규칙:
+- 보이는 텍스트만 추출
+- 글자가 불확실하면 "확인 불가"로 작성
+- 캐릭터/동물/제품 모양 해석 금지
+- 브랜드명, 제품명, 가격, 할인율, CTA 문구를 우선 추출
+- 줄 단위로 분리
+- JSON 외 설명문/마크다운/백틱 금지
+- 반드시 json.loads() 가능한 순수 JSON만 반환
+
+반환 형식:
+{
+  "texts": ["이미지 안 실제 문구1", "이미지 안 실제 문구2"],
+  "brand_candidates": ["보이는 브랜드명"],
+  "product_candidates": ["보이는 제품명"],
+  "price_texts": ["가격/할인 관련 문구"],
+  "cta_texts": ["CTA 문구"]
+}
+"""
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": _anthropic_model(),
+                "max_tokens": 700,
+                "temperature": 0,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+                        {"type": "text", "text": ocr_prompt},
+                    ],
+                }],
+            },
+            timeout=45,
+        )
+        if resp.status_code != 200:
+            return {"texts": [], "raw": "", "_error": f"OCR API {resp.status_code}: {resp.text[:200]}"}
+        txt = resp.json()["content"][0]["text"].strip()
+        parsed, err = _parse_ai_json(txt)
+        if err:
+            return {"texts": [], "raw": txt, "_error": err}
+        if not isinstance(parsed, dict):
+            return {"texts": [], "raw": txt, "_error": "OCR 응답이 JSON object가 아닙니다."}
+        for k in ["texts", "brand_candidates", "product_candidates", "price_texts", "cta_texts"]:
+            v = parsed.get(k, [])
+            if isinstance(v, str):
+                parsed[k] = [v]
+            elif not isinstance(v, list):
+                parsed[k] = []
+        parsed["raw"] = txt
+        return parsed
+    except Exception as ex:
+        return {"texts": [], "raw": "", "_error": f"OCR 실패: {str(ex)[:200]}"}
+
 def analyze(item):
     """모달/요소 스크린샷 base64가 있을 때만 Claude Vision 분석. 추정 fallback 없음."""
     if not API_KEY:
@@ -666,6 +735,13 @@ def analyze(item):
         return {"_error": "모달/요소 스크린샷 확보 실패: 실제 이미지 payload가 없어 분석하지 않았습니다."}
 
     try:
+        ocr_data = _extract_ocr_with_claude(b64)
+        ocr_text = _safe_join(ocr_data.get("texts", []), " / ") or "확인 불가"
+        brand_text = _safe_join(ocr_data.get("brand_candidates", []), " / ") or "확인 불가"
+        product_text = _safe_join(ocr_data.get("product_candidates", []), " / ") or "확인 불가"
+        price_text = _safe_join(ocr_data.get("price_texts", []), " / ") or "확인 불가"
+        cta_text = _safe_join(ocr_data.get("cta_texts", []), " / ") or "확인 불가"
+
         prompt = f"""
 당신은 광고 소재 리서치 분석가입니다.
 첨부 이미지는 Meta 광고 라이브러리에서 캡처한 실제 광고 소재 화면입니다.
@@ -674,6 +750,10 @@ def analyze(item):
 - 절대 추상적 해석부터 하지 마세요.
 - 반드시 이미지에서 실제로 보이는 요소를 먼저 객관적으로 추출하세요.
 - 이미지에 없는 정보는 추정하지 말고 "확인 불가"라고 작성하세요.
+- OCR 결과에 있는 브랜드명/제품명/가격/CTA를 최우선 근거로 사용하세요.
+- 캐릭터/동물/사물의 종류를 임의로 일반화하지 마세요. 예: 곰, 토끼, 강아지, 캐릭터 이름 등은 이미지 텍스트에 명시되어 있지 않으면 쓰지 마세요.
+- 갈색 둥근 형태처럼 보이면 "갈색 둥근 형태의 제품/소품"처럼 형태 그대로만 쓰세요.
+- 제품명 또는 OCR에 특정 명칭이 보이면 그 명칭을 그대로 사용하세요.
 - "귀여운", "감성적", "프리미엄" 같은 표현은 이미지 근거가 있을 때만 사용하세요.
 - 모든 분석은 visual_facts에 적은 요소를 근거로 해야 합니다.
 - JSON 외 마크다운, 설명문, 백틱은 절대 출력하지 마세요.
@@ -684,6 +764,19 @@ def analyze(item):
 
 검색 키워드: {item['keyword']}
 캡처 방식: {item.get('capture_source', 'unknown')}
+
+1차 OCR 결과:
+- 전체 문구: {ocr_text}
+- 브랜드 후보: {brand_text}
+- 제품명 후보: {product_text}
+- 가격/할인 문구: {price_text}
+- CTA 문구: {cta_text}
+
+분석 제한 규칙:
+- visible_text는 위 OCR 결과와 이미지에서 실제 확인되는 문구만 사용하세요.
+- objects에는 동물명/캐릭터명을 추정해서 쓰지 말고, 실제 보이는 형태만 기술하세요.
+- OCR에 제품명이 있으면 objects와 message에서 해당 제품명을 우선 사용하세요.
+- OCR과 이미지가 충돌하면 OCR 텍스트를 우선하되, 불확실하면 "확인 불가"라고 쓰세요.
 
 반드시 아래 JSON 구조로만 반환하세요:
 {{
@@ -753,7 +846,11 @@ def analyze(item):
         parsed, parse_error = _parse_ai_json(txt)
         if parse_error:
             return {"_error": parse_error}
-        return _normalize_ai_result(parsed)
+        normalized = _normalize_ai_result(parsed)
+        normalized["ocr"] = ocr_data
+        if isinstance(normalized.get("visual_facts"), dict):
+            normalized["visual_facts"].setdefault("ocr_text", ocr_data.get("texts", []))
+        return normalized
     except Exception as ex:
         return {"_error": str(ex)[:300]}
 
@@ -1453,7 +1550,8 @@ else:
                     ce = ai_data.get("conversion_elements", {}) or {}
                     cd = ai_data.get("creative_diagnosis", {}) or {}
 
-                    visible_text = _safe_join(vf.get("visible_text", []), " / ") or ai_data.get("copy", "—")
+                    ocr_line = _safe_join((ai_data.get("ocr") or {}).get("texts", []), " / ")
+                    visible_text = _safe_join(vf.get("visible_text", []), " / ") or ocr_line or ai_data.get("copy", "—")
                     objects = _safe_join(vf.get("objects", [])) or ai_data.get("main_visual", "—")
                     colors = _safe_join(vf.get("colors", [])) or ai_data.get("tone", "—")
                     strengths = _safe_join(cd.get("strengths", [])) or "—"
