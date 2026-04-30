@@ -223,179 +223,136 @@ def scrape(keyword, country, scrolls, limit):
         f"?active_status=all&ad_type=all&country={country}&q={quote(keyword)}"
     )
 
-    # ── GraphQL 응답에서 광고 데이터 추출 ──
-    def parse_graphql(data: dict) -> list[dict]:
-        """Meta Ad Library GraphQL 응답을 재귀 파싱해서 광고 단위로 변환"""
-        ads = []
+    # ── GraphQL JSON 재귀 파싱 ──
+    def deep_find(obj, keys):
+        """JSON 안에서 특정 키를 재귀적으로 찾아 첫 번째 값 반환"""
+        if isinstance(obj, dict):
+            for k in keys:
+                if k in obj and obj[k]:
+                    return obj[k]
+            for v in obj.values():
+                result = deep_find(v, keys)
+                if result: return result
+        elif isinstance(obj, list):
+            for item in obj:
+                result = deep_find(item, keys)
+                if result: return result
+        return None
 
-        def find_edges(obj):
-            if isinstance(obj, dict):
-                # search_results_connection 또는 edges 있으면 탐색
-                if "edges" in obj:
-                    for edge in obj["edges"]:
-                        node = edge.get("node", {})
-                        parse_node(node)
-                for v in obj.values():
-                    find_edges(v)
-            elif isinstance(obj, list):
-                for item in obj:
-                    find_edges(item)
+    def extract_text(val):
+        if isinstance(val, dict):
+            return val.get("text") or val.get("content") or ""
+        elif isinstance(val, list):
+            parts = []
+            for v in val:
+                t = extract_text(v)
+                if t: parts.append(t)
+            return " ".join(parts)
+        return str(val) if val else ""
 
-        def parse_node(node: dict):
-            if not isinstance(node, dict): return
+    def parse_ad_node(node: dict) -> list[dict]:
+        """광고 노드에서 이미지+카피 추출"""
+        results = []
+        if not isinstance(node, dict): return results
 
-            # 광고주명
-            advertiser = (
-                node.get("page_name") or
-                node.get("advertiser_name") or
-                ""
-            )
+        advertiser  = str(node.get("page_name") or node.get("advertiser_name") or "")
+        start_ts    = node.get("start_date") or node.get("ad_delivery_start_time") or 0
+        end_ts      = node.get("end_date")   or node.get("ad_delivery_stop_time") or 0
+        platforms   = node.get("publisher_platforms") or []
 
-            # 집행 기간
-            start_ts = node.get("start_date") or node.get("ad_delivery_start_time")
-            end_ts   = node.get("end_date")   or node.get("ad_delivery_stop_time")
-            start_date = ""
-            end_date   = ""
-            if start_ts:
-                try:
-                    import datetime
-                    start_date = datetime.datetime.fromtimestamp(
-                        int(start_ts)).strftime("%Y-%m-%d")
-                except Exception:
-                    pass
-            if end_ts:
-                try:
-                    import datetime
-                    end_date = datetime.datetime.fromtimestamp(
-                        int(end_ts)).strftime("%Y-%m-%d")
-                except Exception:
-                    pass
+        try:
+            import datetime
+            start_date = datetime.datetime.fromtimestamp(int(start_ts)).strftime("%Y-%m-%d") if start_ts else ""
+            end_date   = datetime.datetime.fromtimestamp(int(end_ts)).strftime("%Y-%m-%d")   if end_ts   else ""
+        except Exception:
+            start_date = end_date = ""
 
-            # 집행 플랫폼
-            platforms = node.get("publisher_platforms") or \
-                        node.get("platforms") or []
-            platform_str = ", ".join(platforms) if isinstance(platforms, list) else ""
+        platform_str = ", ".join(platforms) if isinstance(platforms, list) else ""
 
-            # 개별 광고(creative) 파싱
-            raw_ads = node.get("ads") or node.get("ad_creatives") or [node]
-            for ad in raw_ads:
-                if not isinstance(ad, dict): continue
-                parse_creative(ad, advertiser, start_date, end_date, platform_str)
+        # 광고 크리에이티브 목록
+        creatives = node.get("ads") or node.get("ad_creatives") or [node]
 
-            # 중첩 노드 탐색
-            for v in node.values():
-                if isinstance(v, dict) and "edges" in v:
-                    find_edges(v)
-
-        def parse_creative(ad: dict, advertiser: str,
-                           start_date: str, end_date: str, platform_str: str):
-            # 카피
-            body = ""
-            body_obj = ad.get("body") or ad.get("ad_creative_bodies")
-            if isinstance(body_obj, dict):
-                body = body_obj.get("text", "")
-            elif isinstance(body_obj, list):
-                body = " ".join(str(b) for b in body_obj if b)
-            elif isinstance(body_obj, str):
-                body = body_obj
-
-            # snapshot 안에 카피가 있는 경우
+        for ad in creatives:
+            if not isinstance(ad, dict): continue
             snap = ad.get("snapshot") or {}
-            if not body and isinstance(snap, dict):
-                b = snap.get("body") or {}
-                if isinstance(b, dict):
-                    body = b.get("text", "")
-                elif isinstance(b, str):
-                    body = b
+
+            # 카피 본문
+            body_raw = (ad.get("body") or snap.get("body") or
+                        ad.get("ad_creative_bodies") or "")
+            body = extract_text(body_raw)[:400]
 
             # 헤드라인
-            headline = (
-                ad.get("title") or
-                ad.get("ad_creative_link_titles") or
-                snap.get("title") or
-                ""
-            )
-            if isinstance(headline, list):
-                headline = " ".join(str(h) for h in headline if h)
+            hl_raw = (ad.get("title") or snap.get("title") or
+                      ad.get("ad_creative_link_titles") or
+                      snap.get("link_title") or "")
+            headline = extract_text(hl_raw)[:120]
 
             # CTA
-            cta = (
-                ad.get("cta_text") or
-                ad.get("call_to_action_type") or
-                snap.get("cta_text") or
-                ""
+            cta = str(ad.get("cta_text") or snap.get("cta_text") or
+                      ad.get("call_to_action_type") or "")[:40]
+
+            base = dict(
+                advertiser=advertiser, headline=headline,
+                body=body, cta=cta,
+                start_date=start_date, end_date=end_date,
+                platforms=platform_str,
             )
 
-            base = {
-                "advertiser":  advertiser[:100],
-                "headline":    str(headline)[:120],
-                "body":        str(body)[:400],
-                "cta":         str(cta)[:40],
-                "start_date":  start_date,
-                "end_date":    end_date,
-                "platforms":   platform_str,
-            }
-
-            # 이미지 URL 수집
-            images = (
-                ad.get("images") or
-                snap.get("images") or
-                ad.get("ad_creative_images") or
-                []
-            )
-            for img in images:
+            # 이미지
+            imgs = (ad.get("images") or snap.get("images") or
+                    ad.get("ad_creative_images") or [])
+            for img in imgs:
                 if not isinstance(img, dict): continue
-                url = (img.get("original_image_url") or
-                       img.get("url") or
+                url = (img.get("original_image_url") or img.get("url") or
                        img.get("resized_image_url") or "")
                 if url:
-                    ads.append({**base, "type": "image", "src": url, "w": 0, "h": 0})
+                    results.append({**base, "type": "image", "src": url})
 
-            # 비디오 썸네일 수집
-            videos = (
-                ad.get("videos") or
-                snap.get("videos") or
-                ad.get("ad_creative_videos") or
-                []
-            )
-            for vid in videos:
+            # 비디오 썸네일
+            vids = (ad.get("videos") or snap.get("videos") or
+                    ad.get("ad_creative_videos") or [])
+            for vid in vids:
                 if not isinstance(vid, dict): continue
                 url = (vid.get("video_preview_image_url") or
-                       vid.get("thumbnail") or
-                       vid.get("preview_image_url") or "")
+                       vid.get("thumbnail") or "")
                 if url:
-                    ads.append({**base, "type": "video_poster", "src": url, "w": 0, "h": 0})
+                    results.append({**base, "type": "video_poster", "src": url})
 
+        return results
+
+    def parse_graphql_body(raw_bytes: bytes) -> list[dict]:
+        results = []
         try:
-            find_edges(data)
+            text = raw_bytes.decode("utf-8", errors="ignore")
         except Exception:
-            pass
-        return ads
+            return results
 
-    # ── Playwright + 네트워크 인터셉트 ──
-    gql_ads = []  # GraphQL에서 수집된 광고 데이터
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or not line.startswith("{"): continue
+            try:
+                data = json.loads(line)
+                # edges 탐색
+                def walk(obj):
+                    if isinstance(obj, dict):
+                        if "edges" in obj:
+                            for edge in obj.get("edges", []):
+                                node = edge.get("node", {})
+                                if "page_name" in node or "ads" in node:
+                                    results.extend(parse_ad_node(node))
+                        for v in obj.values():
+                            walk(v)
+                    elif isinstance(obj, list):
+                        for item in obj:
+                            walk(item)
+                walk(data)
+            except Exception:
+                pass
+        return results
 
-    def on_response(response):
-        try:
-            url = response.url
-            if "facebook.com/api/graphql" not in url:
-                return
-            if response.status != 200:
-                return
-            body = response.body()
-            # 여러 JSON 라인으로 올 수 있음 (multipart)
-            for line in body.decode("utf-8", errors="ignore").splitlines():
-                line = line.strip()
-                if not line or not line.startswith("{"):
-                    continue
-                try:
-                    data = json.loads(line)
-                    parsed = parse_graphql(data)
-                    gql_ads.extend(parsed)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+    # ── Playwright 실행 ──
+    gql_results = []
+    captured_bodies = []  # route에서 캡처한 응답 바이트 목록
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=[
@@ -405,9 +362,23 @@ def scrape(keyword, country, scrolls, limit):
         ctx = browser.new_context(viewport={"width": 1440, "height": 2000})
         ctx.route("**/*.{woff,woff2,ttf,otf,eot}", lambda r: r.abort())
 
-        page = ctx.new_page()
-        page.on("response", on_response)  # 네트워크 인터셉트 등록
+        # GraphQL 요청을 route로 가로채서 응답 바이트 저장
+        def handle_graphql(route):
+            try:
+                resp = route.fetch()
+                body = resp.body()
+                captured_bodies.append(body)
+                route.fulfill(response=resp)
+            except Exception:
+                try:
+                    route.continue_()
+                except Exception:
+                    pass
 
+        ctx.route("**/api/graphql*", handle_graphql)
+        ctx.route("**/graphql*",     handle_graphql)
+
+        page = ctx.new_page()
         page.goto(search_url, wait_until="domcontentloaded", timeout=90000)
         page.wait_for_timeout(4000)
 
@@ -430,24 +401,53 @@ def scrape(keyword, country, scrolls, limit):
                 stalls += 1
                 if stalls >= 2: break
 
-        # GraphQL로 못 잡은 경우를 위한 DOM fallback
-        dom_imgs = page.evaluate("""() => {
+        # DOM에서 이미지 + 카피 동시 수집 (카드 단위)
+        dom_data = page.evaluate("""() => {
             const out = [];
-            for (const img of document.querySelectorAll('img')) {
+
+            // 전체 텍스트 블록 수집
+            function getText(el) {
+                try { return (el.innerText || el.textContent || '').trim(); }
+                catch(e) { return ''; }
+            }
+
+            // 이미지 전체
+            const imgMap = {};
+            for (const img of document.querySelectorAll('img[src*="fbcdn"]')) {
                 const src = img.currentSrc || img.src || '';
-                if (!src || src.startsWith('data:')) continue;
+                if (!src) continue;
+                // 가장 가까운 텍스트 블록 찾기
+                let parent = img.parentElement;
+                let body = '', headline = '', advertiser = '', cta = '';
+                for (let i = 0; i < 8 && parent; i++) {
+                    const divs = parent.querySelectorAll('div[dir="auto"]');
+                    const texts = [];
+                    for (const d of divs) {
+                        const t = getText(d);
+                        if (t && t.length > 3) texts.push(t);
+                    }
+                    if (texts.length > 0) {
+                        body = texts.slice(0, 3).join(' | ').substring(0, 400);
+                        break;
+                    }
+                    parent = parent.parentElement;
+                }
                 out.push({
-                    src,
+                    type: 'image', src,
                     w: img.naturalWidth  || img.width  || 0,
                     h: img.naturalHeight || img.height || 0,
+                    body, headline, advertiser, cta
                 });
             }
+
+            // 비디오 썸네일
             for (const v of document.querySelectorAll('video')) {
                 if (!v.poster) continue;
                 out.push({
-                    src: v.poster,
+                    type: 'video_poster', src: v.poster,
                     w: v.videoWidth || v.clientWidth || 0,
                     h: v.videoHeight || v.clientHeight || 0,
+                    body: '', headline: '', advertiser: '', cta: ''
                 });
             }
             return out;
@@ -455,84 +455,65 @@ def scrape(keyword, country, scrolls, limit):
 
         ctx.close(); browser.close()
 
+    # ── GraphQL 파싱 ──
+    for body_bytes in captured_bodies:
+        gql_results.extend(parse_graphql_body(body_bytes))
+
+    # GraphQL 이미지 URL → 카피 매핑
+    gql_map = {}  # src → 카피 정보
+    for g in gql_results:
+        src = g.get("src", "")
+        if src:
+            gql_map[src] = g
+
+    # ── 최종 수집 ──
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     seen, collected = set(), []
 
-    # ── 1차: GraphQL 데이터 사용 ──
-    if gql_ads:
-        # DOM 이미지 URL 집합 (크기 보정용)
-        dom_url_map = {d["src"]: d for d in dom_imgs}
+    for d in dom_data:
+        if len(collected) >= limit: break
+        src = (d.get("src") or "").strip()
+        if not src: continue
+        w, h = int(d.get("w") or 0), int(d.get("h") or 0)
+        if not valid(w, h): continue
 
-        for r in gql_ads:
-            if len(collected) >= limit: break
-            src = (r.get("src") or "").strip()
-            if not src: continue
+        # GraphQL 카피 우선, 없으면 DOM 카피 사용
+        gql = gql_map.get(src, {})
+        advertiser = gql.get("advertiser") or d.get("advertiser") or ""
+        headline   = gql.get("headline")   or d.get("headline")   or ""
+        body       = gql.get("body")       or d.get("body")       or ""
+        cta        = gql.get("cta")        or d.get("cta")        or ""
+        start_date = gql.get("start_date") or ""
+        end_date   = gql.get("end_date")   or ""
+        platforms  = gql.get("platforms")  or ""
 
-            # DOM에서 실제 크기 보완
-            dom = dom_url_map.get(src, {})
-            w = dom.get("w", 0) or 0
-            h = dom.get("h", 0) or 0
-
-            fp_key = (src, r.get("type","image"))
-            if fp_key in seen: continue
-            seen.add(fp_key)
-
-            collected.append({
-                "id":         str(uuid.uuid4()),
-                "keyword":    keyword,
-                "country":    country,
-                "asset_type": r.get("type", "image"),
-                "image_url":  src,
-                "source_url": search_url,
-                "caption":    "",
-                "advertiser": r.get("advertiser", ""),
-                "headline":   r.get("headline", ""),
-                "body":       r.get("body", ""),
-                "cta":        r.get("cta", ""),
-                "start_date": r.get("start_date", ""),
-                "end_date":   r.get("end_date", ""),
-                "platforms":  r.get("platforms", ""),
-                "width":      w,
-                "height":     h,
-                "created_at": now,
-                "starred":    False,
-                "ai":         None,
-            })
-
-    # ── 2차: GraphQL 실패 시 DOM fallback ──
-    if not collected:
-        for d in dom_imgs:
-            if len(collected) >= limit: break
-            src = (d.get("src") or "").strip()
-            w, h = int(d.get("w") or 0), int(d.get("h") or 0)
-            if not src or not valid(w, h): continue
-            fp_key = (src, "image")
-            if fp_key in seen: continue
-            seen.add(fp_key)
-            collected.append({
-                "id":         str(uuid.uuid4()),
-                "keyword":    keyword,
-                "country":    country,
-                "asset_type": "image",
-                "image_url":  src,
-                "source_url": search_url,
-                "caption":    "",
-                "advertiser": "",
-                "headline":   "",
-                "body":       "",
-                "cta":        "",
-                "start_date": "",
-                "end_date":   "",
-                "platforms":  "",
-                "width":      w,
-                "height":     h,
-                "created_at": now,
-                "starred":    False,
-                "ai":         None,
-            })
+        asset = {
+            "id":         str(uuid.uuid4()),
+            "keyword":    keyword,
+            "country":    country,
+            "asset_type": d.get("type", "image"),
+            "image_url":  src,
+            "source_url": search_url,
+            "caption":    "",
+            "advertiser": advertiser,
+            "headline":   headline,
+            "body":       body,
+            "cta":        cta,
+            "start_date": start_date,
+            "end_date":   end_date,
+            "platforms":  platforms,
+            "width":      w,
+            "height":     h,
+            "created_at": now,
+            "starred":    False,
+            "ai":         None,
+        }
+        fp_key = make_fp(asset)
+        if fp_key in seen: continue
+        seen.add(fp_key)
+        collected.append(asset)
 
     return collected
-
 
 
 
