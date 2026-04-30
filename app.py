@@ -196,7 +196,7 @@ a{{color:var(--ac)!important;}}
 
 
 # ============================================================
-# 스크래퍼 — 모달/요소 스크린샷 기반 이미지 payload 확보
+# 스크래퍼 — 빠른 목록 수집 + 선택 소재만 스크린샷 확보
 # ============================================================
 def valid(w, h):
     if w < 180 or h < 180:
@@ -271,6 +271,11 @@ def _capture_modal_or_element_b64(page, img_index: int, asset_type: str = "image
     return "", "capture_failed"
 
 def scrape(keyword, country, scrolls, limit):
+    """
+    검색 단계에서는 빠르게 소재 후보만 수집합니다.
+    모달 클릭/스크린샷은 하지 않습니다.
+    선택 분석 버튼을 눌렀을 때 선택 소재만 다시 열어 캡처합니다.
+    """
     ensure_browser()
     search_url = (
         "https://www.facebook.com/ads/library/"
@@ -286,7 +291,7 @@ def scrape(keyword, country, scrolls, limit):
         ctx.route("**/*.{woff,woff2,ttf,otf,eot}", lambda r: r.abort())
         page = ctx.new_page()
         page.goto(search_url, wait_until="domcontentloaded", timeout=90000)
-        page.wait_for_timeout(4500)
+        page.wait_for_timeout(3500)
 
         def card_count():
             return page.evaluate("""() => {
@@ -307,9 +312,9 @@ def scrape(keyword, country, scrolls, limit):
         for _ in range(scrolls):
             page.mouse.wheel(0, 3200)
             waited = 0
-            while waited < 3500:
-                page.wait_for_timeout(400)
-                waited += 400
+            while waited < 2500:
+                page.wait_for_timeout(300)
+                waited += 300
                 cur = card_count()
                 if cur > prev:
                     prev = cur
@@ -347,49 +352,134 @@ def scrape(keyword, country, scrolls, limit):
             return out;
         }""")
 
-        seen, collected, now = set(), [], time.strftime("%Y-%m-%d %H:%M:%S")
-        for r in raw:
-            if len(collected) >= limit:
-                break
-            src = (r.get("src") or "").strip()
-            w, h = int(r.get("w") or 0), int(r.get("h") or 0)
-            if not src or not valid(w, h):
+        ctx.close()
+        browser.close()
+
+    seen, collected, now = set(), [], time.strftime("%Y-%m-%d %H:%M:%S")
+    for r in raw:
+        if len(collected) >= limit:
+            break
+        src = (r.get("src") or "").strip()
+        w, h = int(r.get("w") or 0), int(r.get("h") or 0)
+        if not src or not valid(w, h):
+            continue
+
+        asset_type = r.get("type", "image")
+        asset = {
+            "id":             str(uuid.uuid4()),
+            "keyword":        keyword,
+            "country":        country,
+            "asset_type":     asset_type,
+            "image_url":      src,
+            "source_url":     search_url,
+            "caption":        (r.get("alt") or "").strip(),
+            "width":          w,
+            "height":         h,
+            "created_at":     now,
+            "starred":        False,
+            "ai":             None,
+            "img_b64":        "",
+            "capture_source": "not_captured",
+        }
+        fp = make_fp(asset)
+        if fp in seen:
+            continue
+        seen.add(fp)
+        collected.append(asset)
+
+    return collected
+
+
+def _url_key(url: str) -> str:
+    p = urlparse((url or "").strip())
+    return f"{p.netloc}{p.path}"
+
+
+def capture_screenshots_for_items(items, scrolls=8):
+    if not items:
+        return items
+
+    ensure_browser()
+    groups = {}
+    for item in items:
+        if item.get("img_b64"):
+            continue
+        groups.setdefault(item.get("source_url", ""), []).append(item)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=[
+            "--no-sandbox", "--disable-dev-shm-usage", "--disable-extensions",
+            "--disable-plugins", "--disable-background-networking",
+            "--no-first-run", "--disable-default-apps",
+        ])
+        ctx = browser.new_context(viewport={"width": 1440, "height": 2000})
+        ctx.route("**/*.{woff,woff2,ttf,otf,eot}", lambda r: r.abort())
+
+        for source_url, group_items in groups.items():
+            if not source_url:
+                for item in group_items:
+                    item["capture_source"] = "missing_source_url"
                 continue
 
-            asset_type = r.get("type", "image")
-            img_b64, capture_source = _capture_modal_or_element_b64(
-                page,
-                int(r.get("idx") or 0),
-                "image" if asset_type == "image" else "video_poster",
-            )
+            page = ctx.new_page()
+            try:
+                page.goto(source_url, wait_until="domcontentloaded", timeout=90000)
+                page.wait_for_timeout(3500)
+                target_keys = {_url_key(item.get("image_url")) for item in group_items}
+                matched = {}
 
-            asset = {
-                "id":             str(uuid.uuid4()),
-                "keyword":        keyword,
-                "country":        country,
-                "asset_type":     asset_type,
-                "image_url":      src,
-                "source_url":     search_url,
-                "caption":        (r.get("alt") or "").strip(),
-                "width":          w,
-                "height":         h,
-                "created_at":     now,
-                "starred":        False,
-                "ai":             None,
-                "img_b64":        img_b64,
-                "capture_source": capture_source,
-            }
-            fp = make_fp(asset)
-            if fp in seen:
-                continue
-            seen.add(fp)
-            collected.append(asset)
+                for _ in range(max(3, int(scrolls))):
+                    raw = page.evaluate("""() => {
+                        const out = [];
+                        Array.from(document.querySelectorAll('img')).forEach((img, idx) => {
+                            const src = img.currentSrc || img.src || '';
+                            if (!src || src.startsWith('data:')) return;
+                            out.push({type:'image', src, idx});
+                        });
+                        Array.from(document.querySelectorAll('video')).forEach((v, idx) => {
+                            const poster = v.poster || '';
+                            if (!poster) return;
+                            out.push({type:'video_poster', src:poster, idx});
+                        });
+                        return out;
+                    }""")
+                    for r in raw:
+                        k = _url_key(r.get("src"))
+                        if k in target_keys and k not in matched:
+                            matched[k] = r
+                    if len(matched) >= len(target_keys):
+                        break
+                    page.mouse.wheel(0, 3200)
+                    page.wait_for_timeout(700)
+
+                for item in group_items:
+                    k = _url_key(item.get("image_url"))
+                    r = matched.get(k)
+                    if not r:
+                        item["capture_source"] = "selected_asset_not_found"
+                        continue
+                    asset_type = r.get("type", "image")
+                    img_b64, capture_source = _capture_modal_or_element_b64(
+                        page,
+                        int(r.get("idx") or 0),
+                        "image" if asset_type == "image" else "video_poster",
+                    )
+                    item["img_b64"] = img_b64
+                    item["capture_source"] = capture_source if img_b64 else "capture_failed"
+            except Exception as ex:
+                for item in group_items:
+                    if not item.get("img_b64"):
+                        item["capture_source"] = f"capture_error: {str(ex)[:80]}"
+            finally:
+                try:
+                    page.close()
+                except Exception:
+                    pass
 
         ctx.close()
         browser.close()
 
-    return collected
-
+    return items
 
 # ============================================================
 # AI 분석
@@ -824,7 +914,7 @@ def to_pptx(items: list, summary: dict | None = None) -> bytes:
 # ============================================================
 st.markdown("""
 <div class="hdr">
-  <div class="hdr-row"><div class="logo">AD<b>INTEL</b></div><div class="ver">v3.2</div></div>
+  <div class="hdr-row"><div class="logo">AD<b>INTEL</b></div><div class="ver">v3.3</div></div>
   <div class="sub">META AD LIBRARY INTELLIGENCE BOARD</div>
 </div>""", unsafe_allow_html=True)
 
@@ -906,7 +996,7 @@ with st.sidebar:
 if ai_on and API_KEY:
     st.markdown("""<div class="banner">
         <div class="dot dot-on"></div>
-        <span class="banner-txt">AI 분석 <b>ON</b> &nbsp;—&nbsp; 소재 선택 후 일괄 분석 &nbsp;·&nbsp; Claude Haiku (병렬 처리)</span>
+        <span class="banner-txt">AI 분석 <b>ON</b> &nbsp;—&nbsp; 검색은 빠르게, 선택 소재만 캡처 분석 &nbsp;·&nbsp; Claude Vision</span>
     </div>""", unsafe_allow_html=True)
 elif ai_on and not API_KEY:
     st.markdown("""<div class="banner banner-w">
@@ -1069,12 +1159,13 @@ if ai_on and API_KEY and shown:
     with btn_c1:
         if sel_unanalyzed:
             if st.button(f"선택 분석 ({len(sel_unanalyzed)})", use_container_width=True):
-                pb = st.progress(0, text="분석 중...")
-                # analyze_parallel이 items 딕셔너리를 직접 수정하므로
-                # st.session_state.assets의 동일 객체가 업데이트됨
-                analyze_parallel(sel_unanalyzed, max_workers=6)
-                done = sum(1 for it in sel_unanalyzed if it.get("ai"))
-                pb.progress(1.0, text=f"완료! {done}개 분석")
+                pb = st.progress(0, text="선택 소재 캡처 중... (검색 단계에서는 캡처하지 않음)")
+                capture_screenshots_for_items(sel_unanalyzed, scrolls=scrolls)
+                captured = sum(1 for it in sel_unanalyzed if it.get("img_b64"))
+                pb.progress(0.35, text=f"캡처 완료 {captured}/{len(sel_unanalyzed)}개 · Claude 분석 중...")
+                analyze_parallel(sel_unanalyzed, max_workers=3)
+                done = sum(1 for it in sel_unanalyzed if it.get("ai") and not it.get("ai", {}).get("_error"))
+                pb.progress(1.0, text=f"완료! 이미지 기반 분석 {done}개")
                 pb.empty()
                 st.rerun()
     with btn_c2:
@@ -1194,7 +1285,7 @@ th   = "DARK" if D else "LIGHT"
 ai_s = "AI ON · Haiku" if (ai_on and API_KEY) else "AI OFF"
 st.markdown(
     f'<div style="border-top:2px solid var(--bd);padding-top:14px;display:flex;justify-content:space-between;">'
-    f'<span style="font-family:Pretendard,sans-serif;font-size:10px;color:var(--mu)">ADINTEL v3.2 · {th} · {ai_s}</span>'
+    f'<span style="font-family:Pretendard,sans-serif;font-size:10px;color:var(--mu)">ADINTEL v3.3 · {th} · {ai_s}</span>'
     f'<span style="font-family:Pretendard,sans-serif;font-size:10px;color:var(--mu)">{time.strftime("%Y-%m-%d")}</span>'
     f'</div>',
     unsafe_allow_html=True)
