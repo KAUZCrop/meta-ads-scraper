@@ -1,5 +1,5 @@
 # ============================================================
-# AD INTEL v3.2 — Meta Ad Library Intelligence Board
+# AD INTEL v3.3 — Meta Ad Library Intelligence Board
 # ============================================================
 import sys, asyncio, subprocess, time, uuid, io, json, requests, base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -656,6 +656,40 @@ def _normalize_ai_result(data: dict) -> dict:
     return data
 
 
+def _ocr_has_word(ocr_data, word: str) -> bool:
+    hay = " ".join(
+        str(x)
+        for k in ["texts", "brand_candidates", "product_candidates", "price_texts", "cta_texts"]
+        for x in (ocr_data or {}).get(k, [])
+    ).lower()
+    return word.lower() in hay
+
+
+def _sanitize_no_object_inference(value, ocr_data):
+    """OCR에 없는 동물/캐릭터 일반화 표현을 결과에서 강제 제거."""
+    banned_map = {
+        "곰모양": "브라운 컬러의 둥근 형태 비주얼",
+        "곰 모양": "브라운 컬러의 둥근 형태 비주얼",
+        "곰 캐릭터": "브라운 컬러의 둥근 형태 비주얼",
+        "곰": "브라운 컬러의 둥근 형태",
+        "동물 캐릭터": "제품/패키지 형태 비주얼",
+        "동물": "제품/패키지 형태",
+        "토끼": "형태 비주얼",
+        "강아지": "형태 비주얼",
+        "고양이": "형태 비주얼",
+    }
+    if isinstance(value, dict):
+        return {k: _sanitize_no_object_inference(v, ocr_data) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_no_object_inference(v, ocr_data) for v in value]
+    if isinstance(value, str):
+        out = value
+        for banned, repl in banned_map.items():
+            if banned in out and not _ocr_has_word(ocr_data, banned):
+                out = out.replace(banned, repl)
+        return out
+    return value
+
 
 def _extract_ocr_with_claude(img_b64: str) -> dict:
     """Claude Vision을 OCR 전용으로 1차 호출. 광고 해석 없이 실제 문구만 추출."""
@@ -751,8 +785,11 @@ def analyze(item):
 - 반드시 이미지에서 실제로 보이는 요소를 먼저 객관적으로 추출하세요.
 - 이미지에 없는 정보는 추정하지 말고 "확인 불가"라고 작성하세요.
 - OCR 결과에 있는 브랜드명/제품명/가격/CTA를 최우선 근거로 사용하세요.
-- 캐릭터/동물/사물의 종류를 임의로 일반화하지 마세요. 예: 곰, 토끼, 강아지, 캐릭터 이름 등은 이미지 텍스트에 명시되어 있지 않으면 쓰지 마세요.
-- 갈색 둥근 형태처럼 보이면 "갈색 둥근 형태의 제품/소품"처럼 형태 그대로만 쓰세요.
+- 캐릭터/동물/사물의 종류를 임의로 일반화하지 마세요.
+- 금지어: "곰", "동물", "토끼", "강아지", "고양이", "캐릭터 동물", "곰모양". OCR 텍스트에 해당 단어가 실제로 보이지 않으면 절대 쓰지 마세요.
+- 형태가 동물처럼 보여도 "동물"이라고 부르지 말고, "브라운 컬러의 둥근 제품 연출", "브라운 톤 제품/패키지 비주얼"처럼 색상/형태/배치만 쓰세요.
+- 브랜드/제품 텍스트가 보이면 형태 추정보다 제품명 텍스트를 우선하세요.
+- 갈색 둥근 형태처럼 보이면 "브라운 컬러의 둥근 형태 비주얼"처럼 형태 그대로만 쓰세요.
 - 제품명 또는 OCR에 특정 명칭이 보이면 그 명칭을 그대로 사용하세요.
 - "귀여운", "감성적", "프리미엄" 같은 표현은 이미지 근거가 있을 때만 사용하세요.
 - 모든 분석은 visual_facts에 적은 요소를 근거로 해야 합니다.
@@ -774,7 +811,7 @@ def analyze(item):
 
 분석 제한 규칙:
 - visible_text는 위 OCR 결과와 이미지에서 실제 확인되는 문구만 사용하세요.
-- objects에는 동물명/캐릭터명을 추정해서 쓰지 말고, 실제 보이는 형태만 기술하세요.
+- objects에는 동물명/캐릭터명/사물명을 추정해서 쓰지 말고, 색상·형태·위치만 기술하세요. 예: "브라운 컬러의 둥근 형태 비주얼", "노란색 원형 쿠션 제품", "하단 제품 컷 3개"
 - OCR에 제품명이 있으면 objects와 message에서 해당 제품명을 우선 사용하세요.
 - OCR과 이미지가 충돌하면 OCR 텍스트를 우선하되, 불확실하면 "확인 불가"라고 쓰세요.
 
@@ -847,6 +884,7 @@ def analyze(item):
         if parse_error:
             return {"_error": parse_error}
         normalized = _normalize_ai_result(parsed)
+        normalized = _sanitize_no_object_inference(normalized, ocr_data)
         normalized["ocr"] = ocr_data
         if isinstance(normalized.get("visual_facts"), dict):
             normalized["visual_facts"].setdefault("ocr_text", ocr_data.get("texts", []))
