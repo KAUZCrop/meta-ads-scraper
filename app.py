@@ -635,18 +635,87 @@ def analyze(item):
         return None
 
 
-def analyze_parallel(items, max_workers=6):
+def analyze_parallel(items, max_workers=3):
+    """
+    병렬 분석 - 이미지 다운로드와 API 호출 동시 진행
+    실패 시 재시도 1회 + 텍스트 fallback 보장
+    """
     if not API_KEY: return items
     id_map = {item["id"]: item for item in items}
+
     def task(item):
-        return item["id"], analyze(item)
+        # 1차 시도 (이미지 포함)
+        result = analyze(item)
+        if result:
+            return item["id"], result
+        # 2차 시도 - 잠깐 대기 후 재시도
+        time.sleep(1.5)
+        result = analyze(item)
+        if result:
+            return item["id"], result
+        # 3차 - 이미지 없이 키워드+메타정보만으로 강제 분석
+        result = analyze_text_only(item)
+        return item["id"], result
+
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(task, item): item["id"] for item in items if not item.get("ai")}
+        futures = {
+            ex.submit(task, item): item["id"]
+            for item in items if not item.get("ai")
+        }
         for future in as_completed(futures):
-            aid, result = future.result()
-            if result and aid in id_map:
-                id_map[aid]["ai"] = result
+            try:
+                aid, result = future.result(timeout=60)
+                if result and aid in id_map:
+                    id_map[aid]["ai"] = result
+            except Exception:
+                pass
     return items
+
+
+def analyze_text_only(item):
+    """이미지 없이 키워드·메타정보만으로 분석 (최후 fallback)"""
+    if not API_KEY: return None
+    try:
+        parts = [f"검색 키워드: {item['keyword']}"]
+        if item.get("advertiser"): parts.append(f"광고주: {item['advertiser']}")
+        if item.get("headline"):   parts.append(f"헤드라인: {item['headline']}")
+        if item.get("body"):       parts.append(f"본문: {item['body']}")
+        if item.get("cta"):        parts.append(f"CTA: {item['cta']}")
+        if item.get("platforms"):  parts.append(f"플랫폼: {item['platforms']}")
+
+        prompt = (
+            "광고 전략 전문가입니다. 아래 정보로 광고 소재를 분석해주세요.\n\n"
+            + "\n".join(parts) +
+            "\n\n이미지를 직접 볼 수 없으니 수집된 텍스트 정보 기반으로 최대한 분석해주세요.\n"
+            "아래 JSON만 반환 (마크다운·백틱 없이):\n"
+            '{"copy_analysis":{"visible_text":"수집된 카피 요약","hook":"추정 후크",'
+            '"headline":"헤드라인","cta":"CTA","appeal":"소구포인트 유형+근거"},'
+            '"tone_manner":{"mood":"추정 분위기","color_tone":"알 수 없음",'
+            '"visual_style":"알 수 없음","typography":"알 수 없음","target_feel":"추정 감정"},'
+            '"insight":{"target":"타겟 추정","message":"핵심 메시지",'
+            '"strategy":"전략 추정","strength":"강점","weakness":"약점",'
+            '"tags":["태그1","태그2","태그3"]}}'
+        )
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model":      "claude-haiku-4-5-20251001",
+                "max_tokens": 700,
+                "messages":   [{"role": "user", "content": prompt}],
+            },
+            timeout=20,
+        )
+        if resp.status_code != 200: return None
+        txt = resp.json()["content"][0]["text"].strip()
+        s, e = txt.find("{"), txt.rfind("}") + 1
+        return json.loads(txt[s:e]) if s != -1 and e > 0 else None
+    except Exception:
+        return None
 
 def summarize_insights(analyzed_items):
     if not API_KEY or not analyzed_items: return None
@@ -1219,13 +1288,33 @@ if ai_on and API_KEY and shown:
     with btn_c1:
         if sel_unanalyzed:
             if st.button(f"선택 분석 ({len(sel_unanalyzed)})", use_container_width=True):
-                pb = st.progress(0, text="병렬 분석 중...")
-                result_items = analyze_parallel(sel_unanalyzed, max_workers=6)
+                pb = st.progress(0, text=f"분석 중... 0 / {len(sel_unanalyzed)}")
                 id_map = {a["id"]: a for a in st.session_state.assets}
                 done = 0
-                for it in result_items:
-                    if it.get("ai") and it["id"] in id_map:
-                        id_map[it["id"]]["ai"] = it["ai"]; done += 1
+
+                def do_one(item):
+                    result = analyze(item)
+                    if result: return item["id"], result
+                    time.sleep(1)
+                    result = analyze(item)
+                    if result: return item["id"], result
+                    return item["id"], analyze_text_only(item)
+
+                with ThreadPoolExecutor(max_workers=3) as ex:
+                    futures = {ex.submit(do_one, item): item for item in sel_unanalyzed}
+                    for future in as_completed(futures):
+                        try:
+                            aid, result = future.result(timeout=60)
+                            if result and aid in id_map:
+                                id_map[aid]["ai"] = result
+                            done += 1
+                            pb.progress(
+                                done / len(sel_unanalyzed),
+                                text=f"분석 중... {done} / {len(sel_unanalyzed)}"
+                            )
+                        except Exception:
+                            done += 1
+
                 pb.progress(1.0, text=f"완료! {done}개 분석")
                 pb.empty()
                 st.rerun()
