@@ -222,32 +222,199 @@ def scrape(keyword, country, scrolls, limit):
         "https://www.facebook.com/ads/library/"
         f"?active_status=all&ad_type=all&country={country}&q={quote(keyword)}"
     )
+
+    # ── GraphQL 응답에서 광고 데이터 추출 ──
+    def parse_graphql(data: dict) -> list[dict]:
+        """Meta Ad Library GraphQL 응답을 재귀 파싱해서 광고 단위로 변환"""
+        ads = []
+
+        def find_edges(obj):
+            if isinstance(obj, dict):
+                # search_results_connection 또는 edges 있으면 탐색
+                if "edges" in obj:
+                    for edge in obj["edges"]:
+                        node = edge.get("node", {})
+                        parse_node(node)
+                for v in obj.values():
+                    find_edges(v)
+            elif isinstance(obj, list):
+                for item in obj:
+                    find_edges(item)
+
+        def parse_node(node: dict):
+            if not isinstance(node, dict): return
+
+            # 광고주명
+            advertiser = (
+                node.get("page_name") or
+                node.get("advertiser_name") or
+                ""
+            )
+
+            # 집행 기간
+            start_ts = node.get("start_date") or node.get("ad_delivery_start_time")
+            end_ts   = node.get("end_date")   or node.get("ad_delivery_stop_time")
+            start_date = ""
+            end_date   = ""
+            if start_ts:
+                try:
+                    import datetime
+                    start_date = datetime.datetime.fromtimestamp(
+                        int(start_ts)).strftime("%Y-%m-%d")
+                except Exception:
+                    pass
+            if end_ts:
+                try:
+                    import datetime
+                    end_date = datetime.datetime.fromtimestamp(
+                        int(end_ts)).strftime("%Y-%m-%d")
+                except Exception:
+                    pass
+
+            # 집행 플랫폼
+            platforms = node.get("publisher_platforms") or \
+                        node.get("platforms") or []
+            platform_str = ", ".join(platforms) if isinstance(platforms, list) else ""
+
+            # 개별 광고(creative) 파싱
+            raw_ads = node.get("ads") or node.get("ad_creatives") or [node]
+            for ad in raw_ads:
+                if not isinstance(ad, dict): continue
+                parse_creative(ad, advertiser, start_date, end_date, platform_str)
+
+            # 중첩 노드 탐색
+            for v in node.values():
+                if isinstance(v, dict) and "edges" in v:
+                    find_edges(v)
+
+        def parse_creative(ad: dict, advertiser: str,
+                           start_date: str, end_date: str, platform_str: str):
+            # 카피
+            body = ""
+            body_obj = ad.get("body") or ad.get("ad_creative_bodies")
+            if isinstance(body_obj, dict):
+                body = body_obj.get("text", "")
+            elif isinstance(body_obj, list):
+                body = " ".join(str(b) for b in body_obj if b)
+            elif isinstance(body_obj, str):
+                body = body_obj
+
+            # snapshot 안에 카피가 있는 경우
+            snap = ad.get("snapshot") or {}
+            if not body and isinstance(snap, dict):
+                b = snap.get("body") or {}
+                if isinstance(b, dict):
+                    body = b.get("text", "")
+                elif isinstance(b, str):
+                    body = b
+
+            # 헤드라인
+            headline = (
+                ad.get("title") or
+                ad.get("ad_creative_link_titles") or
+                snap.get("title") or
+                ""
+            )
+            if isinstance(headline, list):
+                headline = " ".join(str(h) for h in headline if h)
+
+            # CTA
+            cta = (
+                ad.get("cta_text") or
+                ad.get("call_to_action_type") or
+                snap.get("cta_text") or
+                ""
+            )
+
+            base = {
+                "advertiser":  advertiser[:100],
+                "headline":    str(headline)[:120],
+                "body":        str(body)[:400],
+                "cta":         str(cta)[:40],
+                "start_date":  start_date,
+                "end_date":    end_date,
+                "platforms":   platform_str,
+            }
+
+            # 이미지 URL 수집
+            images = (
+                ad.get("images") or
+                snap.get("images") or
+                ad.get("ad_creative_images") or
+                []
+            )
+            for img in images:
+                if not isinstance(img, dict): continue
+                url = (img.get("original_image_url") or
+                       img.get("url") or
+                       img.get("resized_image_url") or "")
+                if url:
+                    ads.append({**base, "type": "image", "src": url, "w": 0, "h": 0})
+
+            # 비디오 썸네일 수집
+            videos = (
+                ad.get("videos") or
+                snap.get("videos") or
+                ad.get("ad_creative_videos") or
+                []
+            )
+            for vid in videos:
+                if not isinstance(vid, dict): continue
+                url = (vid.get("video_preview_image_url") or
+                       vid.get("thumbnail") or
+                       vid.get("preview_image_url") or "")
+                if url:
+                    ads.append({**base, "type": "video_poster", "src": url, "w": 0, "h": 0})
+
+        try:
+            find_edges(data)
+        except Exception:
+            pass
+        return ads
+
+    # ── Playwright + 네트워크 인터셉트 ──
+    gql_ads = []  # GraphQL에서 수집된 광고 데이터
+
+    def on_response(response):
+        try:
+            url = response.url
+            if "facebook.com/api/graphql" not in url:
+                return
+            if response.status != 200:
+                return
+            body = response.body()
+            # 여러 JSON 라인으로 올 수 있음 (multipart)
+            for line in body.decode("utf-8", errors="ignore").splitlines():
+                line = line.strip()
+                if not line or not line.startswith("{"):
+                    continue
+                try:
+                    data = json.loads(line)
+                    parsed = parse_graphql(data)
+                    gql_ads.extend(parsed)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=[
             "--no-sandbox", "--disable-dev-shm-usage", "--disable-extensions",
-            "--disable-plugins", "--disable-background-networking",
-            "--no-first-run", "--disable-default-apps",
+            "--disable-plugins", "--no-first-run", "--disable-default-apps",
         ])
         ctx = browser.new_context(viewport={"width": 1440, "height": 2000})
         ctx.route("**/*.{woff,woff2,ttf,otf,eot}", lambda r: r.abort())
+
         page = ctx.new_page()
+        page.on("response", on_response)  # 네트워크 인터셉트 등록
+
         page.goto(search_url, wait_until="domcontentloaded", timeout=90000)
         page.wait_for_timeout(4000)
 
         def card_count():
-            return page.evaluate("""() => {
-                const sels = [
-                    'div[class*="x8gbvx8"]',
-                    'div[data-visualcompletion="ignore-dynamic"]',
-                    'div._7jyr',
-                    'div[class*="xh8yej3"]'
-                ];
-                for (const s of sels) {
-                    const n = document.querySelectorAll(s).length;
-                    if (n > 0) return n;
-                }
-                return document.querySelectorAll('img[src*="fbcdn"]').length;
-            }""")
+            return page.evaluate(
+                "() => document.querySelectorAll('img[src*=\"fbcdn\"]').length"
+            )
 
         prev, stalls = 0, 0
         for _ in range(scrolls):
@@ -263,155 +430,110 @@ def scrape(keyword, country, scrolls, limit):
                 stalls += 1
                 if stalls >= 2: break
 
-        raw = page.evaluate("""() => {
+        # GraphQL로 못 잡은 경우를 위한 DOM fallback
+        dom_imgs = page.evaluate("""() => {
             const out = [];
-
-            function safeText(el) {
-                try { return (el.innerText || el.textContent || '').trim(); }
-                catch(e) { return ''; }
+            for (const img of document.querySelectorAll('img')) {
+                const src = img.currentSrc || img.src || '';
+                if (!src || src.startsWith('data:')) continue;
+                out.push({
+                    src,
+                    w: img.naturalWidth  || img.width  || 0,
+                    h: img.naturalHeight || img.height || 0,
+                });
             }
-
-            function collectImages(root, advertiser, headline, body, cta) {
-                try {
-                    for (const img of root.querySelectorAll('img')) {
-                        try {
-                            const src = img.currentSrc || img.src || '';
-                            if (!src || src.startsWith('data:')) continue;
-                            const w = img.naturalWidth  || img.width  || img.offsetWidth  || 0;
-                            const h = img.naturalHeight || img.height || img.offsetHeight || 0;
-                            out.push({ type:'image', src, w, h, advertiser, headline, body, cta });
-                        } catch(e) {}
-                    }
-                    for (const v of root.querySelectorAll('video')) {
-                        try {
-                            if (!v.poster) continue;
-                            const w = v.videoWidth  || v.clientWidth  || v.offsetWidth  || 0;
-                            const h = v.videoHeight || v.clientHeight || v.offsetHeight || 0;
-                            out.push({ type:'video_poster', src:v.poster, w, h, advertiser, headline, body, cta });
-                        } catch(e) {}
-                    }
-                } catch(e) {}
+            for (const v of document.querySelectorAll('video')) {
+                if (!v.poster) continue;
+                out.push({
+                    src: v.poster,
+                    w: v.videoWidth || v.clientWidth || 0,
+                    h: v.videoHeight || v.clientHeight || 0,
+                });
             }
-
-            // ── 카드 셀렉터 시도 ──
-            const CARD_SELS = [
-                'div[class*="_7jyr"]',
-                'div[class*="x1dr75xp"]',
-                'div[class*="xh8yej3"]',
-                'div[data-visualcompletion="ignore-dynamic"]',
-            ];
-
-            let cards = [];
-            for (const sel of CARD_SELS) {
-                try {
-                    const found = Array.from(document.querySelectorAll(sel));
-                    if (found.length > 2) { cards = found; break; }
-                } catch(e) {}
-            }
-
-            if (cards.length > 0) {
-                for (const card of cards) {
-                    try {
-                        let advertiser = '', headline = '', body = '', cta = '';
-
-                        // 광고주명
-                        for (const sel of [
-                            'a[href*="facebook.com"] strong',
-                            'a[role="link"] strong',
-                            'span[dir="auto"] strong',
-                            'h2 span', 'h3 span'
-                        ]) {
-                            try {
-                                const el = card.querySelector(sel);
-                                if (el) { advertiser = safeText(el); break; }
-                            } catch(e) {}
-                        }
-
-                        // 본문 카피
-                        const textParts = [];
-                        const textSels = [
-                            'div[data-ad-preview="message"]',
-                            'div[class*="xdj266r"]',
-                            'div[dir="auto"][class*="x1iorvi4"]',
-                            'div[dir="auto"][style*="white-space"]',
-                        ];
-                        for (const sel of textSels) {
-                            try {
-                                for (const el of card.querySelectorAll(sel)) {
-                                    const t = safeText(el);
-                                    if (t && t.length > 5 && !textParts.includes(t))
-                                        textParts.push(t);
-                                }
-                            } catch(e) {}
-                        }
-                        body = textParts.slice(0,3).join(' | ').substring(0,300);
-
-                        // 헤드라인
-                        for (const sel of [
-                            '[role="heading"]',
-                            'div[class*="xt0psk2"]',
-                            'h2[class*="x1heor9g"]',
-                        ]) {
-                            try {
-                                const el = card.querySelector(sel);
-                                if (el) { headline = safeText(el).substring(0,120); break; }
-                            } catch(e) {}
-                        }
-
-                        // CTA
-                        for (const sel of [
-                            'a[role="button"]',
-                            'div[role="button"]',
-                            'div[class*="x1i10hfl"][role="button"]',
-                        ]) {
-                            try {
-                                const el = card.querySelector(sel);
-                                if (el) { cta = safeText(el).substring(0,40); break; }
-                            } catch(e) {}
-                        }
-
-                        collectImages(card, advertiser, headline, body, cta);
-                    } catch(e) {}
-                }
-            }
-
-            // 카드 수집 결과가 없으면 전체 DOM fallback
-            if (out.length === 0) {
-                collectImages(document, '', '', '', '');
-            }
-
             return out;
         }""")
+
         ctx.close(); browser.close()
 
-    seen, collected, now = set(), [], time.strftime("%Y-%m-%d %H:%M:%S")
-    for r in raw:
-        if len(collected) >= limit: break
-        src = (r.get("src") or "").strip()
-        w, h = int(r.get("w") or 0), int(r.get("h") or 0)
-        if not src or not valid(w, h): continue
-        asset = {
-            "id":         str(uuid.uuid4()),
-            "keyword":    keyword,
-            "country":    country,
-            "asset_type": r.get("type", "image"),
-            "image_url":  src,
-            "source_url": search_url,
-            "caption":    (r.get("alt") or "").strip(),
-            "advertiser": (r.get("advertiser") or "").strip(),
-            "headline":   (r.get("headline") or "").strip(),
-            "body":       (r.get("body") or "").strip(),
-            "cta":        (r.get("cta") or "").strip(),
-            "width":      w,
-            "height":     h,
-            "created_at": now,
-            "starred":    False,
-            "ai":         None,
-        }
-        fp = make_fp(asset)
-        if fp in seen: continue
-        seen.add(fp); collected.append(asset)
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    seen, collected = set(), []
+
+    # ── 1차: GraphQL 데이터 사용 ──
+    if gql_ads:
+        # DOM 이미지 URL 집합 (크기 보정용)
+        dom_url_map = {d["src"]: d for d in dom_imgs}
+
+        for r in gql_ads:
+            if len(collected) >= limit: break
+            src = (r.get("src") or "").strip()
+            if not src: continue
+
+            # DOM에서 실제 크기 보완
+            dom = dom_url_map.get(src, {})
+            w = dom.get("w", 0) or 0
+            h = dom.get("h", 0) or 0
+
+            fp_key = (src, r.get("type","image"))
+            if fp_key in seen: continue
+            seen.add(fp_key)
+
+            collected.append({
+                "id":         str(uuid.uuid4()),
+                "keyword":    keyword,
+                "country":    country,
+                "asset_type": r.get("type", "image"),
+                "image_url":  src,
+                "source_url": search_url,
+                "caption":    "",
+                "advertiser": r.get("advertiser", ""),
+                "headline":   r.get("headline", ""),
+                "body":       r.get("body", ""),
+                "cta":        r.get("cta", ""),
+                "start_date": r.get("start_date", ""),
+                "end_date":   r.get("end_date", ""),
+                "platforms":  r.get("platforms", ""),
+                "width":      w,
+                "height":     h,
+                "created_at": now,
+                "starred":    False,
+                "ai":         None,
+            })
+
+    # ── 2차: GraphQL 실패 시 DOM fallback ──
+    if not collected:
+        for d in dom_imgs:
+            if len(collected) >= limit: break
+            src = (d.get("src") or "").strip()
+            w, h = int(d.get("w") or 0), int(d.get("h") or 0)
+            if not src or not valid(w, h): continue
+            fp_key = (src, "image")
+            if fp_key in seen: continue
+            seen.add(fp_key)
+            collected.append({
+                "id":         str(uuid.uuid4()),
+                "keyword":    keyword,
+                "country":    country,
+                "asset_type": "image",
+                "image_url":  src,
+                "source_url": search_url,
+                "caption":    "",
+                "advertiser": "",
+                "headline":   "",
+                "body":       "",
+                "cta":        "",
+                "start_date": "",
+                "end_date":   "",
+                "platforms":  "",
+                "width":      w,
+                "height":     h,
+                "created_at": now,
+                "starred":    False,
+                "ai":         None,
+            })
+
     return collected
+
+
 
 
 # ============================================================
