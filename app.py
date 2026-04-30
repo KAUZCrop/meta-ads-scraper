@@ -316,34 +316,106 @@ def scrape(keyword, country, scrolls, limit):
 # ============================================================
 # AI 분석
 # ============================================================
-def analyze(image_url, keyword):
+def fetch_images_b64(urls: list) -> dict:
+    """
+    Playwright로 이미지 일괄 base64 변환
+    Meta CDN은 브라우저 컨텍스트 없이는 막히므로 Playwright 사용
+    """
+    if not urls: return {}
+    ensure_browser()
+    result = {}
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=[
+                "--no-sandbox", "--disable-dev-shm-usage"
+            ])
+            ctx  = browser.new_context()
+            page = ctx.new_page()
+            # Meta 광고 라이브러리 페이지를 referrer로 설정
+            page.goto("https://www.facebook.com/ads/library/", 
+                      wait_until="domcontentloaded", timeout=30000)
+            
+            # 브라우저 fetch API로 이미지 일괄 다운로드
+            b64_map = page.evaluate("""async (urls) => {
+                const out = {};
+                for (const url of urls) {
+                    try {
+                        const r = await fetch(url, {credentials: 'include'});
+                        if (!r.ok) continue;
+                        const buf = await r.arrayBuffer();
+                        const bytes = new Uint8Array(buf);
+                        let bin = '';
+                        for (let i = 0; i < bytes.byteLength; i++) {
+                            bin += String.fromCharCode(bytes[i]);
+                        }
+                        out[url] = btoa(bin);
+                    } catch(e) {}
+                }
+                return out;
+            }""", urls)
+            
+            if isinstance(b64_map, dict):
+                result = b64_map
+            ctx.close(); browser.close()
+    except Exception:
+        pass
+    return result
+
+
+def analyze(item, b64: str = "") -> dict | None:
+    """
+    Claude Vision으로 광고 소재 분석
+    - 카피 분석: 이미지 안 텍스트 추출 + 소구포인트
+    - 톤앤매너: 색감, 분위기, 비주얼 스타일
+    - 인사이트: 타겟, 메시지, 강점/약점
+    """
     if not API_KEY: return None
     try:
-        prompt = (
-            "광고 전략 전문가로서 Meta 광고 소재를 분석해주세요.\n\n"
-            f"검색 키워드: {keyword}\n"
-            f"이미지 URL: {image_url}\n\n"
-            "이미지를 직접 볼 수 없어도 키워드와 URL 패턴으로 분석해주세요.\n"
-            "아래 JSON만 반환 (마크다운·백틱 없이 순수 JSON):\n"
-            '{"hook":"첫 시선을 잡는 요소 (1문장)",'
-            '"appeal":"소구포인트 유형 + 설명 (감성/이성/사회적증거/희소성/혜택 분류)",'
-            '"target":"추정 타겟 (연령·성별·관심사)",'
-            '"message":"핵심 메시지 (1문장)",'
-            '"tags":["태그1","태그2","태그3"]}'
+        prompt_text = (
+            "당신은 광고 전략 전문가이자 크리에이티브 디렉터입니다.\n"
+            "아래 Meta 광고 소재 이미지를 보고 세 가지를 분석해주세요.\n\n"
+            f"[검색 키워드] {item['keyword']}\n\n"
+            "반드시 아래 JSON 형식으로만 답하세요 (마크다운·백틱 없이 순수 JSON):\n"
+            '{"copy":{'
+            '"text":"이미지에 보이는 텍스트 전체 (그대로 옮겨쓰기, 없으면 빈 문자열)",'
+            '"hook":"첫 시선을 잡는 핵심 요소",'
+            '"appeal":"소구포인트 유형 — 감성/이성/사회적증거/희소성/혜택 중 선택 + 근거"},'
+            '"tone":{'
+            '"mood":"전체적인 분위기 (예: 고급스러운, 친근한, 역동적인)",'
+            '"color":"주요 색상과 색감이 주는 인상",'
+            '"style":"비주얼 스타일 (예: 제품중심, 라이프스타일, UGC, 인포그래픽)"},'
+            '"insight":{'
+            '"target":"추정 타겟 (연령·성별·관심사 구체적으로)",'
+            '"message":"핵심 메시지 한 줄",'
+            '"strength":"이 소재의 강점",'
+            '"weakness":"약점 또는 개선 제안",'
+            '"tags":["태그1","태그2","태그3"]}}'
         )
+
+        # 이미지 있으면 비전, 없으면 텍스트만
+        if b64:
+            content = [
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/jpeg", "data": b64
+                }},
+                {"type": "text", "text": prompt_text}
+            ]
+        else:
+            content = [{"type": "text", "text": prompt_text}]
+
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={
-                "x-api-key": API_KEY,
+                "x-api-key":         API_KEY,
                 "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
+                "content-type":      "application/json",
             },
             json={
                 "model":      "claude-haiku-4-5-20251001",
-                "max_tokens": 400,
-                "messages":   [{"role": "user", "content": prompt}],
+                "max_tokens": 800,
+                "messages":   [{"role": "user", "content": content}],
             },
-            timeout=25,
+            timeout=30,
         )
         if resp.status_code != 200: return None
         txt = resp.json()["content"][0]["text"].strip()
@@ -352,17 +424,32 @@ def analyze(image_url, keyword):
     except Exception:
         return None
 
-def analyze_parallel(items, max_workers=6):
+
+def analyze_parallel(items, max_workers=4):
+    """이미지 일괄 다운로드 후 병렬 분석"""
     if not API_KEY: return items
     id_map = {item["id"]: item for item in items}
+    targets = [item for item in items if not item.get("ai")]
+    if not targets: return items
+
+    # 1단계: Playwright로 이미지 일괄 다운로드
+    urls = [item["image_url"] for item in targets]
+    b64_map = fetch_images_b64(urls)
+
+    # 2단계: 병렬 분석
     def task(item):
-        return item["id"], analyze(item["image_url"], item["keyword"])
+        b64 = b64_map.get(item["image_url"], "")
+        return item["id"], analyze(item, b64)
+
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(task, item): item["id"] for item in items if not item.get("ai")}
+        futures = {ex.submit(task, item): item["id"] for item in targets}
         for future in as_completed(futures):
-            aid, result = future.result()
-            if result and aid in id_map:
-                id_map[aid]["ai"] = result
+            try:
+                aid, result = future.result(timeout=45)
+                if result and aid in id_map:
+                    id_map[aid]["ai"] = result
+            except Exception:
+                pass
     return items
 
 def summarize_insights(analyzed_items):
@@ -1008,17 +1095,45 @@ else:
 
             ai_data = item.get("ai")
             if ai_data:
-                tags_str = "".join(f'<span class="ai-tag">{t}</span>' for t in ai_data.get("tags", []))
+                copy    = ai_data.get("copy")    or {}
+                tone    = ai_data.get("tone")    or {}
+                insight = ai_data.get("insight") or {}
+                tags    = insight.get("tags")    or ai_data.get("tags") or []
+                tags_html = "".join(f'<span class="ai-tag">{t}</span>' for t in tags)
+
+                def r(lbl, val):
+                    if not val: return ""
+                    return (f'<div style="margin-bottom:5px">'
+                            f'<span style="font-size:10px;font-weight:700;color:var(--ac);'
+                            f'display:inline-block;min-width:64px">{lbl}</span>'
+                            f'<span style="font-size:11px;color:var(--tx2)">{val}</span></div>')
+
                 st.markdown(
                     '<div class="ai-wrap"><div class="ai-box">'
-                    '<div class="ai-head">APPEAL ANALYSIS</div>'
-                    '<div class="ai-body">'
-                    f'<b>후크</b>&nbsp;&nbsp;&nbsp;{ai_data.get("hook","—")}<br>'
-                    f'<b>소구</b>&nbsp;&nbsp;&nbsp;{ai_data.get("appeal","—")}<br>'
-                    f'<b>타겟</b>&nbsp;&nbsp;&nbsp;{ai_data.get("target","—")}<br>'
-                    f'<b>메시지</b>&nbsp;{ai_data.get("message","—")}<br>'
-                    f'<div style="margin-top:6px">{tags_str}</div>'
-                    '</div></div></div>',
+
+                    # 카피 분석
+                    '<div class="ai-head">📝 카피 분석</div>'
+                    + r("노출 카피", (copy.get("text") or "")[:100])
+                    + r("후크",     copy.get("hook",""))
+                    + r("소구",     copy.get("appeal",""))
+
+                    # 톤앤매너
+                    + '<div style="border-top:1px solid var(--ac2);margin:8px 0"></div>'
+                    '<div class="ai-head">🎨 톤앤매너</div>'
+                    + r("분위기",   tone.get("mood",""))
+                    + r("색감",     tone.get("color",""))
+                    + r("스타일",   tone.get("style",""))
+
+                    # 인사이트
+                    + '<div style="border-top:1px solid var(--ac2);margin:8px 0"></div>'
+                    '<div class="ai-head">💡 인사이트</div>'
+                    + r("타겟",     insight.get("target",""))
+                    + r("메시지",   insight.get("message",""))
+                    + (f'<div style="font-size:11px;color:var(--ok);margin-bottom:3px">▲ {insight.get("strength","")}</div>' if insight.get("strength") else "")
+                    + (f'<div style="font-size:11px;color:var(--er);margin-bottom:6px">▼ {insight.get("weakness","")}</div>' if insight.get("weakness") else "")
+                    + (f'<div style="margin-top:4px">{tags_html}</div>' if tags_html else "")
+
+                    + '</div></div>',
                     unsafe_allow_html=True)
 
             st.markdown('</div>', unsafe_allow_html=True)
