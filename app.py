@@ -168,7 +168,7 @@ html,body,[class*="css"]{{font-family:'Pretendard',sans-serif;background:var(--b
 .log .er{{color:var(--er);}}
 
 /* 버튼 */
-.stButton>button{{font-family:'Pretendard',monospace!important;font-size:11px!important;border-radius:8px!important;border:1.5px solid var(--bd2)!important;background:var(--bg)!important;color:var(--tx2)!important;height:34px!important;transition:.15s!important;letter-spacing:.3px!important;}}
+.stButton>button{{font-family:'Pretendard',sans-serif!important;font-size:11px!important;border-radius:8px!important;border:1.5px solid var(--bd2)!important;background:var(--bg)!important;color:var(--tx2)!important;height:32px!important;min-height:32px!important;transition:.15s!important;letter-spacing:0!important;white-space:nowrap!important;overflow:hidden!important;padding:0 4px!important;line-height:32px!important;}}
 .stButton>button:hover{{border-color:var(--ac)!important;color:var(--ac)!important;background:var(--ac2)!important;}}
 .stDownloadButton>button{{font-family:'Pretendard',monospace!important;font-size:11px!important;border-radius:8px!important;border:1.5px solid var(--bd2)!important;background:var(--bg)!important;color:var(--tx2)!important;}}
 
@@ -670,7 +670,7 @@ if ai_on and API_KEY and shown:
     with bar_c:
         st.markdown(
             f'<div class="sel-bar"><span class="sel-count">{len(sel)}</span>' +
-            '<span class="sel-bar-txt">선택됨  ·  SELECT 버튼으로 소재를 골라주세요</span></div>',
+            '<span class="sel-bar-txt">선택됨  ·  ○ 버튼으로 소재를 선택하세요</span></div>',
             unsafe_allow_html=True)
     with btn_c1:
         if sel_unanalyzed:
@@ -763,20 +763,20 @@ else:
             # 버튼 4개
             b1, b2, b3, b4 = st.columns(4)
             with b1:
-                sel_lbl = "DESELECT" if is_sel else "SELECT"
+                sel_lbl = "✓" if is_sel else "○"
                 if st.button(sel_lbl, key="sel_" + item["id"], use_container_width=True):
                     if is_sel: st.session_state.selected.discard(item["id"])
                     else:      st.session_state.selected.add(item["id"])
                     st.rerun()
             with b2:
-                sv_lbl = "UNSAVE" if item.get("starred") else "SAVE"
+                sv_lbl = "★" if item.get("starred") else "☆"
                 if st.button(sv_lbl, key="sv_" + item["id"], use_container_width=True):
                     toggle_star(item["id"]); st.rerun()
             with b3:
-                if st.button("HIDE", key="hd_" + item["id"], use_container_width=True):
+                if st.button("✕", key="hd_" + item["id"], use_container_width=True):
                     st.session_state.hidden.add(item["id"]); st.rerun()
             with b4:
-                st.link_button("LINK", item["source_url"], use_container_width=True)
+                st.link_button("↗", item["source_url"], use_container_width=True)
 
 
 # ============================================================
