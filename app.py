@@ -201,73 +201,116 @@ def valid(w, h):
     r = w / h if h else 0
     return 0.25 <= r <= 3.0
 
+def url_key(url: str) -> str:
+    """URL에서 쿼리·fragment 제거한 순수 path로 중복 판별"""
+    p = urlparse(url.strip())
+    # fbcdn URL은 path 앞부분(파일명 제외)이 같으면 같은 이미지
+    path = p.path.rsplit("/", 1)[-1].split("?")[0]
+    return f"{p.netloc}/{path}"
+
 def fp(item):
-    p = urlparse((item.get("image_url") or "").strip())
-    return (f"{p.netloc}{p.path}", item.get("asset_type",""),
-            (item.get("caption") or "").lower()[:80],
-            item.get("width",0), item.get("height",0))
+    """보드 병합용 fingerprint — URL key 기반"""
+    return url_key(item.get("image_url") or "")
 
 def scrape(keyword, country, scrolls, limit):
     ensure_browser()
     url = f"https://www.facebook.com/ads/library/?active_status=all&ad_type=all&country={country}&q={quote(keyword)}"
     with sync_playwright() as p:
-        br  = p.chromium.launch(headless=True, args=[
-            "--no-sandbox","--disable-dev-shm-usage","--disable-extensions",
-            "--disable-plugins","--disable-background-networking","--no-first-run"])
-        ctx = br.new_context(viewport={"width":1440,"height":2000})
-        ctx.route("**/*.{woff,woff2,ttf,otf,eot}", lambda r: r.abort())
-        pg  = ctx.new_page()
-        pg.goto(url, wait_until="domcontentloaded", timeout=90000)
-        pg.wait_for_timeout(4000)
+        br = p.chromium.launch(headless=True, args=[
+            "--no-sandbox", "--disable-dev-shm-usage", "--disable-extensions",
+            "--disable-plugins", "--disable-background-networking",
+            "--no-first-run", "--disable-images",  # 이미지 렌더링 생략 → 속도↑
+        ])
+        ctx = br.new_context(
+            viewport={"width": 1440, "height": 2000},
+            # 이미지 리소스는 차단하되 URL은 JS로 수집 가능
+        )
+        # 폰트·미디어·광고 트래킹 차단
+        def block(route):
+            if route.request.resource_type in ("image", "media", "font"):
+                route.abort()
+            else:
+                route.continue_()
+        ctx.route("**/*", block)
 
+        pg = ctx.new_page()
+        pg.goto(url, wait_until="domcontentloaded", timeout=90000)
+        pg.wait_for_timeout(2500)  # 4000 → 2500ms
+
+        # fbcdn 이미지 수 기준 — 항상 작동하는 셀렉터
         def cnt():
-            return pg.evaluate("""() => {
-                for (const s of ['div[class*="x8gbvx8"]','div._7jyr','div[class*="xh8yej3"]']) {
-                    const n = document.querySelectorAll(s).length; if (n>0) return n;
-                }
-                return document.querySelectorAll('img[src*="fbcdn"]').length;
-            }""")
+            return pg.evaluate(
+                "() => document.querySelectorAll('img[src*=\"fbcdn\"]').length"
+            )
 
         prev = stalls = 0
         for _ in range(scrolls):
-            pg.mouse.wheel(0, 3200)
+            pg.mouse.wheel(0, 3000)
             waited = 0
-            while waited < 3500:
-                pg.wait_for_timeout(400); waited += 400
+            while waited < 2800:          # 3500 → 2800ms
+                pg.wait_for_timeout(350)  # 400 → 350ms
+                waited += 350
                 cur = cnt()
-                if cur > prev: prev=cur; stalls=0; break
+                if cur > prev:
+                    prev = cur; stalls = 0; break
             else:
                 stalls += 1
                 if stalls >= 2: break
 
+        # JS에서 src 수집 (렌더링 없이 attribute만 읽음)
         raw = pg.evaluate("""() => {
-            const o=[];
+            const o = [];
             for (const i of document.querySelectorAll('img')) {
-                const s=i.currentSrc||i.src||'';
-                if(!s||s.startsWith('data:')) continue;
-                o.push({t:'image',s,w:i.naturalWidth||i.width||0,h:i.naturalHeight||i.height||0,a:i.alt||''});
+                const s = i.getAttribute('src') || i.getAttribute('data-src') || '';
+                if (!s || s.startsWith('data:')) continue;
+                o.push({
+                    t: 'image', s,
+                    w: i.naturalWidth  || parseInt(i.getAttribute('width'))  || 0,
+                    h: i.naturalHeight || parseInt(i.getAttribute('height')) || 0,
+                    a: i.alt || ''
+                });
             }
             for (const v of document.querySelectorAll('video')) {
-                if(!v.poster) continue;
-                o.push({t:'video_poster',s:v.poster,w:v.videoWidth||v.clientWidth||0,h:v.videoHeight||v.clientHeight||0,a:''});
+                if (!v.poster) continue;
+                o.push({
+                    t: 'video_poster', s: v.poster,
+                    w: v.videoWidth  || v.clientWidth  || 0,
+                    h: v.videoHeight || v.clientHeight || 0,
+                    a: ''
+                });
             }
             return o;
         }""")
         ctx.close(); br.close()
 
-    seen, out, now = set(), [], time.strftime("%Y-%m-%d %H:%M:%S")
+    # 중복 제거 — URL key 기반 (강력)
+    seen_url = set()
+    out, now = [], time.strftime("%Y-%m-%d %H:%M:%S")
+
     for r in raw:
         if len(out) >= limit: break
         s = (r.get("s") or "").strip()
-        w, h = int(r.get("w",0)), int(r.get("h",0))
+        w, h = int(r.get("w") or 0), int(r.get("h") or 0)
         if not s or not valid(w, h): continue
-        a = {"id":str(uuid.uuid4()),"keyword":keyword,"country":country,
-             "asset_type":r.get("t","image"),"image_url":s,"source_url":url,
-             "caption":(r.get("a") or "").strip(),"width":w,"height":h,
-             "created_at":now,"starred":False,"ai":None}
-        k = fp(a)
-        if k in seen: continue
-        seen.add(k); out.append(a)
+
+        uk = url_key(s)
+        if uk in seen_url: continue   # URL 기준 중복 제거
+        seen_url.add(uk)
+
+        out.append({
+            "id":         str(uuid.uuid4()),
+            "keyword":    keyword,
+            "country":    country,
+            "asset_type": r.get("t", "image"),
+            "image_url":  s,
+            "source_url": url,
+            "caption":    (r.get("a") or "").strip(),
+            "width":      w,
+            "height":     h,
+            "created_at": now,
+            "starred":    False,
+            "ai":         None,
+        })
     return out
 
 
@@ -528,7 +571,7 @@ st.markdown('<div class="srch">', unsafe_allow_html=True)
 st.markdown('<div class="srch-lbl">KEYWORD SEARCH</div>', unsafe_allow_html=True)
 c1, c2, c3 = st.columns([5,1,1])
 with c1:
-    kw = st.text_input("kw", placeholder="예: 캐리어, 스킨케어, 공기청정기",
+    kw = st.text_input("kw", placeholder="예: 무무키, 샤이샤이샤이, 스킨케어  (쉼표로 여러 키워드 동시 검색)",
         label_visibility="collapsed",
         on_change=lambda: st.session_state.update({"_enter":True}))
 with c2:
@@ -537,7 +580,7 @@ with c3:
     do_add = st.button("누적 검색", use_container_width=True)
 
 if st.session_state.pop("_enter", False): do_new = True
-st.caption("엔터 / 검색 = 새 검색   ·   누적 검색 = 기존 보드에 추가")
+st.caption("쉼표(,)로 여러 키워드 동시 입력 가능   ·   검색 = 보드 초기화 후 새로 수집   ·   누적 검색 = 기존 보드에 추가")
 st.markdown('</div>', unsafe_allow_html=True)
 
 
@@ -545,37 +588,51 @@ st.markdown('</div>', unsafe_allow_html=True)
 # 검색 실행
 # ============================================================
 if do_new or do_add:
-    q = (kw or "").strip()
-    if not q:
+    raw_input = (kw or "").strip()
+    if not raw_input:
         st.warning("검색어를 입력하세요.")
     else:
-        try:
-            if do_new:
-                st.session_state.assets  = []
-                st.session_state.hidden  = set()
-                st.session_state.history = []
+        # 쉼표로 분리 → 각 키워드 공백 제거 → 빈 문자열 제거
+        keywords = [k.strip() for k in raw_input.replace("，", ",").split(",") if k.strip()]
 
-            # 1. 스크래핑
-            with st.spinner(f"'{q}' 수집 중..."):
-                items = scrape(q, country, scrolls, max_n)
+        if do_new:
+            # 새 검색: 보드 초기화 후 시작
+            st.session_state.assets  = []
+            st.session_state.hidden  = set()
+            st.session_state.history = []
+            st.session_state.summary = None
+            st.session_state.selected = set()
 
-            # 3. 병합
-            merged, added = merge(st.session_state.assets, items)
-            st.session_state.assets = merged
-            if q not in st.session_state.history:
-                st.session_state.history.append(q)
+        total_added = 0
+        all_new_items = []
 
-            ai_done = sum(1 for a in items if a.get("ai"))
-            st.session_state.log.append({"t":time.strftime("%H:%M"),"kw":q,"n":added,"ok":True})
+        for q in keywords:
+            try:
+                with st.spinner(f"'{q}' 수집 중... ({keywords.index(q)+1}/{len(keywords)})"):
+                    items = scrape(q, country, scrolls, max_n)
 
-            msg = f"{added}개 수집 완료"
-            if ai_on and API_KEY: msg += f" · AI 분석 {ai_done}개"
-            (st.success(msg) if added > 0 else st.info("새 소재 없음"))
-            st.rerun()
+                merged, added = merge(st.session_state.assets, items)
+                st.session_state.assets = merged
+                total_added += added
+                all_new_items.extend(items)
 
-        except Exception as e:
-            st.session_state.log.append({"t":time.strftime("%H:%M"),"kw":q,"n":0,"ok":False})
-            st.error(f"오류: {e}")
+                if q not in st.session_state.history:
+                    st.session_state.history.append(q)
+
+                st.session_state.log.append({
+                    "t": time.strftime("%H:%M"), "kw": q, "n": added, "ok": True
+                })
+
+            except Exception as e:
+                st.session_state.log.append({
+                    "t": time.strftime("%H:%M"), "kw": q, "n": 0, "ok": False
+                })
+                st.error(f"'{q}' 오류: {e}")
+
+        kw_label = ", ".join(keywords)
+        msg = f"총 {total_added}개 수집 완료 ({len(keywords)}개 키워드)"
+        (st.success(msg) if total_added > 0 else st.info("새 소재 없음"))
+        st.rerun()
 
 
 # ============================================================
