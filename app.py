@@ -199,6 +199,8 @@ a{{color:var(--ac)!important;}}
 # 스크래퍼 (기존 원본)
 # ============================================================
 def valid(w, h):
+    # 크기 정보가 아예 없으면(0,0) 일단 통과 — URL 패턴으로 필터
+    if w == 0 and h == 0: return True
     if w < 180 or h < 180: return False
     r = w / h if h else 0
     return 0.25 <= r <= 3.0
@@ -264,7 +266,34 @@ def scrape(keyword, country, scrolls, limit):
         raw = page.evaluate("""() => {
             const out = [];
 
-            // ── Meta Ad Library 카드 셀렉터 (여러 버전 대응) ──
+            function safeText(el) {
+                try { return (el.innerText || el.textContent || '').trim(); }
+                catch(e) { return ''; }
+            }
+
+            function collectImages(root, advertiser, headline, body, cta) {
+                try {
+                    for (const img of root.querySelectorAll('img')) {
+                        try {
+                            const src = img.currentSrc || img.src || '';
+                            if (!src || src.startsWith('data:')) continue;
+                            const w = img.naturalWidth  || img.width  || img.offsetWidth  || 0;
+                            const h = img.naturalHeight || img.height || img.offsetHeight || 0;
+                            out.push({ type:'image', src, w, h, advertiser, headline, body, cta });
+                        } catch(e) {}
+                    }
+                    for (const v of root.querySelectorAll('video')) {
+                        try {
+                            if (!v.poster) continue;
+                            const w = v.videoWidth  || v.clientWidth  || v.offsetWidth  || 0;
+                            const h = v.videoHeight || v.clientHeight || v.offsetHeight || 0;
+                            out.push({ type:'video_poster', src:v.poster, w, h, advertiser, headline, body, cta });
+                        } catch(e) {}
+                    }
+                } catch(e) {}
+            }
+
+            // ── 카드 셀렉터 시도 ──
             const CARD_SELS = [
                 'div[class*="_7jyr"]',
                 'div[class*="x1dr75xp"]',
@@ -274,105 +303,83 @@ def scrape(keyword, country, scrolls, limit):
 
             let cards = [];
             for (const sel of CARD_SELS) {
-                const found = Array.from(document.querySelectorAll(sel));
-                if (found.length > 2) { cards = found; break; }
+                try {
+                    const found = Array.from(document.querySelectorAll(sel));
+                    if (found.length > 2) { cards = found; break; }
+                } catch(e) {}
             }
 
-            // 카드 단위로 수집 실패 시 이미지 fallback
-            if (cards.length === 0) {
-                for (const img of document.querySelectorAll('img')) {
-                    const src = img.currentSrc || img.src || '';
-                    if (!src || src.startsWith('data:')) continue;
-                    out.push({
-                        type: 'image', src,
-                        w: img.naturalWidth  || img.width  || 0,
-                        h: img.naturalHeight || img.height || 0,
-                        advertiser: '', headline: '', body: '', cta: ''
-                    });
-                }
-                for (const v of document.querySelectorAll('video')) {
-                    if (!v.poster) continue;
-                    out.push({
-                        type: 'video_poster', src: v.poster,
-                        w: v.videoWidth || v.clientWidth || 0,
-                        h: v.videoHeight || v.clientHeight || 0,
-                        advertiser: '', headline: '', body: '', cta: ''
-                    });
-                }
-                return out;
-            }
+            if (cards.length > 0) {
+                for (const card of cards) {
+                    try {
+                        let advertiser = '', headline = '', body = '', cta = '';
 
-            for (const card of cards) {
-                // ── 광고주명 ──
-                let advertiser = '';
-                const advEl = card.querySelector('a[href*="facebook.com"] strong')
-                    || card.querySelector('a[role="link"] strong')
-                    || card.querySelector('span[dir="auto"] strong')
-                    || card.querySelector('h2 span')
-                    || card.querySelector('h3 span');
-                if (advEl) advertiser = advEl.innerText.trim();
+                        // 광고주명
+                        for (const sel of [
+                            'a[href*="facebook.com"] strong',
+                            'a[role="link"] strong',
+                            'span[dir="auto"] strong',
+                            'h2 span', 'h3 span'
+                        ]) {
+                            try {
+                                const el = card.querySelector(sel);
+                                if (el) { advertiser = safeText(el); break; }
+                            } catch(e) {}
+                        }
 
-                // ── 광고 카피 (body) ──
-                let body = '';
-                // 여러 텍스트 컨테이너 시도
-                const textCandidates = card.querySelectorAll(
-                    'div[data-ad-preview="message"], ' +
-                    'div[class*="xdj266r"], ' +
-                    'div[class*="_4bl9"], ' +
-                    'div[dir="auto"][class*="x1iorvi4"], ' +
-                    'div[dir="auto"][style*="white-space"]'
-                );
-                const textParts = [];
-                for (const el of textCandidates) {
-                    const t = el.innerText.trim();
-                    if (t && t.length > 5 && !textParts.includes(t)) {
-                        textParts.push(t);
-                    }
-                }
-                body = textParts.slice(0, 3).join(' | ').substring(0, 300);
+                        // 본문 카피
+                        const textParts = [];
+                        const textSels = [
+                            'div[data-ad-preview="message"]',
+                            'div[class*="xdj266r"]',
+                            'div[dir="auto"][class*="x1iorvi4"]',
+                            'div[dir="auto"][style*="white-space"]',
+                        ];
+                        for (const sel of textSels) {
+                            try {
+                                for (const el of card.querySelectorAll(sel)) {
+                                    const t = safeText(el);
+                                    if (t && t.length > 5 && !textParts.includes(t))
+                                        textParts.push(t);
+                                }
+                            } catch(e) {}
+                        }
+                        body = textParts.slice(0,3).join(' | ').substring(0,300);
 
-                // ── 헤드라인 ──
-                let headline = '';
-                const hlEl = card.querySelector(
-                    'div[class*="_8m3n"] span, ' +
-                    'div[class*="xt0psk2"], ' +
-                    'h2[class*="x1heor9g"], ' +
-                    '[role="heading"]'
-                );
-                if (hlEl) headline = hlEl.innerText.trim().substring(0, 120);
+                        // 헤드라인
+                        for (const sel of [
+                            '[role="heading"]',
+                            'div[class*="xt0psk2"]',
+                            'h2[class*="x1heor9g"]',
+                        ]) {
+                            try {
+                                const el = card.querySelector(sel);
+                                if (el) { headline = safeText(el).substring(0,120); break; }
+                            } catch(e) {}
+                        }
 
-                // ── CTA 버튼 ──
-                let cta = '';
-                const ctaEl = card.querySelector(
-                    'div[class*="_6lz"] a, ' +
-                    'a[role="button"], ' +
-                    'div[class*="x1i10hfl"][role="button"]'
-                );
-                if (ctaEl) cta = ctaEl.innerText.trim().substring(0, 40);
+                        // CTA
+                        for (const sel of [
+                            'a[role="button"]',
+                            'div[role="button"]',
+                            'div[class*="x1i10hfl"][role="button"]',
+                        ]) {
+                            try {
+                                const el = card.querySelector(sel);
+                                if (el) { cta = safeText(el).substring(0,40); break; }
+                            } catch(e) {}
+                        }
 
-                // ── 이미지 ──
-                for (const img of card.querySelectorAll('img')) {
-                    const src = img.currentSrc || img.src || '';
-                    if (!src || src.startsWith('data:')) continue;
-                    out.push({
-                        type: 'image', src,
-                        w: img.naturalWidth  || img.width  || 0,
-                        h: img.naturalHeight || img.height || 0,
-                        advertiser, headline, body, cta
-                    });
-                }
-
-                // ── 비디오 썸네일 ──
-                for (const v of card.querySelectorAll('video')) {
-                    if (!v.poster) continue;
-                    out.push({
-                        type: 'video_poster', src: v.poster,
-                        w: v.videoWidth || v.clientWidth || 0,
-                        h: v.videoHeight || v.clientHeight || 0,
-                        advertiser, headline, body, cta
-                    });
+                        collectImages(card, advertiser, headline, body, cta);
+                    } catch(e) {}
                 }
             }
+
+            // 카드 수집 결과가 없으면 전체 DOM fallback
+            if (out.length === 0) {
+                collectImages(document, '', '', '', '');
+            }
+
             return out;
         }""")
         ctx.close(); browser.close()
