@@ -461,6 +461,235 @@ def to_csv(items):
     return buf.getvalue().encode("utf-8-sig")
 
 
+def fetch_image_bytes(url: str) -> bytes | None:
+    """이미지 URL → bytes. 직접 다운로드 실패 시 Playwright 스크린샷으로 fallback"""
+    # 1차: requests 직접 다운로드
+    try:
+        resp = requests.get(url, timeout=8, headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://www.facebook.com/",
+        })
+        if resp.status_code == 200 and len(resp.content) > 1000:
+            return resp.content
+    except Exception:
+        pass
+
+    # 2차: Playwright 스크린샷 fallback
+    try:
+        ensure_browser()
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            page = browser.new_page(viewport={"width": 800, "height": 800})
+            page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            page.wait_for_timeout(1500)
+            img_bytes = page.screenshot(type="jpeg", quality=80)
+            browser.close()
+            return img_bytes
+    except Exception:
+        return None
+
+
+def to_pptx(items: list, summary: dict | None = None) -> bytes:
+    """
+    선택된 소재 → PPT
+    슬라이드 구성:
+      1. 표지
+      2. 소재별 슬라이드 (이미지 + AI 분석)
+      3. 총합 인사이트 (summary 있을 때)
+    """
+    from pptx import Presentation
+    from pptx.util import Inches, Pt
+    from pptx.dml.color import RGBColor
+    from pptx.enum.text import PP_ALIGN
+    import tempfile
+
+    # 색상 팔레트
+    C_BG    = RGBColor(0xFF, 0xFF, 0xFF)
+    C_DARK  = RGBColor(0x11, 0x13, 0x18)
+    C_BLUE  = RGBColor(0x1A, 0x6D, 0xFF)
+    C_GRAY  = RGBColor(0x3A, 0x3F, 0x4A)
+    C_MUTED = RGBColor(0x8A, 0x90, 0x9E)
+    C_BG2   = RGBColor(0xF7, 0xF8, 0xFA)
+    C_GREEN = RGBColor(0x00, 0xA8, 0x6B)
+    C_BDBLUE= RGBColor(0xCC, 0xDD, 0xFF)
+
+    def add_text(slide, text, x, y, w, h, size=12, bold=False,
+                 color=None, align=PP_ALIGN.LEFT, wrap=True):
+        txBox = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
+        tf = txBox.text_frame
+        tf.word_wrap = wrap
+        p = tf.paragraphs[0]
+        p.alignment = align
+        run = p.add_run()
+        run.text = text
+        run.font.size = Pt(size)
+        run.font.bold = bold
+        run.font.color.rgb = color or C_DARK
+        return txBox
+
+    def add_rect(slide, x, y, w, h, fill_color, line_color=None):
+        from pptx.util import Inches
+        shape = slide.shapes.add_shape(
+            1,  # MSO_SHAPE_TYPE.RECTANGLE
+            Inches(x), Inches(y), Inches(w), Inches(h)
+        )
+        shape.fill.solid()
+        shape.fill.fore_color.rgb = fill_color
+        if line_color:
+            shape.line.color.rgb = line_color
+            shape.line.width = Pt(0.5)
+        else:
+            shape.line.fill.background()
+        return shape
+
+    prs = Presentation()
+    prs.slide_width  = Inches(13.33)
+    prs.slide_height = Inches(7.5)
+    blank = prs.slide_layouts[6]  # 완전 빈 레이아웃
+
+    # ── 1. 표지 슬라이드 ──────────────────────────────
+    slide = prs.slides.add_slide(blank)
+
+    # 배경
+    add_rect(slide, 0, 0, 13.33, 7.5, C_DARK)
+    # 파란 포인트 바
+    add_rect(slide, 0, 0, 0.08, 7.5, C_BLUE)
+
+    add_text(slide, "AD INTEL",        0.4, 1.8, 12, 1.2, size=44, bold=True,  color=C_BG)
+    add_text(slide, "META AD LIBRARY INTELLIGENCE REPORT",
+                                       0.4, 3.0, 12, 0.6, size=13, bold=False, color=C_BLUE)
+
+    kw_list = list(dict.fromkeys(a["keyword"] for a in items))
+    add_text(slide, "키워드: " + " · ".join(kw_list),
+                                       0.4, 3.8, 12, 0.5, size=12, color=C_MUTED)
+    add_text(slide, f"소재 {len(items)}개  ·  {time.strftime('%Y.%m.%d')}",
+                                       0.4, 4.3, 12, 0.5, size=12, color=C_MUTED)
+
+    # ── 2. 소재별 슬라이드 ────────────────────────────
+    for item in items:
+        slide = prs.slides.add_slide(blank)
+
+        # 배경
+        add_rect(slide, 0,    0, 13.33, 7.5, C_BG)
+        add_rect(slide, 0,    0, 13.33, 0.06, C_BLUE)   # 상단 파란 선
+        add_rect(slide, 4.8,  0, 0.01,  7.5, C_BDBLUE)  # 세로 구분선
+
+        # ── 왼쪽: 이미지 영역 ──
+        img_bytes = fetch_image_bytes(item["image_url"])
+        if img_bytes:
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                tmp.write(img_bytes)
+                tmp_path = tmp.name
+            try:
+                pic = slide.shapes.add_picture(tmp_path, Inches(0.3), Inches(0.4),
+                                               width=Inches(4.2))
+                # 이미지 높이 최대 6.5인치 제한
+                if pic.height > Inches(6.5):
+                    pic.height = Inches(6.5)
+                    pic.width  = Inches(4.2)
+            except Exception:
+                add_text(slide, "이미지 로드 실패", 0.3, 2.5, 4.2, 1, color=C_MUTED)
+            import os; os.unlink(tmp_path)
+        else:
+            add_rect(slide, 0.3, 0.4, 4.2, 6.5, C_BG2)
+            add_text(slide, "이미지 없음", 0.3, 3.2, 4.2, 0.8, align=PP_ALIGN.CENTER, color=C_MUTED)
+
+        # ── 오른쪽: 메타 + AI 분석 ──
+        rx = 5.1  # 오른쪽 시작 x
+        rw = 7.8  # 오른쪽 너비
+
+        # 키워드 배지
+        add_text(slide, item["keyword"].upper() + "  ·  " + item["country"],
+                 rx, 0.25, rw, 0.35, size=9, bold=True, color=C_BLUE)
+
+        # 타입 + 사이즈
+        badge = "IMAGE" if item["asset_type"] == "image" else "VIDEO"
+        add_text(slide, f"{badge}  {item['width']}×{item['height']}px  ·  {item['created_at'][11:16]}",
+                 rx, 0.6, rw, 0.35, size=9, color=C_MUTED)
+
+        ai = item.get("ai")
+        if ai:
+            # AI 분석 박스 배경
+            add_rect(slide, rx - 0.1, 1.05, rw + 0.2, 5.9, C_BG2)
+
+            add_text(slide, "APPEAL ANALYSIS",
+                     rx, 1.15, rw, 0.35, size=9, bold=True, color=C_BLUE)
+
+            fields_ai = [
+                ("후크",   ai.get("hook",    "—")),
+                ("소구",   ai.get("appeal",  "—")),
+                ("타겟",   ai.get("target",  "—")),
+                ("메시지", ai.get("message", "—")),
+            ]
+            y_pos = 1.6
+            for label, val in fields_ai:
+                add_text(slide, label, rx, y_pos, 0.9, 0.4, size=10, bold=True, color=C_GRAY)
+                add_text(slide, val,   rx + 0.9, y_pos, rw - 1.0, 0.5,
+                         size=10, color=C_DARK, wrap=True)
+                y_pos += 0.65
+
+            # 태그
+            tags = ai.get("tags", [])
+            if tags:
+                add_text(slide, "  ".join(f"#{t}" for t in tags),
+                         rx, y_pos + 0.15, rw, 0.45, size=10, color=C_BLUE)
+        else:
+            add_text(slide, "AI 분석 없음\n(소재 선택 후 [선택 분석] 실행)",
+                     rx, 2.5, rw, 1.0, size=11, color=C_MUTED)
+
+    # ── 3. 총합 인사이트 슬라이드 ─────────────────────
+    if summary:
+        slide = prs.slides.add_slide(blank)
+        add_rect(slide, 0, 0, 13.33, 7.5, C_DARK)
+        add_rect(slide, 0, 0, 0.08,  7.5, C_BLUE)
+
+        add_text(slide, "TOTAL INSIGHT",
+                 0.4, 0.3, 12, 0.6, size=22, bold=True, color=C_BG)
+        add_text(slide, "선택 소재 종합 분석",
+                 0.4, 0.9, 12, 0.4, size=12, color=C_BLUE)
+
+        # 2열 그리드
+        grid = [
+            ("DOMINANT APPEAL",    summary.get("dominant_appeal", "—")),
+            ("COMMON TARGET",      summary.get("common_target",   "—")),
+            ("KEY MESSAGE PATTERN",summary.get("key_message",     "—")),
+        ]
+        for i, (lbl, val) in enumerate(grid):
+            col = i % 2
+            row = i // 2
+            gx = 0.4 + col * 6.4
+            gy = 1.5 + row * 1.6
+            add_rect(slide, gx, gy, 6.0, 1.4,
+                     RGBColor(0x1A, 0x20, 0x30))
+            add_text(slide, lbl, gx + 0.15, gy + 0.1,  5.7, 0.3,
+                     size=8, bold=True, color=C_BLUE)
+            add_text(slide, val, gx + 0.15, gy + 0.45, 5.7, 0.85,
+                     size=10, color=C_BG, wrap=True)
+
+        # 전략 + 제안
+        sy = 4.6
+        for lbl, key in [("STRATEGY", "strategy"), ("RECOMMENDATIONS", "recommendations")]:
+            add_text(slide, lbl, 0.4, sy, 12, 0.3,
+                     size=8, bold=True, color=C_BLUE)
+            add_text(slide, summary.get(key, "—"), 0.4, sy + 0.3, 12.5, 0.7,
+                     size=10, color=C_BG, wrap=True)
+            sy += 1.2
+
+        # 태그
+        tags = summary.get("tags", [])
+        if tags:
+            add_text(slide, "  ".join(f"#{t}" for t in tags),
+                     0.4, 7.0, 12, 0.35, size=10, color=C_BLUE)
+
+    # 버퍼로 저장
+    buf = io.BytesIO()
+    prs.save(buf)
+    buf.seek(0)
+    return buf.read()
+
+
 # ============================================================
 # 헤더
 # ============================================================
@@ -698,7 +927,7 @@ if ai_on and API_KEY and shown:
     sel_unanalyzed = [a for a in sel_items if not a.get("ai")]
     analyzed_sel   = [a for a in sel_items if a.get("ai")]
 
-    bar_c, btn_c1, btn_c2 = st.columns([4, 1, 1])
+    bar_c, btn_c1, btn_c2, btn_c3 = st.columns([3, 1, 1, 1])
     with bar_c:
         st.markdown(
             f'<div class="sel-bar"><span class="sel-count">{len(sel)}</span>'
@@ -723,6 +952,19 @@ if ai_on and API_KEY and shown:
                 with st.spinner("종합 인사이트 생성 중..."):
                     st.session_state.summary = summarize_insights(analyzed_sel)
                 st.rerun()
+    with btn_c3:
+        if analyzed_sel:
+            if st.button(f"PPT 내보내기 ({len(analyzed_sel)})", use_container_width=True):
+                with st.spinner(f"PPT 생성 중... 이미지 {len(analyzed_sel)}개 수집 (잠시 기다려 주세요)"):
+                    pptx_bytes = to_pptx(analyzed_sel, st.session_state.get("summary"))
+                fname = f"adintel_{time.strftime('%Y%m%d_%H%M')}.pptx"
+                st.download_button(
+                    "다운로드",
+                    data=pptx_bytes,
+                    file_name=fname,
+                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    use_container_width=True,
+                )
 
 if not shown:
     st.markdown(
