@@ -534,6 +534,79 @@ def _anthropic_model() -> str:
     except Exception:
         return "claude-haiku-4-5-20251001"
 
+def _extract_json_block(text: str) -> str | None:
+    """Claude 응답에서 가장 바깥 JSON object만 추출"""
+    if not text:
+        return None
+    txt = text.strip().replace("```json", "").replace("```", "").strip()
+    s = txt.find("{")
+    e = txt.rfind("}") + 1
+    if s == -1 or e <= 0 or e <= s:
+        return None
+    return txt[s:e]
+
+
+def _repair_json_with_claude(raw_json: str) -> dict | None:
+    """JSON 파싱 실패 시 Claude에게 문법만 복구시킴"""
+    if not API_KEY or not raw_json:
+        return None
+    try:
+        repair_prompt = f"""
+아래 텍스트는 JSON 형식으로 작성된 광고 분석 결과입니다.
+내용은 바꾸지 말고 json.loads()로 파싱 가능한 순수 JSON으로만 고쳐서 반환하세요.
+
+규칙:
+- 마크다운/백틱/설명문 금지
+- 누락된 쉼표, 따옴표, 괄호만 수정
+- 문자열 내부의 큰따옴표는 작은따옴표로 바꾸거나 제거
+- 줄바꿈, 특수문자, >>, [SET] 등으로 JSON이 깨지지 않게 처리
+- 기존 key 구조와 값의 의미는 유지
+
+수정할 JSON:
+{raw_json}
+"""
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": _anthropic_model(),
+                "max_tokens": 1200,
+                "temperature": 0,
+                "messages": [{"role": "user", "content": repair_prompt}],
+            },
+            timeout=35,
+        )
+        if resp.status_code != 200:
+            return None
+        fixed_txt = resp.json()["content"][0]["text"].strip()
+        fixed_json = _extract_json_block(fixed_txt)
+        if not fixed_json:
+            return None
+        return json.loads(fixed_json)
+    except Exception:
+        return None
+
+
+def _parse_ai_json(txt: str) -> tuple[dict | None, str | None]:
+    """AI 응답 JSON 파싱. 실패하면 1회 자동 복구"""
+    raw_json = _extract_json_block(txt)
+    if not raw_json:
+        return None, f"Claude가 JSON이 아닌 응답을 반환했습니다. 응답: {txt[:180]}"
+    try:
+        return json.loads(raw_json), None
+    except json.JSONDecodeError as ex:
+        repaired = _repair_json_with_claude(raw_json)
+        if repaired is not None:
+            return repaired, None
+        return None, f"JSON 파싱 실패 및 자동 복구 실패: {ex}. 원문 일부: {raw_json[:220]}"
+    except Exception as ex:
+        return None, f"JSON 처리 실패: {ex}"
+
+
 def _safe_join(value, sep=", "):
     """list/dict/string 값을 UI에 안전하게 표시하기 위한 간단 변환"""
     if value is None:
@@ -604,6 +677,10 @@ def analyze(item):
 - "귀여운", "감성적", "프리미엄" 같은 표현은 이미지 근거가 있을 때만 사용하세요.
 - 모든 분석은 visual_facts에 적은 요소를 근거로 해야 합니다.
 - JSON 외 마크다운, 설명문, 백틱은 절대 출력하지 마세요.
+- 반드시 json.loads()로 파싱 가능한 순수 JSON만 반환하세요.
+- 문자열 안의 큰따옴표(")는 작은따옴표(')로 바꾸거나 제거하세요.
+- 이미지 문구에 [SET], >>, %, 원, /, 줄바꿈이 있어도 JSON 문자열이 깨지지 않게 작성하세요.
+- 배열 값에는 실제 문구를 문자열로만 넣고, 객체나 주석을 섞지 마세요.
 
 검색 키워드: {item['keyword']}
 캡처 방식: {item.get('capture_source', 'unknown')}
@@ -673,10 +750,10 @@ def analyze(item):
             return {"_error": f"API {resp.status_code}: {resp.text[:300]}"}
 
         txt = resp.json()["content"][0]["text"].strip()
-        s, e = txt.find("{"), txt.rfind("}") + 1
-        if s == -1 or e == 0:
-            return {"_error": f"Claude가 JSON이 아닌 응답을 반환했습니다. 캡처가 공백/비광고 영역일 가능성이 큽니다. 응답: {txt[:180]}"}
-        return _normalize_ai_result(json.loads(txt[s:e]))
+        parsed, parse_error = _parse_ai_json(txt)
+        if parse_error:
+            return {"_error": parse_error}
+        return _normalize_ai_result(parsed)
     except Exception as ex:
         return {"_error": str(ex)[:300]}
 
@@ -757,8 +834,8 @@ def summarize_insights(analyzed_items):
         )
         if resp.status_code != 200: return None
         txt = resp.json()["content"][0]["text"].strip()
-        s, e = txt.find("{"), txt.rfind("}") + 1
-        return json.loads(txt[s:e]) if s != -1 and e > 0 else None
+        parsed, _ = _parse_ai_json(txt)
+        return parsed
     except Exception:
         return None
 
