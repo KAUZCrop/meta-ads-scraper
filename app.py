@@ -1,5 +1,5 @@
 # ============================================================
-# AD INTEL v3.3 — Meta Ad Library Intelligence Board
+# AD INTEL v3.4 — Meta Ad Library Intelligence Board
 # ============================================================
 import sys, asyncio, subprocess, time, uuid, io, json, requests, base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -656,39 +656,44 @@ def _normalize_ai_result(data: dict) -> dict:
     return data
 
 
-def _ocr_has_word(ocr_data, word: str) -> bool:
-    hay = " ".join(
-        str(x)
-        for k in ["texts", "brand_candidates", "product_candidates", "price_texts", "cta_texts"]
-        for x in (ocr_data or {}).get(k, [])
-    ).lower()
-    return word.lower() in hay
+def _force_sanitize_text(text: str) -> str:
+    """동물/객체명 임의 추론 표현을 무조건 제거.
+    OCR이 잘못 읽어 금지어가 들어가도 최종 화면에는 남기지 않는다.
+    """
+    if not isinstance(text, str):
+        return text
+    replacements = [
+        ("곰모양", "브라운 컬러의 둥근 형태"),
+        ("곰 모양", "브라운 컬러의 둥근 형태"),
+        ("곰 캐릭터", "브라운 컬러의 둥근 형태 비주얼"),
+        ("곰", "브라운 컬러의 둥근 형태"),
+        ("동물 캐릭터", "형태 비주얼"),
+        ("캐릭터 동물", "형태 비주얼"),
+        ("동물", "형태 비주얼"),
+        ("토끼", "형태 비주얼"),
+        ("강아지", "형태 비주얼"),
+        ("고양이", "형태 비주얼"),
+    ]
+    out = text
+    for bad, repl in replacements:
+        out = out.replace(bad, repl)
+    return out
 
 
-def _sanitize_no_object_inference(value, ocr_data):
-    """OCR에 없는 동물/캐릭터 일반화 표현을 결과에서 강제 제거."""
-    banned_map = {
-        "곰모양": "브라운 컬러의 둥근 형태 비주얼",
-        "곰 모양": "브라운 컬러의 둥근 형태 비주얼",
-        "곰 캐릭터": "브라운 컬러의 둥근 형태 비주얼",
-        "곰": "브라운 컬러의 둥근 형태",
-        "동물 캐릭터": "제품/패키지 형태 비주얼",
-        "동물": "제품/패키지 형태",
-        "토끼": "형태 비주얼",
-        "강아지": "형태 비주얼",
-        "고양이": "형태 비주얼",
-    }
+def _sanitize_json_deep(value):
+    """OCR 결과와 최종 분석 결과 전체를 재귀적으로 보정."""
     if isinstance(value, dict):
-        return {k: _sanitize_no_object_inference(v, ocr_data) for k, v in value.items()}
+        return {k: _sanitize_json_deep(v) for k, v in value.items()}
     if isinstance(value, list):
-        return [_sanitize_no_object_inference(v, ocr_data) for v in value]
+        return [_sanitize_json_deep(v) for v in value]
     if isinstance(value, str):
-        out = value
-        for banned, repl in banned_map.items():
-            if banned in out and not _ocr_has_word(ocr_data, banned):
-                out = out.replace(banned, repl)
-        return out
+        return _force_sanitize_text(value)
     return value
+
+
+def _sanitize_no_object_inference(value, ocr_data=None):
+    """하위 호환용 래퍼. OCR 포함 여부와 무관하게 금지 표현 제거."""
+    return _sanitize_json_deep(value)
 
 
 def _extract_ocr_with_claude(img_b64: str) -> dict:
@@ -755,6 +760,7 @@ def _extract_ocr_with_claude(img_b64: str) -> dict:
             elif not isinstance(v, list):
                 parsed[k] = []
         parsed["raw"] = txt
+        parsed = _sanitize_json_deep(parsed)
         return parsed
     except Exception as ex:
         return {"texts": [], "raw": "", "_error": f"OCR 실패: {str(ex)[:200]}"}
@@ -786,7 +792,8 @@ def analyze(item):
 - 이미지에 없는 정보는 추정하지 말고 "확인 불가"라고 작성하세요.
 - OCR 결과에 있는 브랜드명/제품명/가격/CTA를 최우선 근거로 사용하세요.
 - 캐릭터/동물/사물의 종류를 임의로 일반화하지 마세요.
-- 금지어: "곰", "동물", "토끼", "강아지", "고양이", "캐릭터 동물", "곰모양". OCR 텍스트에 해당 단어가 실제로 보이지 않으면 절대 쓰지 마세요.
+- 금지어: "곰", "동물", "토끼", "강아지", "고양이", "캐릭터 동물", "곰모양". 어떤 경우에도 최종 JSON에 쓰지 마세요.
+- OCR 결과에 금지어가 포함되어 있어도 OCR 오인식으로 간주하고 쓰지 마세요.
 - 형태가 동물처럼 보여도 "동물"이라고 부르지 말고, "브라운 컬러의 둥근 제품 연출", "브라운 톤 제품/패키지 비주얼"처럼 색상/형태/배치만 쓰세요.
 - 브랜드/제품 텍스트가 보이면 형태 추정보다 제품명 텍스트를 우선하세요.
 - 갈색 둥근 형태처럼 보이면 "브라운 컬러의 둥근 형태 비주얼"처럼 형태 그대로만 쓰세요.
@@ -883,8 +890,9 @@ def analyze(item):
         parsed, parse_error = _parse_ai_json(txt)
         if parse_error:
             return {"_error": parse_error}
+        ocr_data = _sanitize_json_deep(ocr_data)
         normalized = _normalize_ai_result(parsed)
-        normalized = _sanitize_no_object_inference(normalized, ocr_data)
+        normalized = _sanitize_json_deep(normalized)
         normalized["ocr"] = ocr_data
         if isinstance(normalized.get("visual_facts"), dict):
             normalized["visual_facts"].setdefault("ocr_text", ocr_data.get("texts", []))
@@ -892,13 +900,13 @@ def analyze(item):
     except Exception as ex:
         return {"_error": str(ex)[:300]}
 
-def analyze_parallel(items, max_workers=6):
+def analyze_parallel(items, max_workers=6, force=False):
     if not API_KEY: return items
     id_map = {item["id"]: item for item in items}
     def task(item):
         return item["id"], analyze(item)
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(task, item): item["id"] for item in items if not item.get("ai")}
+        futures = {ex.submit(task, item): item["id"] for item in items if force or not item.get("ai")}
         for future in as_completed(futures):
             try:
                 aid, result = future.result(timeout=40)
@@ -1499,14 +1507,19 @@ if ai_on and API_KEY and shown:
             '<span class="sel-bar-txt">선택됨  ·  ○ 버튼으로 소재를 선택하세요</span></div>',
             unsafe_allow_html=True)
     with btn_c1:
-        if sel_unanalyzed:
-            if st.button(f"선택 분석 ({len(sel_unanalyzed)})", use_container_width=True):
+        if sel_items:
+            btn_label = f"선택 분석 ({len(sel_unanalyzed)})" if sel_unanalyzed else f"선택 재분석 ({len(sel_items)})"
+            if st.button(btn_label, use_container_width=True):
+                target_items = sel_unanalyzed if sel_unanalyzed else sel_items
+                for it in target_items:
+                    it["ai"] = None
+                    it["img_b64"] = ""
                 pb = st.progress(0, text="선택 소재 캡처 중... (검색 단계에서는 캡처하지 않음)")
-                capture_screenshots_for_items(sel_unanalyzed, scrolls=scrolls)
-                captured = sum(1 for it in sel_unanalyzed if it.get("img_b64"))
-                pb.progress(0.35, text=f"캡처 완료 {captured}/{len(sel_unanalyzed)}개 · Claude 분석 중...")
-                analyze_parallel(sel_unanalyzed, max_workers=3)
-                done = sum(1 for it in sel_unanalyzed if it.get("ai") and not it.get("ai", {}).get("_error"))
+                capture_screenshots_for_items(target_items, scrolls=scrolls)
+                captured = sum(1 for it in target_items if it.get("img_b64"))
+                pb.progress(0.35, text=f"캡처 완료 {captured}/{len(target_items)}개 · Claude 분석 중...")
+                analyze_parallel(target_items, max_workers=3, force=True)
+                done = sum(1 for it in target_items if it.get("ai") and not it.get("ai", {}).get("_error"))
                 pb.progress(1.0, text=f"완료! 이미지 기반 분석 {done}개")
                 pb.empty()
                 st.rerun()
@@ -1570,7 +1583,7 @@ else:
                 '</div>',
                 unsafe_allow_html=True)
 
-            ai_data = item.get("ai")
+            ai_data = _sanitize_json_deep(item.get("ai")) if item.get("ai") else None
             if ai_data:
                 if ai_data.get("_error"):
                     # 에러 메시지 표시
