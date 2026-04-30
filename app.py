@@ -201,16 +201,14 @@ def valid(w, h):
     r = w / h if h else 0
     return 0.25 <= r <= 3.0
 
-def url_key(url: str) -> str:
-    """URL에서 쿼리·fragment 제거한 순수 path로 중복 판별"""
-    p = urlparse(url.strip())
-    # fbcdn URL은 path 앞부분(파일명 제외)이 같으면 같은 이미지
-    path = p.path.rsplit("/", 1)[-1].split("?")[0]
-    return f"{p.netloc}/{path}"
-
 def fp(item):
-    """보드 병합용 fingerprint — URL key 기반"""
-    return url_key(item.get("image_url") or "")
+    """중복 판별 — 사이즈 + 타입 + 캡션 조합"""
+    return (
+        item.get("asset_type", ""),
+        item.get("width", 0),
+        item.get("height", 0),
+        (item.get("caption") or "").strip().lower()[:80],
+    )
 
 def scrape(keyword, country, scrolls, limit):
     ensure_browser()
@@ -218,26 +216,16 @@ def scrape(keyword, country, scrolls, limit):
     with sync_playwright() as p:
         br = p.chromium.launch(headless=True, args=[
             "--no-sandbox", "--disable-dev-shm-usage", "--disable-extensions",
-            "--disable-plugins", "--disable-background-networking",
-            "--no-first-run", "--disable-images",  # 이미지 렌더링 생략 → 속도↑
+            "--disable-plugins", "--disable-background-networking", "--no-first-run",
         ])
-        ctx = br.new_context(
-            viewport={"width": 1440, "height": 2000},
-            # 이미지 리소스는 차단하되 URL은 JS로 수집 가능
-        )
-        # 폰트·미디어·광고 트래킹 차단
-        def block(route):
-            if route.request.resource_type in ("image", "media", "font"):
-                route.abort()
-            else:
-                route.continue_()
-        ctx.route("**/*", block)
+        ctx = br.new_context(viewport={"width": 1440, "height": 2000})
+        # 폰트만 차단 (이미지는 허용해야 수집 가능)
+        ctx.route("**/*.{woff,woff2,ttf,otf,eot}", lambda r: r.abort())
 
         pg = ctx.new_page()
         pg.goto(url, wait_until="domcontentloaded", timeout=90000)
-        pg.wait_for_timeout(2500)  # 4000 → 2500ms
+        pg.wait_for_timeout(2500)
 
-        # fbcdn 이미지 수 기준 — 항상 작동하는 셀렉터
         def cnt():
             return pg.evaluate(
                 "() => document.querySelectorAll('img[src*=\"fbcdn\"]').length"
@@ -247,8 +235,8 @@ def scrape(keyword, country, scrolls, limit):
         for _ in range(scrolls):
             pg.mouse.wheel(0, 3000)
             waited = 0
-            while waited < 2800:          # 3500 → 2800ms
-                pg.wait_for_timeout(350)  # 400 → 350ms
+            while waited < 2800:
+                pg.wait_for_timeout(350)
                 waited += 350
                 cur = cnt()
                 if cur > prev:
@@ -257,16 +245,15 @@ def scrape(keyword, country, scrolls, limit):
                 stalls += 1
                 if stalls >= 2: break
 
-        # JS에서 src 수집 (렌더링 없이 attribute만 읽음)
         raw = pg.evaluate("""() => {
             const o = [];
             for (const i of document.querySelectorAll('img')) {
-                const s = i.getAttribute('src') || i.getAttribute('data-src') || '';
+                const s = i.currentSrc || i.src || '';
                 if (!s || s.startsWith('data:')) continue;
                 o.push({
                     t: 'image', s,
-                    w: i.naturalWidth  || parseInt(i.getAttribute('width'))  || 0,
-                    h: i.naturalHeight || parseInt(i.getAttribute('height')) || 0,
+                    w: i.naturalWidth  || i.width  || 0,
+                    h: i.naturalHeight || i.height || 0,
                     a: i.alt || ''
                 });
             }
@@ -283,21 +270,13 @@ def scrape(keyword, country, scrolls, limit):
         }""")
         ctx.close(); br.close()
 
-    # 중복 제거 — URL key 기반 (강력)
-    seen_url = set()
-    out, now = [], time.strftime("%Y-%m-%d %H:%M:%S")
-
+    seen, out, now = set(), [], time.strftime("%Y-%m-%d %H:%M:%S")
     for r in raw:
         if len(out) >= limit: break
         s = (r.get("s") or "").strip()
         w, h = int(r.get("w") or 0), int(r.get("h") or 0)
         if not s or not valid(w, h): continue
-
-        uk = url_key(s)
-        if uk in seen_url: continue   # URL 기준 중복 제거
-        seen_url.add(uk)
-
-        out.append({
+        a = {
             "id":         str(uuid.uuid4()),
             "keyword":    keyword,
             "country":    country,
@@ -310,7 +289,10 @@ def scrape(keyword, country, scrolls, limit):
             "created_at": now,
             "starred":    False,
             "ai":         None,
-        })
+        }
+        k = fp(a)
+        if k in seen: continue
+        seen.add(k); out.append(a)
     return out
 
 
