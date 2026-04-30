@@ -604,6 +604,7 @@ for col, (lbl, val, sub) in zip(st.columns(6), sc_data):
                  f'<div class="sc-val">{val}</div><div class="sc-sub">{sub}</div></div>',
                  unsafe_allow_html=True)
 
+st.markdown('<div style="height:24px"></div>', unsafe_allow_html=True)
 
 # ============================================================
 # 키워드 태그
