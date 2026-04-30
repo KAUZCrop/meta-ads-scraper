@@ -453,6 +453,45 @@ def scrape(keyword, country, scrolls, limit):
             return out;
         }""")
 
+        # ── 브라우저 fetch로 이미지 base64 캡처 (Meta CDN 우회) ──
+        # 브라우저 컨텍스트 안에서 실행되므로 쿠키·헤더 자동 포함
+        img_urls = [d["src"] for d in dom_data if d.get("src") and d.get("type") == "image"]
+        img_urls = img_urls[:limit]  # 최대 limit개만
+
+        img_b64_map = {}
+        if img_urls:
+            try:
+                results = page.evaluate("""async (urls) => {
+                    const out = {};
+                    const fetchOne = async (url) => {
+                        try {
+                            const resp = await fetch(url, {credentials: 'include'});
+                            if (!resp.ok) return null;
+                            const buf = await resp.arrayBuffer();
+                            const bytes = new Uint8Array(buf);
+                            let binary = '';
+                            for (let i = 0; i < bytes.byteLength; i++) {
+                                binary += String.fromCharCode(bytes[i]);
+                            }
+                            return btoa(binary);
+                        } catch(e) { return null; }
+                    };
+                    // 병렬로 최대 5개씩 처리
+                    const chunkSize = 5;
+                    for (let i = 0; i < urls.length; i += chunkSize) {
+                        const chunk = urls.slice(i, i + chunkSize);
+                        const results = await Promise.all(chunk.map(fetchOne));
+                        chunk.forEach((url, idx) => {
+                            if (results[idx]) out[url] = results[idx];
+                        });
+                    }
+                    return out;
+                }""", img_urls)
+                if isinstance(results, dict):
+                    img_b64_map = results
+            except Exception:
+                pass
+
         ctx.close(); browser.close()
 
     # ── GraphQL 파싱 ──
@@ -507,6 +546,7 @@ def scrape(keyword, country, scrolls, limit):
             "created_at": now,
             "starred":    False,
             "ai":         None,
+            "img_b64":    img_b64_map.get(src, ""),  # 브라우저로 캡처한 base64
         }
         fp_key = make_fp(asset)
         if fp_key in seen: continue
@@ -593,11 +633,20 @@ def analyze(item):
             "}"
         )
 
-        # ── 이미지 base64 시도 ──
-        img_result = fetch_image_b64(item["image_url"])
+        # ── 이미지 base64 확보 (저장된 것 우선, 없으면 다운로드 시도) ──
+        b64, mt = "", "image/jpeg"
 
-        if img_result:
-            b64, mt = img_result
+        if item.get("img_b64"):
+            # 스크래핑 시 브라우저로 캡처한 base64 사용
+            b64 = item["img_b64"]
+            mt  = "image/jpeg"
+        else:
+            # fallback: requests로 시도
+            img_result = fetch_image_b64(item["image_url"])
+            if img_result:
+                b64, mt = img_result
+
+        if b64:
             content = [
                 {
                     "type": "image",
@@ -610,7 +659,6 @@ def analyze(item):
                 {"type": "text", "text": prompt_text}
             ]
         else:
-            # 이미지 로드 실패 시 텍스트만으로 분석
             content = [{"type": "text", "text": prompt_text}]
 
         resp = requests.post(
