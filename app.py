@@ -2583,79 +2583,83 @@ with tab_board:
                 '<span class="sel-bar-txt">선택됨  ·  ○ 버튼으로 소재를 선택하세요</span></div>',
                 unsafe_allow_html=True)
         with btn_c1:
-            if sel_items:
-                btn_label = f"선택 분석 ({len(sel_unanalyzed)})" if sel_unanalyzed else f"선택 재분석 ({len(sel_items)})"
-                if st.button(btn_label, use_container_width=True):
-                    target_items = sel_unanalyzed if sel_unanalyzed else sel_items
-                    for it in target_items:
-                        it["ai"] = None
-                        it["img_b64"] = ""
-
-                    n = len(target_items)
-                    status = st.empty()
-
-                    # ── STEP 1: 캡처 ──
-                    status.markdown(
-                        _analysis_status_html("capture", 0, n, "Playwright로 광고 카드 전체 영역을 캡처합니다"),
-                        unsafe_allow_html=True,
-                    )
-                    capture_screenshots_for_items(target_items, scrolls=scrolls)
-                    captured = sum(1 for it in target_items if it.get("img_b64"))
-
-                    # ── STEP 2/3: Claude 분석 ──
-                    status.markdown(
-                        _analysis_status_html(
-                            "analyze", captured, n,
-                            f"캡처 완료 {captured}개 · OCR + Vision 분석 병렬 실행 중",
-                        ),
-                        unsafe_allow_html=True,
-                    )
-                    _, errors = analyze_parallel(target_items, max_workers=3, force=True)
-                    done = sum(1 for it in target_items if it.get("ai") and not (it.get("ai") or {}).get("_error"))
-
-                    # ── 완료 ──
-                    status.markdown(
-                        _analysis_status_html("done", done, n),
-                        unsafe_allow_html=True,
-                    )
-                    time.sleep(1.8)
-                    status.empty()
-
-                    if errors:
-                        with st.expander(f"⚠ 분석 오류 {len(errors)}건", expanded=False):
-                            for e in errors:
-                                st.markdown(f'<div class="err-box">{e}</div>', unsafe_allow_html=True)
-
-                    # 세션 assets에도 ai 결과 반영 (DB는 analyze_parallel에서 이미 저장)
-                    id_map = {it["id"]: it for it in target_items}
-                    for a in st.session_state.assets:
-                        if a["id"] in id_map:
-                            a["ai"] = id_map[a["id"]].get("ai")
-
-                    st.rerun()
-
+            btn_label = f"선택 분석 ({len(sel_unanalyzed)})" if sel_unanalyzed else f"선택 재분석 ({len(sel_items)})"
+            do_analyze = st.button(btn_label, use_container_width=True, disabled=not sel_items)
         with btn_c2:
-            if analyzed_sel:
-                if st.button(f"종합 인사이트 ({len(analyzed_sel)})", use_container_width=True):
-                    with st.spinner("종합 인사이트 생성 중..."):
-                        summ = summarize_insights(analyzed_sel)
-                        if summ:
-                            st.session_state.summary = summ
-                            db_save_summary(summ)
-                    st.rerun()
+            do_insight = (
+                st.button(f"종합 인사이트 ({len(analyzed_sel)})", use_container_width=True)
+                if analyzed_sel else False
+            )
         with btn_c3:
-            if analyzed_sel:
-                if st.button(f"PPT 내보내기 ({len(analyzed_sel)})", use_container_width=True):
-                    with st.spinner(f"PPT 생성 중 ({len(analyzed_sel)}개 소재)..."):
-                        pptx_bytes = to_pptx(analyzed_sel, st.session_state.get("summary"))
-                    fname = f"adintel_{time.strftime('%Y%m%d_%H%M')}.pptx"
-                    st.download_button(
-                        "다운로드",
-                        data=pptx_bytes,
-                        file_name=fname,
-                        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                        use_container_width=True,
-                    )
+            do_ppt = (
+                st.button(f"PPT 내보내기 ({len(analyzed_sel)})", use_container_width=True)
+                if analyzed_sel else False
+            )
+
+        # ── 분석 애니메이션: 컬럼 밖 전체 너비 ──
+        status = st.empty()
+
+        if do_analyze and sel_items:
+            target_items = sel_unanalyzed if sel_unanalyzed else sel_items
+            for it in target_items:
+                it["ai"] = None
+                it["img_b64"] = ""
+            n = len(target_items)
+
+            status.markdown(
+                _analysis_status_html("capture", 0, n, "Playwright로 광고 카드 전체 영역을 캡처합니다"),
+                unsafe_allow_html=True,
+            )
+            capture_screenshots_for_items(target_items, scrolls=scrolls)
+            captured = sum(1 for it in target_items if it.get("img_b64"))
+
+            status.markdown(
+                _analysis_status_html(
+                    "analyze", captured, n,
+                    f"캡처 완료 {captured}개 · OCR + Vision 분석 병렬 실행 중",
+                ),
+                unsafe_allow_html=True,
+            )
+            _, errors = analyze_parallel(target_items, max_workers=3, force=True)
+            done = sum(1 for it in target_items if it.get("ai") and not (it.get("ai") or {}).get("_error"))
+
+            status.markdown(
+                _analysis_status_html("done", done, n),
+                unsafe_allow_html=True,
+            )
+            time.sleep(1.8)
+            status.empty()
+
+            if errors:
+                with st.expander(f"⚠ 분석 오류 {len(errors)}건", expanded=False):
+                    for e in errors:
+                        st.markdown(f'<div class="err-box">{e}</div>', unsafe_allow_html=True)
+
+            id_map = {it["id"]: it for it in target_items}
+            for a in st.session_state.assets:
+                if a["id"] in id_map:
+                    a["ai"] = id_map[a["id"]].get("ai")
+            st.rerun()
+
+        if do_insight:
+            with st.spinner("종합 인사이트 생성 중..."):
+                summ = summarize_insights(analyzed_sel)
+                if summ:
+                    st.session_state.summary = summ
+                    db_save_summary(summ)
+            st.rerun()
+
+        if do_ppt:
+            with st.spinner(f"PPT 생성 중 ({len(analyzed_sel)}개 소재)..."):
+                pptx_bytes = to_pptx(analyzed_sel, st.session_state.get("summary"))
+            fname = f"adintel_{time.strftime('%Y%m%d_%H%M')}.pptx"
+            st.download_button(
+                "다운로드",
+                data=pptx_bytes,
+                file_name=fname,
+                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                use_container_width=True,
+            )
 
     if not shown:
         st.markdown(
