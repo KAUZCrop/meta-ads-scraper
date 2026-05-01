@@ -394,12 +394,13 @@ if "initialized" not in st.session_state:
     st.session_state.assets   = db_load_assets()
     st.session_state.hidden   = db_load_hidden()
     st.session_state.history  = db_load_history()
-    st.session_state.log      = []
-    st.session_state.ai_on    = False
-    st.session_state.dark     = False
-    st.session_state.selected = set()
-    st.session_state.summary  = db_load_summary()
-    st.session_state.initialized = True
+    st.session_state.log            = []
+    st.session_state.ai_on          = False
+    st.session_state.dark           = False
+    st.session_state.selected       = set()
+    st.session_state.summary        = db_load_summary()
+    st.session_state.analysis_model = "haiku"   # haiku | sonnet
+    st.session_state.initialized    = True
 
 
 # ============================================================
@@ -631,36 +632,93 @@ def _find_media_handle_by_url(page, target_url: str, asset_type: str = "image"):
     except Exception:
         return None
 
+def _find_ad_card_container(page, target_key: str):
+    """
+    이미지 URL을 기준으로 광고 카드 전체 컨테이너를 DOM에서 탐색.
+    텍스트 카피·CTA·브랜드명까지 포함된 카드 영역을 반환.
+    """
+    try:
+        handle = page.evaluate_handle("""({targetKey}) => {
+            const key = (u) => {
+                try { const p = new URL(u); return p.host + p.pathname; }
+                catch(e) { return u || ''; }
+            };
+            const imgs = Array.from(document.querySelectorAll('img'));
+            for (const img of imgs) {
+                const src = img.currentSrc || img.src || '';
+                if (!src || key(src) !== targetKey) continue;
+                let el = img;
+                for (let i = 0; i < 12; i++) {
+                    if (!el.parentElement) break;
+                    el = el.parentElement;
+                    const rect = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    if (rect.width > 200 && rect.height > 250
+                        && style.overflow !== 'scroll'
+                        && style.overflow !== 'auto') {
+                        const text = (el.innerText || '').trim();
+                        if (text.length > 15) return el;
+                    }
+                }
+                return img;
+            }
+            return null;
+        }""", {"targetKey": target_key})
+        return handle.as_element()
+    except Exception:
+        return None
+
+
 def _capture_media_by_url_b64(page, target_url: str, asset_type: str = "image") -> tuple[str, str]:
-    element = _find_media_handle_by_url(page, target_url, asset_type)
-    if not element:
-        return "", "element_not_found"
+    """
+    개선된 3단계 캡처 전략 (quality=85):
+    1순위 — 광고 카드 컨테이너 전체 (텍스트+이미지+CTA 포함)
+    2순위 — 모달 다이얼로그
+    3순위 — 이미지 요소 단독
+    """
+    target_key = _url_key(target_url)
+
+    # ── 1순위: 광고 카드 컨테이너 ──
     try:
-        element.scroll_into_view_if_needed(timeout=7000)
-        page.wait_for_timeout(700)
-    except Exception:
-        pass
-    try:
-        element.click(timeout=5000, force=True)
-        page.wait_for_timeout(1600)
-        dialog = page.locator('div[role="dialog"]').last
-        if dialog.count() > 0 and dialog.is_visible():
-            shot = dialog.screenshot(type="jpeg", quality=55, timeout=15000)
-            _close_modal(page)
+        card = _find_ad_card_container(page, target_key)
+        if card:
+            card.scroll_into_view_if_needed(timeout=7000)
+            page.wait_for_timeout(700)
+            shot = card.screenshot(type="jpeg", quality=85, timeout=15000)
             if _is_valid_screenshot(shot):
-                return _bytes_to_b64(shot), "modal_screenshot"
-    except Exception:
-        _close_modal(page)
-    try:
-        element = _find_media_handle_by_url(page, target_url, asset_type) or element
-        element.scroll_into_view_if_needed(timeout=7000)
-        page.wait_for_timeout(500)
-        shot = element.screenshot(type="jpeg", quality=65, timeout=12000)
-        if _is_valid_screenshot(shot):
-            return _bytes_to_b64(shot), "element_screenshot"
+                return _bytes_to_b64(shot), "card_container"
     except Exception:
         pass
-    return "", "blank_or_capture_failed"
+
+    # ── 2순위: 클릭 후 모달 ──
+    element = _find_media_handle_by_url(page, target_url, asset_type)
+    if element:
+        try:
+            element.scroll_into_view_if_needed(timeout=7000)
+            page.wait_for_timeout(600)
+            element.click(timeout=5000, force=True)
+            page.wait_for_timeout(1600)
+            dialog = page.locator('div[role="dialog"]').last
+            if dialog.count() > 0 and dialog.is_visible():
+                shot = dialog.screenshot(type="jpeg", quality=85, timeout=15000)
+                _close_modal(page)
+                if _is_valid_screenshot(shot):
+                    return _bytes_to_b64(shot), "modal"
+        except Exception:
+            _close_modal(page)
+
+        # ── 3순위: 이미지 요소 단독 ──
+        try:
+            element = _find_media_handle_by_url(page, target_url, asset_type) or element
+            element.scroll_into_view_if_needed(timeout=7000)
+            page.wait_for_timeout(500)
+            shot = element.screenshot(type="jpeg", quality=85, timeout=12000)
+            if _is_valid_screenshot(shot):
+                return _bytes_to_b64(shot), "element"
+        except Exception:
+            pass
+
+    return "", "capture_failed"
 
 def scrape(keyword, country, scrolls, limit):
     ensure_browser()
@@ -883,11 +941,19 @@ def capture_screenshots_for_items(items, scrolls=8):
 # ============================================================
 # AI 분석
 # ============================================================
-def _anthropic_model() -> str:
-    try:
-        return st.secrets.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
-    except Exception:
+def _anthropic_model(role: str = "analysis") -> str:
+    """
+    role: analysis → 사용자 선택 모델 / repair·summary → 항상 haiku (비용 절감)
+    """
+    if role in ("repair", "summary"):
         return "claude-haiku-4-5-20251001"
+    try:
+        model_choice = st.session_state.get("analysis_model", "haiku")
+    except Exception:
+        model_choice = "haiku"
+    if model_choice == "sonnet":
+        return "claude-sonnet-4-5-20250514"
+    return "claude-haiku-4-5-20251001"
 
 def _extract_json_block(text: str) -> str | None:
     if not text:
@@ -1058,108 +1124,203 @@ def _extract_ocr_with_claude(img_b64: str) -> dict:
     except Exception as ex:
         return {"texts": [], "raw": "", "_error": f"OCR 실패: {str(ex)[:200]}"}
 
-def analyze(item):
+def _quality_score(ai_result: dict) -> int:
+    """분석 결과 품질 점수 (0-100). 확인 불가 개수 기반."""
+    if not ai_result or ai_result.get("_error"):
+        return 0
+    text = json.dumps(ai_result, ensure_ascii=False)
+    unknowns = text.count("확인 불가")
+    return max(0, 100 - unknowns * 12)
+
+
+def analyze(item, lenient: bool = False):
+    """
+    개선된 AI 분석 파이프라인:
+    1) OCR 추출 (1차 호출)
+    2) 비전 분석 (2차 호출) — 프롬프트는 lenient=True일 때 더 관대하게
+    3) 품질 점수가 낮으면 analyze_parallel에서 lenient=True로 재시도
+    """
     if not API_KEY:
         return {"_error": "API Key 없음"}
     b64 = item.get("img_b64", "") or db_get_img_b64(item["id"])
     if not b64:
         return {"_error": "스크린샷 확보 실패 — 선택 분석 버튼으로 재시도하세요."}
+
+    capture_src = item.get("capture_source", "unknown")
+    has_card_context = "card" in capture_src  # 광고 카드 전체 캡처 여부
+
     try:
-        ocr_data = _extract_ocr_with_claude(b64)
-        ocr_text    = _safe_join(ocr_data.get("texts", []),            " / ") or "확인 불가"
-        brand_text  = _safe_join(ocr_data.get("brand_candidates", []), " / ") or "확인 불가"
-        product_text= _safe_join(ocr_data.get("product_candidates",[])," / ") or "확인 불가"
-        price_text  = _safe_join(ocr_data.get("price_texts", []),      " / ") or "확인 불가"
-        cta_text    = _safe_join(ocr_data.get("cta_texts", []),        " / ") or "확인 불가"
+        # ── 1차: OCR 추출 ──
+        ocr_data     = _extract_ocr_with_claude(b64)
+        ocr_text     = _safe_join(ocr_data.get("texts", []),            " / ") or ""
+        brand_text   = _safe_join(ocr_data.get("brand_candidates", []), " / ") or ""
+        product_text = _safe_join(ocr_data.get("product_candidates",[]), " / ") or ""
+        price_text   = _safe_join(ocr_data.get("price_texts", []),      " / ") or ""
+        cta_text     = _safe_join(ocr_data.get("cta_texts", []),        " / ") or ""
 
-        prompt = f"""
-당신은 광고 소재 리서치 분석가입니다.
-첨부 이미지는 Meta 광고 라이브러리에서 캡처한 실제 광고 소재 화면입니다.
+        card_notice = (
+            "이 캡처는 광고 카드 전체를 담고 있어 이미지 외에 텍스트 카피, CTA, 브랜드명도 포함될 수 있습니다."
+            if has_card_context else
+            "이 캡처는 광고 이미지 영역만 담고 있습니다. 보이는 비주얼 요소에 집중하세요."
+        )
 
-중요 원칙:
-- 이미지에서 실제로 보이는 요소를 먼저 객관적으로 추출하세요.
-- 이미지에 없는 정보는 추정하지 말고 "확인 불가"로 작성하세요.
-- OCR 결과의 브랜드명/제품명/가격/CTA를 최우선 근거로 사용하세요.
-- 금지어: "곰", "동물", "토끼", "강아지", "고양이". 절대 쓰지 마세요.
-- JSON 외 마크다운, 설명문, 백틱은 절대 출력하지 마세요.
-- 반드시 json.loads()로 파싱 가능한 순수 JSON만 반환하세요.
-- 문자열 안의 큰따옴표(")는 작은따옴표(')로 바꾸거나 제거하세요.
+        inference_rule = (
+            "시각적 단서가 있으면 적극적으로 추론해도 됩니다. 불확실할 때는 '추정: [근거]' 형식으로 쓰세요."
+            if lenient else
+            "명확한 시각적 근거가 있을 때만 단정하고, 불확실하면 '추정: [근거]' 형식으로 쓰세요."
+        )
 
-검색 키워드: {item['keyword']}
-캡처 방식: {item.get('capture_source', 'unknown')}
+        prompt = f"""당신은 Meta 광고 소재 전문 분석가입니다.
+첨부된 이미지를 보고 광고 소재를 구조적으로 분석하세요.
 
-1차 OCR 결과:
-- 전체 문구: {ocr_text}
-- 브랜드 후보: {brand_text}
-- 제품명 후보: {product_text}
-- 가격/할인 문구: {price_text}
-- CTA 문구: {cta_text}
+=== 분석 맥락 ===
+검색 키워드: {item["keyword"]}
+캡처 방식: {capture_src}
+{card_notice}
 
-반드시 아래 JSON 구조로만 반환하세요:
+=== OCR 추출 결과 (참고용) ===
+전체 문구: {ocr_text or "(텍스트 없음 또는 추출 실패)"}
+브랜드 후보: {brand_text or "(없음)"}
+제품명 후보: {product_text or "(없음)"}
+가격/할인: {price_text or "(없음)"}
+CTA: {cta_text or "(없음)"}
+
+=== 분석 지침 ===
+1. 이미지에 실제로 보이는 것을 최우선으로 기술하세요.
+2. {inference_rule}
+3. "확인 불가"는 정말 아무것도 파악이 안 될 때만 사용하세요. 최대 2~3개로 제한하세요.
+4. 광고 카피, 슬로건, 가격, 할인율, 브랜드명이 보이면 반드시 그대로 옮기세요.
+5. 비주얼 스타일, 색감, 레이아웃은 이미지에서 직접 관찰하여 기술하세요.
+6. 마케팅 분석은 보이는 요소에서 출발해 합리적으로 추론하세요.
+7. JSON 외 마크다운·백틱·설명문은 출력하지 마세요.
+8. 문자열 내 큰따옴표(")는 작은따옴표(')로 바꾸세요.
+
+=== 레이아웃 유형 정의 ===
+- 제품 단독형: 제품 이미지가 주역, 텍스트 최소
+- 모델 사용형: 사람/모델이 제품 사용 또는 착용
+- Before-After형: 변화 전후 비교
+- 리뷰/UGC형: 실사용 후기, 별점, 댓글 스타일
+- 가격혜택형: 할인율·가격·프로모션이 전면에
+- 카드뉴스형: 여러 정보를 슬라이드/카드로 분할
+- 문제제기형: 타겟의 pain point를 질문·공감으로 시작
+- 기능설명형: 제품 스펙·기능을 시각적으로 나열
+- 브랜드필름형: 스토리텔링·감성·브랜드 세계관 중심
+
+=== 반환 JSON 구조 ===
 {{
   "visual_facts": {{
-    "visible_text": ["이미지 안에 실제로 보이는 문구를 줄 단위로 정확히 작성"],
-    "objects": ["실제 보이는 제품/인물/소품/아이콘/배경 요소"],
-    "colors": ["메인 컬러", "보조 컬러"],
-    "layout_type": "제품 단독형/모델 사용형/Before-After형/리뷰형/가격혜택형/카드뉴스형/문제제기형/기능설명형/브랜드필름형 중 가장 가까운 유형",
-    "product_focus": "제품이 어떻게 강조되는지",
-    "price_visible": true,
-    "discount_visible": true,
-    "human_visible": false,
-    "brand_visible": "보이면 브랜드명, 없으면 확인 불가"
+    "visible_text": ["이미지에서 보이는 실제 문구 — OCR 결과와 대조하여 정확하게"],
+    "main_subject": "이미지의 주요 피사체 또는 비주얼 (구체적으로)",
+    "supporting_elements": ["부차적 비주얼 요소들"],
+    "color_palette": ["주요 색상 — 색감과 분위기 포함"],
+    "layout_type": "위 정의 중 가장 가까운 유형",
+    "text_hierarchy": "헤드카피 → 서브카피 → CTA 순서로 정리 (있는 것만)",
+    "brand_name": "브랜드명 또는 추정",
+    "product_name": "제품명 또는 추정",
+    "price_info": "가격·할인 정보 또는 없음",
+    "cta_text": "CTA 문구 또는 없음",
+    "human_present": true,
+    "mood": "따뜻함/신뢰/활기/고급스러움/유머/긴박감 등 분위기"
   }},
   "marketing_analysis": {{
-    "hook_type": "가격강조/비주얼강조/문제제기/혜택강조/비교강조/후기강조/한정성강조/확인 불가 중 하나",
-    "appeal_type": ["가격", "혜택"],
-    "target": "이미지 근거로 추정 가능한 타겟. 근거 부족 시 확인 불가",
-    "message": "이미지 내 텍스트와 비주얼 기준 핵심 메시지 한 줄",
-    "cta_strength": 1,
-    "evidence": "판단 근거가 된 실제 이미지 요소를 구체적으로 작성"
+    "hook_type": "가격강조/비주얼강조/문제제기/혜택강조/비교강조/후기강조/한정성강조/감성소구/권위소구 중 하나",
+    "primary_appeal": "주요 소구점 (가격/품질/편의/감성/사회적증명/희소성 등)",
+    "secondary_appeal": "부가 소구점 (없으면 없음)",
+    "target_audience": "추정 타겟 — 연령대, 관심사, 상황 포함하여 구체적으로",
+    "core_message": "이 광고가 전달하려는 핵심 메시지 한 문장",
+    "emotional_trigger": "어떤 감정이나 욕구를 자극하는지",
+    "evidence": "위 분석의 근거가 된 이미지 요소 2~3가지"
   }},
   "conversion_elements": {{
-    "price_emphasis": 1,
-    "product_visibility": 1,
-    "readability": 1,
-    "discount_visibility": 1,
-    "visual_clarity": 1,
-    "overall_conversion_power": 1,
-    "score_reason": "각 점수를 준 핵심 근거"
+    "price_emphasis": 3,
+    "product_visibility": 3,
+    "readability": 3,
+    "discount_visibility": 3,
+    "visual_clarity": 3,
+    "cta_strength": 3,
+    "overall_conversion_power": 3,
+    "score_rationale": "각 점수의 핵심 근거를 간단히"
   }},
   "creative_diagnosis": {{
-    "strengths": ["이미지 근거 기반 장점"],
-    "weaknesses": ["이미지 근거 기반 약점"],
-    "improvement_direction": "소재 개선 방향 1문장"
+    "strengths": ["강점 1", "강점 2"],
+    "weaknesses": ["약점 1", "약점 2"],
+    "missed_opportunity": "이 소재가 놓친 기회 한 가지",
+    "improvement_direction": "가장 임팩트 있는 개선 방향 한 문장"
   }},
-  "tags": ["태그1", "태그2", "태그3"]
+  "tags": ["핵심태그1", "핵심태그2", "핵심태그3", "핵심태그4", "핵심태그5"]
 }}
 
-점수 기준: 1=매우 약함, 2=약함, 3=보통, 4=강함, 5=매우 강함
+점수 기준: 1=매우 약함 2=약함 3=보통 4=강함 5=매우 강함
+각 점수는 해당 소재의 실제 강도를 반영하세요. 모든 항목을 3으로 주지 마세요.
 """
-        content = [
+
+        content_payload = [
             {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
             {"type": "text", "text": prompt},
         ]
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": _anthropic_model(), "max_tokens": 1200, "temperature": 0,
-                  "messages": [{"role": "user", "content": content}]},
-            timeout=50,
+            json={
+                "model": _anthropic_model("analysis"),
+                "max_tokens": 1600,
+                "temperature": 0,
+                "messages": [{"role": "user", "content": content_payload}],
+            },
+            timeout=60,
         )
         if resp.status_code != 200:
             return {"_error": f"API {resp.status_code}: {resp.text[:300]}"}
+
         txt = resp.json()["content"][0]["text"].strip()
         parsed, parse_error = _parse_ai_json(txt)
         if parse_error:
             return {"_error": parse_error}
-        normalized = _normalize_ai_result(parsed)
+
+        # 기존 normalize + sanitize
+        normalized = _normalize_ai_result_v2(parsed)
         normalized = _sanitize_json_deep(normalized)
         normalized["ocr"] = _sanitize_json_deep(ocr_data)
-        if isinstance(normalized.get("visual_facts"), dict):
-            normalized["visual_facts"].setdefault("ocr_text", ocr_data.get("texts", []))
+        normalized["_quality"] = _quality_score(normalized)
         return normalized
+
     except Exception as ex:
         return {"_error": str(ex)[:300]}
+
+
+def _normalize_ai_result_v2(data: dict) -> dict:
+    """v4.1 신규 JSON 구조를 UI 호환 필드로 정규화."""
+    if not isinstance(data, dict):
+        return {"_error": "AI 응답이 JSON object가 아닙니다."}
+
+    vf = data.get("visual_facts") or {}
+    ma = data.get("marketing_analysis") or {}
+    ce = data.get("conversion_elements") or {}
+    cd = data.get("creative_diagnosis") or {}
+
+    # 구버전 UI 호환용 top-level 필드
+    data["copy"]        = _safe_join(vf.get("visible_text", []), " / ") or vf.get("text_hierarchy") or "—"
+    data["hook"]        = ma.get("hook_type") or "—"
+    data["appeal"]      = ma.get("primary_appeal") or "—"
+    data["tone"]        = _safe_join(vf.get("color_palette", [])) or vf.get("mood") or "—"
+    data["target"]      = ma.get("target_audience") or "—"
+    data["message"]     = ma.get("core_message") or "—"
+    data["evidence"]    = ma.get("evidence") or "—"
+    data["main_visual"] = vf.get("main_subject") or "—"
+    data["layout_type"] = vf.get("layout_type") or "—"
+    data["scores"]      = ce
+
+    # 태그가 없으면 생성
+    if not data.get("tags"):
+        data["tags"] = [
+            x for x in [
+                ma.get("hook_type"), ma.get("primary_appeal"),
+                vf.get("layout_type"), vf.get("mood"),
+            ] if x and x not in ("—", "없음")
+        ][:5]
+
+    return data
+
 
 def analyze_parallel(items, max_workers=6, force=False):
     if not API_KEY:
@@ -1168,7 +1329,14 @@ def analyze_parallel(items, max_workers=6, force=False):
     errors = []
 
     def task(item):
-        return item["id"], analyze(item)
+        result = analyze(item)
+        # 품질이 낮으면 lenient 모드로 1회 재시도
+        quality = result.get("_quality", 100) if not result.get("_error") else 0
+        if quality < 40 and not result.get("_error"):
+            retry = analyze(item, lenient=True)
+            if not retry.get("_error") and retry.get("_quality", 0) > quality:
+                result = retry
+        return item["id"], result
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {
@@ -1179,13 +1347,14 @@ def analyze_parallel(items, max_workers=6, force=False):
         for future in as_completed(futures):
             aid = futures[future]
             try:
-                aid, result = future.result(timeout=60)
+                aid, result = future.result(timeout=90)
                 if result and aid in id_map:
                     id_map[aid]["ai"] = result
-                    # AI 결과를 DB에 즉시 저장
                     db_set_field(aid, ai_json=json.dumps(result, ensure_ascii=False))
                     if result.get("_error"):
                         errors.append(f"[{id_map[aid]['keyword']}] {result['_error']}")
+                    elif result.get("_quality", 100) < 40:
+                        errors.append(f"[{id_map[aid]['keyword']}] 분석 품질 낮음 (score={result.get('_quality')})")
             except Exception as ex_inner:
                 err_msg = f"[{aid[:8]}] 분석 예외: {str(ex_inner)[:120]}"
                 errors.append(err_msg)
@@ -1886,7 +2055,24 @@ with st.sidebar:
     if ai_on:
         if API_KEY:
             st.success("API Key 연결됨")
-            st.caption("선택 소재만 분석 · Haiku · 소재당 ~1원")
+
+            # 분석 모델 선택
+            st.markdown('<div class="slbl">분석 모델 선택</div>', unsafe_allow_html=True)
+            model_choice = st.radio(
+                "model_radio",
+                options=["haiku", "sonnet"],
+                format_func=lambda x: (
+                    "⚡ Haiku — 빠름·저비용 (~1원)" if x == "haiku"
+                    else "🎯 Sonnet — 정밀·고품질 (~15원)"
+                ),
+                index=0 if st.session_state.get("analysis_model", "haiku") == "haiku" else 1,
+                label_visibility="collapsed",
+            )
+            if model_choice != st.session_state.get("analysis_model"):
+                st.session_state.analysis_model = model_choice
+            if model_choice == "sonnet":
+                st.info("비전 분석 품질이 크게 높습니다.\n소재당 약 10~20원 수준.")
+
             if st.button("API 연결 테스트", use_container_width=True):
                 ok, msg = test_api()
                 if ok:
@@ -2332,7 +2518,8 @@ with tab_table:
 # ============================================================
 st.markdown("<div style='height:40px'></div>", unsafe_allow_html=True)
 th   = "DARK" if D else "LIGHT"
-ai_s = "AI ON · Haiku" if (ai_on and API_KEY) else "AI OFF"
+model_label = "Sonnet" if st.session_state.get("analysis_model")=="sonnet" else "Haiku"
+ai_s = f"AI ON · {model_label}" if (ai_on and API_KEY) else "AI OFF"
 st.markdown(
     f'<div style="border-top:2px solid var(--bd);padding-top:14px;display:flex;justify-content:space-between;">'
     f'<span style="font-size:10px;color:var(--mu)">ADINTEL v4.0 · {th} · {ai_s} · SQLite 자동저장</span>'
