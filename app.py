@@ -1097,6 +1097,171 @@ def _repair_json_with_claude(raw_json: str) -> dict | None:
     except Exception:
         return None
 
+
+
+# ============================================================
+# 분석 로딩 애니메이션 -- 스플래시 스크린과 동일 톤
+# ============================================================
+def _analysis_status_html(step, current, total, detail=""):
+    BG      = "#0d0f12"
+    BORDER  = "#252a34"
+    TX      = "#e8eaf0"
+    MU      = "#6b7280"
+    AC      = "#4f8aff"
+    AC_DIM  = "rgba(79,138,255,.08)"
+    AC_MED  = "rgba(79,138,255,.15)"
+    AC_BD   = "rgba(79,138,255,.35)"
+    AC_GLOW = "rgba(79,138,255,.6)"
+    OK      = "#3dffa0"
+    OK_DIM  = "rgba(61,255,160,.12)"
+    OK_BD   = "rgba(61,255,160,.3)"
+    GRID    = "rgba(26,109,255,.055)"
+    TRACK   = "rgba(255,255,255,.06)"
+
+    step_order = {"capture": 0, "analyze": 2, "done": 3}
+    step_idx   = step_order.get(step, 0)
+    pct        = int((current / max(total, 1)) * 100)
+    is_done    = step == "done"
+
+    step_defs = [
+        ("01", "CAPTURE",  "Playwright"),
+        ("02", "OCR",      "Claude Vision"),
+        ("03", "ANALYZE",  "Claude AI"),
+    ]
+    ko_labels = {
+        "capture": "\uad11\uace0 \uc18c\uc7ac \uc2a4\ud06c\ub9b0\uc0f7 \uce90\uccad \uc911",
+        "analyze": "Claude AI \ub9c8\ucf00\ud305 \ubd84\uc11d \uc911",
+        "done":    "\ubd84\uc11d \uc644\ub8cc",
+    }
+    current_label = ko_labels.get(step, "\ucc98\ub9ac \uc911")
+
+    steps_html = ""
+    for i, (num, lbl, sub) in enumerate(step_defs):
+        done_step   = i < step_idx
+        active_step = (i == 0 and step == "capture") or (i == 2 and step == "analyze")
+
+        if done_step:
+            bg, bd, col, icon, fs, lbl_col = OK_DIM, f"1.5px solid {OK_BD}", OK, "v", "16px", OK
+        elif active_step:
+            bg, bd, col, icon, fs, lbl_col = AC_MED, f"2px solid {AC}", AC, "o", "13px", AC
+        else:
+            bg = "rgba(255,255,255,.03)"
+            bd, col, icon, fs, lbl_col = f"1px solid {BORDER}", MU, num, "11px", MU
+
+        ring = "animation:aia-ring 1.5s ease-in-out infinite;" if active_step else ""
+
+        steps_html += (
+            f'<div style="display:flex;flex-direction:column;align-items:center;gap:6px;flex:1;min-width:0;">'
+            f'<div style="width:48px;height:48px;border-radius:50%;background:{bg};border:{bd};'
+            f'display:flex;align-items:center;justify-content:center;'
+            f'font-family:Pretendard,-apple-system,sans-serif;'
+            f'font-size:{fs};font-weight:800;color:{col};flex-shrink:0;transition:.4s;{ring}">'
+            f'{icon}</div>'
+            f'<div style="font-size:9px;font-weight:700;color:{lbl_col};letter-spacing:1.5px;">{lbl}</div>'
+            f'<div style="font-size:9px;color:{MU};letter-spacing:.5px;">{sub}</div>'
+            f'</div>'
+        )
+        if i < len(step_defs) - 1:
+            arr_col = OK if done_step else BORDER
+            steps_html += (
+                f'<div style="font-size:18px;color:{arr_col};padding-top:12px;flex-shrink:0;transition:.4s;">'
+                f'&rsaquo;</div>'
+            )
+
+    dots_html = ""
+    if not is_done:
+        spans = "".join(
+            f'<span style="width:4px;height:4px;border-radius:50%;background:{AC};opacity:.3;'
+            f'display:inline-block;animation:aia-pulse 1.2s ease-in-out {i * 0.2:.1f}s infinite;">'
+            f'</span>'
+            for i in range(3)
+        )
+        dots_html = (
+            f'<div style="display:flex;gap:6px;justify-content:center;margin-top:14px;">'
+            f'{spans}</div>'
+        )
+
+    h_col  = OK if is_done else AC
+    h_lbl  = "COMPLETE" if is_done else "ANALYZING"
+    dot_a  = "" if is_done else "animation:aia-pulse 1.1s ease-in-out infinite;"
+    bar_bg = OK if is_done else f"linear-gradient(90deg,#1a6dff,{AC})"
+    bar_sh = f"box-shadow:0 0 8px {AC_GLOW};" if not is_done else f"box-shadow:0 0 6px rgba(61,255,160,.4);"
+    bar_ani= "background-size:200% 100%;animation:aia-shimmer 1.8s linear infinite;" if not is_done else ""
+    chk    = f'<span style="color:{OK};margin-right:6px;font-size:14px;">v</span>' if is_done else ""
+    det    = (
+        f'<div style="text-align:center;font-size:10px;color:{MU};'
+        f'letter-spacing:.5px;margin-bottom:18px;">{detail}</div>'
+    ) if detail else ""
+
+    css = (
+        "<style>"
+        "@keyframes aia-scan{0%{transform:translateX(-100%);opacity:0}18%{opacity:1}82%{opacity:1}100%{transform:translateX(220%);opacity:0}}"
+        "@keyframes aia-pulse{0%,100%{opacity:.3;transform:scale(1)}50%{opacity:1;transform:scale(1.5)}}"
+        "@keyframes aia-ring{0%,100%{box-shadow:0 0 0 0 rgba(79,138,255,.45)}50%{box-shadow:0 0 0 8px rgba(79,138,255,0)}}"
+        "@keyframes aia-shimmer{0%{background-position:0% 50%}100%{background-position:200% 50%}}"
+        "@keyframes aia-rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}"
+        "</style>"
+    )
+
+    return (
+        css
+        + f'<div style="background:{BG};border:1px solid {BORDER};border-radius:14px;'
+        + f'padding:28px 32px;margin:4px 0 16px;position:relative;overflow:hidden;'
+        + f'font-family:Pretendard,-apple-system,sans-serif;animation:aia-rise .35s cubic-bezier(.2,.8,.4,1);">'
+
+        # Grid (same as splash)
+        + f'<div style="position:absolute;inset:0;pointer-events:none;border-radius:14px;'
+        + f'background-image:linear-gradient({GRID} 1px,transparent 1px),'
+        + f'linear-gradient(90deg,{GRID} 1px,transparent 1px);'
+        + f'background-size:48px 48px;opacity:.8;"></div>'
+
+        # Scan line (same as splash)
+        + f'<div style="position:absolute;top:0;left:0;right:0;height:2px;overflow:hidden;border-radius:14px 14px 0 0;">'
+        + f'<div style="height:100%;background:linear-gradient(90deg,transparent,rgba(79,138,255,.55),rgba(91,157,255,.4),transparent);'
+        + f'animation:aia-scan 2.3s ease-in-out infinite;"></div></div>'
+
+        # Logo header (same as splash)
+        + f'<div style="position:relative;display:flex;align-items:center;justify-content:space-between;margin-bottom:24px;">'
+        + f'<div style="display:flex;align-items:center;gap:10px;">'
+        + f'<span style="font-size:16px;font-weight:900;color:{TX};letter-spacing:-.5px;line-height:1;">'
+        + f'AD<span style="color:{AC};">INTEL</span></span>'
+        + f'<span style="font-size:9px;font-weight:600;color:{AC};border:1px solid {AC_BD};'
+        + f'border-radius:4px;padding:2px 7px;letter-spacing:.5px;background:{AC_DIM};">v4.0</span>'
+        + f'</div>'
+        + f'<div style="display:flex;align-items:center;gap:8px;">'
+        + f'<div style="width:7px;height:7px;border-radius:50%;background:{h_col};{dot_a}"></div>'
+        + f'<span style="font-size:9px;font-weight:700;color:{h_col};letter-spacing:2.5px;">{h_lbl}</span>'
+        + f'</div></div>'
+
+        # Divider (same as splash)
+        + f'<div style="position:relative;height:1px;background:linear-gradient(90deg,transparent,{AC_BD},transparent);margin-bottom:24px;"></div>'
+
+        # Steps
+        + f'<div style="position:relative;display:flex;align-items:flex-start;justify-content:center;gap:6px;margin-bottom:24px;">{steps_html}</div>'
+
+        # Label
+        + f'<div style="position:relative;text-align:center;margin-bottom:6px;">'
+        + f'<span style="font-size:13px;font-weight:700;color:{TX};">{chk}{current_label}</span></div>'
+
+        # Detail + dots
+        + f'<div style="position:relative;">{det}{dots_html}</div>'
+
+        # Divider
+        + f'<div style="position:relative;height:1px;background:linear-gradient(90deg,transparent,{BORDER},transparent);margin:20px 0 16px;"></div>'
+
+        # Progress bar (same as splash: 2px, glow, track)
+        + f'<div style="position:relative;">'
+        + f'<div style="background:{TRACK};border-radius:2px;height:2px;overflow:hidden;margin-bottom:10px;">'
+        + f'<div style="height:100%;width:{pct}%;background:{bar_bg};border-radius:2px;{bar_sh}{bar_ani}transition:width .6s ease;"></div>'
+        + f'</div>'
+        + f'<div style="display:flex;justify-content:space-between;">'
+        + f'<span style="font-size:9px;color:{MU};letter-spacing:1px;">{current} / {total} ASSETS</span>'
+        + f'<span style="font-size:9px;color:{h_col};font-weight:700;">{pct}%</span>'
+        + f'</div></div>'
+        + f'</div>'
+    )
+
+
 def _safe_join(value, sep=", "):
     if value is None:
         return ""
@@ -2426,15 +2591,35 @@ with tab_board:
                         it["ai"] = None
                         it["img_b64"] = ""
 
-                    pb = st.progress(0, text="선택 소재 캡처 중...")
+                    n = len(target_items)
+                    status = st.empty()
+
+                    # ── STEP 1: 캡처 ──
+                    status.markdown(
+                        _analysis_status_html("capture", 0, n, "Playwright로 광고 카드 전체 영역을 캡처합니다"),
+                        unsafe_allow_html=True,
+                    )
                     capture_screenshots_for_items(target_items, scrolls=scrolls)
                     captured = sum(1 for it in target_items if it.get("img_b64"))
-                    pb.progress(0.35, text=f"캡처 완료 {captured}/{len(target_items)}개 · Claude 분석 중...")
 
+                    # ── STEP 2/3: Claude 분석 ──
+                    status.markdown(
+                        _analysis_status_html(
+                            "analyze", captured, n,
+                            f"캡처 완료 {captured}개 · OCR + Vision 분석 병렬 실행 중",
+                        ),
+                        unsafe_allow_html=True,
+                    )
                     _, errors = analyze_parallel(target_items, max_workers=3, force=True)
                     done = sum(1 for it in target_items if it.get("ai") and not (it.get("ai") or {}).get("_error"))
-                    pb.progress(1.0, text=f"완료! 분석 성공 {done}개")
-                    pb.empty()
+
+                    # ── 완료 ──
+                    status.markdown(
+                        _analysis_status_html("done", done, n),
+                        unsafe_allow_html=True,
+                    )
+                    time.sleep(1.8)
+                    status.empty()
 
                     if errors:
                         with st.expander(f"⚠ 분석 오류 {len(errors)}건", expanded=False):
