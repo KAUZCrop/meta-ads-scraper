@@ -1124,21 +1124,11 @@ def _extract_ocr_with_claude(img_b64: str) -> dict:
     except Exception as ex:
         return {"texts": [], "raw": "", "_error": f"OCR 실패: {str(ex)[:200]}"}
 
-def _quality_score(ai_result: dict) -> int:
-    """분석 결과 품질 점수 (0-100). 확인 불가 개수 기반."""
-    if not ai_result or ai_result.get("_error"):
-        return 0
-    text = json.dumps(ai_result, ensure_ascii=False)
-    unknowns = text.count("확인 불가")
-    return max(0, 100 - unknowns * 12)
-
-
-def analyze(item, lenient: bool = False):
+def analyze(item):
     """
-    개선된 AI 분석 파이프라인:
-    1) OCR 추출 (1차 호출)
-    2) 비전 분석 (2차 호출) — 프롬프트는 lenient=True일 때 더 관대하게
-    3) 품질 점수가 낮으면 analyze_parallel에서 lenient=True로 재시도
+    근거 기반 광고 소재 분석.
+    철학: 보이는 것(OBSERVE) → 인용해서 해석(INTERPRET).
+    보이지 않으면 확인 불가. 추정·추론·가정 금지.
     """
     if not API_KEY:
         return {"_error": "API Key 없음"}
@@ -1147,114 +1137,109 @@ def analyze(item, lenient: bool = False):
         return {"_error": "스크린샷 확보 실패 — 선택 분석 버튼으로 재시도하세요."}
 
     capture_src = item.get("capture_source", "unknown")
-    has_card_context = "card" in capture_src  # 광고 카드 전체 캡처 여부
+    has_card = "card" in capture_src
 
     try:
         # ── 1차: OCR 추출 ──
         ocr_data     = _extract_ocr_with_claude(b64)
-        ocr_text     = _safe_join(ocr_data.get("texts", []),            " / ") or ""
-        brand_text   = _safe_join(ocr_data.get("brand_candidates", []), " / ") or ""
-        product_text = _safe_join(ocr_data.get("product_candidates",[]), " / ") or ""
-        price_text   = _safe_join(ocr_data.get("price_texts", []),      " / ") or ""
-        cta_text     = _safe_join(ocr_data.get("cta_texts", []),        " / ") or ""
+        ocr_texts    = ocr_data.get("texts", [])
+        brand_text   = _safe_join(ocr_data.get("brand_candidates", []), " / ")
+        product_text = _safe_join(ocr_data.get("product_candidates", []), " / ")
+        price_text   = _safe_join(ocr_data.get("price_texts", []), " / ")
+        cta_text     = _safe_join(ocr_data.get("cta_texts", []), " / ")
+        ocr_all      = _safe_join(ocr_texts, " / ")
 
-        card_notice = (
-            "이 캡처는 광고 카드 전체를 담고 있어 이미지 외에 텍스트 카피, CTA, 브랜드명도 포함될 수 있습니다."
-            if has_card_context else
-            "이 캡처는 광고 이미지 영역만 담고 있습니다. 보이는 비주얼 요소에 집중하세요."
+        card_note = (
+            "캡처 범위: 광고 카드 전체 (이미지 + 텍스트 카피 + CTA + 브랜드 영역 포함 가능)"
+            if has_card else
+            "캡처 범위: 광고 이미지 영역 단독"
         )
 
-        inference_rule = (
-            "시각적 단서가 있으면 적극적으로 추론해도 됩니다. 불확실할 때는 '추정: [근거]' 형식으로 쓰세요."
-            if lenient else
-            "명확한 시각적 근거가 있을 때만 단정하고, 불확실하면 '추정: [근거]' 형식으로 쓰세요."
-        )
+        prompt = f"""당신은 Meta 광고 소재 분석 전문가입니다.
+아래 두 단계를 순서대로 수행하세요.
 
-        prompt = f"""당신은 Meta 광고 소재 전문 분석가입니다.
-첨부된 이미지를 보고 광고 소재를 구조적으로 분석하세요.
-
-=== 분석 맥락 ===
+━━━ 분석 컨텍스트 ━━━
 검색 키워드: {item["keyword"]}
-캡처 방식: {capture_src}
-{card_notice}
+{card_note}
 
-=== OCR 추출 결과 (참고용) ===
-전체 문구: {ocr_text or "(텍스트 없음 또는 추출 실패)"}
+━━━ OCR 사전 추출 결과 ━━━
+(아래는 별도 OCR 모델이 이미지에서 추출한 텍스트입니다. 이미지와 대조하여 검증하세요.)
+전체 문구: {ocr_all or "(추출된 텍스트 없음)"}
 브랜드 후보: {brand_text or "(없음)"}
 제품명 후보: {product_text or "(없음)"}
 가격/할인: {price_text or "(없음)"}
 CTA: {cta_text or "(없음)"}
 
-=== 분석 지침 ===
-1. 이미지에 실제로 보이는 것을 최우선으로 기술하세요.
-2. {inference_rule}
-3. "확인 불가"는 정말 아무것도 파악이 안 될 때만 사용하세요. 최대 2~3개로 제한하세요.
-4. 광고 카피, 슬로건, 가격, 할인율, 브랜드명이 보이면 반드시 그대로 옮기세요.
-5. 비주얼 스타일, 색감, 레이아웃은 이미지에서 직접 관찰하여 기술하세요.
-6. 마케팅 분석은 보이는 요소에서 출발해 합리적으로 추론하세요.
-7. JSON 외 마크다운·백틱·설명문은 출력하지 마세요.
-8. 문자열 내 큰따옴표(")는 작은따옴표(')로 바꾸세요.
+━━━ STEP 1: OBSERVE — 관찰만 하세요 ━━━
+이미지에서 실제로 보이는 것만 기록합니다.
+규칙:
+- 텍스트: 이미지에서 눈으로 읽히는 문자를 그대로 옮기세요. 흐리거나 잘려서 읽을 수 없으면 기록하지 마세요.
+- 비주얼: "무엇처럼 보인다" 금지. "색상 X, 위치 Y, 크기 Z" 형태로 객관적으로 기술하세요.
+- 추측·추정·가정 완전 금지. 보이지 않으면 해당 필드를 빈 배열 또는 false로 두세요.
+- "확인 불가"는 정직한 답변입니다. 보이지 않는 것을 채우지 마세요.
 
-=== 레이아웃 유형 정의 ===
-- 제품 단독형: 제품 이미지가 주역, 텍스트 최소
-- 모델 사용형: 사람/모델이 제품 사용 또는 착용
-- Before-After형: 변화 전후 비교
-- 리뷰/UGC형: 실사용 후기, 별점, 댓글 스타일
-- 가격혜택형: 할인율·가격·프로모션이 전면에
-- 카드뉴스형: 여러 정보를 슬라이드/카드로 분할
-- 문제제기형: 타겟의 pain point를 질문·공감으로 시작
-- 기능설명형: 제품 스펙·기능을 시각적으로 나열
-- 브랜드필름형: 스토리텔링·감성·브랜드 세계관 중심
+━━━ STEP 2: INTERPRET — STEP 1 근거로만 해석하세요 ━━━
+규칙:
+- 모든 마케팅 해석은 반드시 STEP 1에서 확인된 요소를 evidence로 인용해야 합니다.
+- STEP 1에 없는 정보로 해석하면 안 됩니다.
+- 타겟 추정: 이미지에서 인물, 제품 카테고리, 텍스트 단서가 있을 때만 가능합니다.
+  단서가 없으면 "확인 불가"가 올바른 답입니다.
+- 후크/소구 판단: 이미지에서 관찰된 레이아웃과 텍스트를 근거로만 판단하세요.
+- 전환력 점수: 실제로 보이는 요소 기준으로 채점하세요. 없으면 1점, 강하면 5점.
 
-=== 반환 JSON 구조 ===
+━━━ 출력 규칙 ━━━
+- 순수 JSON만 반환. 마크다운·백틱·설명문 금지.
+- 문자열 내 큰따옴표(")는 작은따옴표(')로 교체.
+- json.loads()로 파싱 가능해야 합니다.
+
+━━━ JSON 구조 ━━━
 {{
-  "visual_facts": {{
-    "visible_text": ["이미지에서 보이는 실제 문구 — OCR 결과와 대조하여 정확하게"],
-    "main_subject": "이미지의 주요 피사체 또는 비주얼 (구체적으로)",
-    "supporting_elements": ["부차적 비주얼 요소들"],
-    "color_palette": ["주요 색상 — 색감과 분위기 포함"],
-    "layout_type": "위 정의 중 가장 가까운 유형",
-    "text_hierarchy": "헤드카피 → 서브카피 → CTA 순서로 정리 (있는 것만)",
-    "brand_name": "브랜드명 또는 추정",
-    "product_name": "제품명 또는 추정",
-    "price_info": "가격·할인 정보 또는 없음",
-    "cta_text": "CTA 문구 또는 없음",
-    "human_present": true,
-    "mood": "따뜻함/신뢰/활기/고급스러움/유머/긴박감 등 분위기"
+  "observe": {{
+    "text_exact": ["이미지에서 실제로 읽힌 문구를 그대로. 못 읽으면 빈 배열"],
+    "layout_description": "이미지 구성을 좌/우/상/하 위치 기준으로 객관적으로 기술",
+    "main_visual_description": "주요 피사체를 색상·형태·위치만으로 기술. 정체 추정 금지",
+    "supporting_visuals": ["부차적 요소들 — 색상·형태·위치만"],
+    "color_palette": ["배경색", "주요 요소 색상"],
+    "human_present": false,
+    "human_description": "사람이 있으면 외형만 기술. 없으면 null",
+    "price_text_exact": "가격·할인 텍스트 그대로. 없으면 null",
+    "cta_text_exact": "CTA 버튼·문구 그대로. 없으면 null",
+    "brand_text_exact": "브랜드명 텍스트 그대로. 없으면 null",
+    "layout_type": "제품단독형/모델사용형/Before-After형/리뷰UGC형/가격혜택형/카드뉴스형/문제제기형/기능설명형/브랜드필름형"
   }},
-  "marketing_analysis": {{
-    "hook_type": "가격강조/비주얼강조/문제제기/혜택강조/비교강조/후기강조/한정성강조/감성소구/권위소구 중 하나",
-    "primary_appeal": "주요 소구점 (가격/품질/편의/감성/사회적증명/희소성 등)",
-    "secondary_appeal": "부가 소구점 (없으면 없음)",
-    "target_audience": "추정 타겟 — 연령대, 관심사, 상황 포함하여 구체적으로",
-    "core_message": "이 광고가 전달하려는 핵심 메시지 한 문장",
-    "emotional_trigger": "어떤 감정이나 욕구를 자극하는지",
-    "evidence": "위 분석의 근거가 된 이미지 요소 2~3가지"
+  "interpret": {{
+    "hook_type": "observe에서 확인된 요소 기반. 근거 없으면 확인 불가",
+    "hook_evidence": "후크 판단의 근거 — observe 필드를 인용",
+    "primary_appeal": "observe에서 확인된 요소 기반. 근거 없으면 확인 불가",
+    "appeal_evidence": "소구 판단의 근거 — observe 필드를 인용",
+    "target_audience": "observe의 인물·제품·텍스트 단서 기반. 단서 없으면 확인 불가",
+    "target_evidence": "타겟 판단의 근거. 단서 없으면 null",
+    "core_message": "observe의 텍스트·비주얼 기반 메시지. 텍스트가 없으면 확인 불가",
+    "emotional_trigger": "observe 근거 있을 때만. 없으면 확인 불가"
   }},
-  "conversion_elements": {{
-    "price_emphasis": 3,
-    "product_visibility": 3,
-    "readability": 3,
-    "discount_visibility": 3,
-    "visual_clarity": 3,
-    "cta_strength": 3,
-    "overall_conversion_power": 3,
-    "score_rationale": "각 점수의 핵심 근거를 간단히"
+  "scores": {{
+    "price_emphasis": 1,
+    "product_visibility": 1,
+    "readability": 1,
+    "discount_visibility": 1,
+    "visual_clarity": 1,
+    "cta_strength": 1,
+    "overall_conversion_power": 1,
+    "score_rationale": "observe에서 확인된 요소 기준으로 채점 근거 기술"
   }},
-  "creative_diagnosis": {{
-    "strengths": ["강점 1", "강점 2"],
-    "weaknesses": ["약점 1", "약점 2"],
-    "missed_opportunity": "이 소재가 놓친 기회 한 가지",
-    "improvement_direction": "가장 임팩트 있는 개선 방향 한 문장"
+  "diagnosis": {{
+    "strengths": ["observe 근거 있는 강점만"],
+    "weaknesses": ["observe 근거 있는 약점만"],
+    "improvement_direction": "관찰된 약점 기반 개선 방향"
   }},
-  "tags": ["핵심태그1", "핵심태그2", "핵심태그3", "핵심태그4", "핵심태그5"]
+  "tags": ["관찰 근거 있는 태그만", "최대 5개"]
 }}
 
-점수 기준: 1=매우 약함 2=약함 3=보통 4=강함 5=매우 강함
-각 점수는 해당 소재의 실제 강도를 반영하세요. 모든 항목을 3으로 주지 마세요.
+점수: 1=없음/매우약함 2=약함 3=보통 4=강함 5=매우강함
+보이지 않는 요소는 1점입니다.
 """
 
-        content_payload = [
+        payload = [
             {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
             {"type": "text", "text": prompt},
         ]
@@ -1263,9 +1248,9 @@ CTA: {cta_text or "(없음)"}
             headers={"x-api-key": API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
             json={
                 "model": _anthropic_model("analysis"),
-                "max_tokens": 1600,
+                "max_tokens": 1800,
                 "temperature": 0,
-                "messages": [{"role": "user", "content": content_payload}],
+                "messages": [{"role": "user", "content": payload}],
             },
             timeout=60,
         )
@@ -1277,47 +1262,70 @@ CTA: {cta_text or "(없음)"}
         if parse_error:
             return {"_error": parse_error}
 
-        # 기존 normalize + sanitize
-        normalized = _normalize_ai_result_v2(parsed)
+        normalized = _normalize_observe_interpret(parsed)
         normalized = _sanitize_json_deep(normalized)
         normalized["ocr"] = _sanitize_json_deep(ocr_data)
-        normalized["_quality"] = _quality_score(normalized)
         return normalized
 
     except Exception as ex:
         return {"_error": str(ex)[:300]}
 
 
-def _normalize_ai_result_v2(data: dict) -> dict:
-    """v4.1 신규 JSON 구조를 UI 호환 필드로 정규화."""
+def _normalize_observe_interpret(data: dict) -> dict:
+    """
+    새 observe/interpret 구조를 UI 호환 top-level 필드로 매핑.
+    추정·fallback 없음 — 없으면 그냥 없는 것.
+    """
     if not isinstance(data, dict):
         return {"_error": "AI 응답이 JSON object가 아닙니다."}
 
-    vf = data.get("visual_facts") or {}
-    ma = data.get("marketing_analysis") or {}
-    ce = data.get("conversion_elements") or {}
-    cd = data.get("creative_diagnosis") or {}
+    ob = data.get("observe") or {}
+    ip = data.get("interpret") or {}
+    sc = data.get("scores") or {}
+    dg = data.get("diagnosis") or {}
 
-    # 구버전 UI 호환용 top-level 필드
-    data["copy"]        = _safe_join(vf.get("visible_text", []), " / ") or vf.get("text_hierarchy") or "—"
-    data["hook"]        = ma.get("hook_type") or "—"
-    data["appeal"]      = ma.get("primary_appeal") or "—"
-    data["tone"]        = _safe_join(vf.get("color_palette", [])) or vf.get("mood") or "—"
-    data["target"]      = ma.get("target_audience") or "—"
-    data["message"]     = ma.get("core_message") or "—"
-    data["evidence"]    = ma.get("evidence") or "—"
-    data["main_visual"] = vf.get("main_subject") or "—"
-    data["layout_type"] = vf.get("layout_type") or "—"
-    data["scores"]      = ce
+    data["copy"]        = _safe_join(ob.get("text_exact", []), " / ") or "확인 불가"
+    data["hook"]        = ip.get("hook_type") or "확인 불가"
+    data["appeal"]      = ip.get("primary_appeal") or "확인 불가"
+    data["tone"]        = _safe_join(ob.get("color_palette", [])) or "확인 불가"
+    data["target"]      = ip.get("target_audience") or "확인 불가"
+    data["message"]     = ip.get("core_message") or "확인 불가"
+    data["evidence"]    = ip.get("hook_evidence") or ip.get("appeal_evidence") or "확인 불가"
+    data["main_visual"] = ob.get("main_visual_description") or "확인 불가"
+    data["layout_type"] = ob.get("layout_type") or "확인 불가"
+    data["scores"]      = sc
 
-    # 태그가 없으면 생성
+    # visual_facts 호환
+    data["visual_facts"] = {
+        "visible_text":  ob.get("text_exact", []),
+        "layout_type":   ob.get("layout_type", "확인 불가"),
+        "ocr_text":      ob.get("text_exact", []),
+    }
+
+    # marketing_analysis 호환
+    data["marketing_analysis"] = {
+        "hook_type":    ip.get("hook_type", "확인 불가"),
+        "appeal_type":  [ip.get("primary_appeal", "확인 불가")],
+        "target":       ip.get("target_audience", "확인 불가"),
+        "message":      ip.get("core_message", "확인 불가"),
+        "evidence":     ip.get("hook_evidence", "확인 불가"),
+    }
+
+    # conversion_elements 호환
+    data["conversion_elements"] = {
+        **sc,
+        "score_reason": sc.get("score_rationale", ""),
+    }
+
+    # creative_diagnosis 호환
+    data["creative_diagnosis"] = {
+        "strengths":             dg.get("strengths", []),
+        "weaknesses":            dg.get("weaknesses", []),
+        "improvement_direction": dg.get("improvement_direction", "확인 불가"),
+    }
+
     if not data.get("tags"):
-        data["tags"] = [
-            x for x in [
-                ma.get("hook_type"), ma.get("primary_appeal"),
-                vf.get("layout_type"), vf.get("mood"),
-            ] if x and x not in ("—", "없음")
-        ][:5]
+        data["tags"] = []
 
     return data
 
@@ -1329,14 +1337,7 @@ def analyze_parallel(items, max_workers=6, force=False):
     errors = []
 
     def task(item):
-        result = analyze(item)
-        # 품질이 낮으면 lenient 모드로 1회 재시도
-        quality = result.get("_quality", 100) if not result.get("_error") else 0
-        if quality < 40 and not result.get("_error"):
-            retry = analyze(item, lenient=True)
-            if not retry.get("_error") and retry.get("_quality", 0) > quality:
-                result = retry
-        return item["id"], result
+        return item["id"], analyze(item)
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {
@@ -1353,8 +1354,6 @@ def analyze_parallel(items, max_workers=6, force=False):
                     db_set_field(aid, ai_json=json.dumps(result, ensure_ascii=False))
                     if result.get("_error"):
                         errors.append(f"[{id_map[aid]['keyword']}] {result['_error']}")
-                    elif result.get("_quality", 100) < 40:
-                        errors.append(f"[{id_map[aid]['keyword']}] 분석 품질 낮음 (score={result.get('_quality')})")
             except Exception as ex_inner:
                 err_msg = f"[{aid[:8]}] 분석 예외: {str(ex_inner)[:120]}"
                 errors.append(err_msg)
@@ -2449,38 +2448,62 @@ with tab_board:
                         cd = ai_data.get("creative_diagnosis") or {}
                         has_img = bool(db_get_img_b64(item["id"]))
 
-                        ocr_line = _safe_join((ai_data.get("ocr") or {}).get("texts", []), " / ")
-                        visible_text = _safe_join(vf.get("visible_text", []), " / ") or ocr_line or ai_data.get("copy", "—")
-                        objects  = _safe_join(vf.get("objects", [])) or ai_data.get("main_visual", "—")
-                        colors   = _safe_join(vf.get("colors", [])) or ai_data.get("tone", "—")
-                        strengths  = _safe_join((cd.get("strengths") or []))  or "—"
-                        weaknesses = _safe_join((cd.get("weaknesses") or [])) or "—"
+                        # 새 구조 (observe/interpret) 우선, 구버전 호환 fallback
+                        ob = ai_data.get("observe") or {}
+                        ip = ai_data.get("interpret") or {}
+
+                        visible_text = _safe_join(ob.get("text_exact", []), " / ") or _safe_join(vf.get("visible_text", []), " / ") or ai_data.get("copy", "—")
+                        main_visual  = ob.get("main_visual_description") or ai_data.get("main_visual", "—")
+                        layout       = ob.get("layout_type") or ai_data.get("layout_type", "—")
+                        colors_str   = _safe_join(ob.get("color_palette", [])) or _safe_join(vf.get("colors", [])) or "—"
+                        hook         = ip.get("hook_type") or ai_data.get("hook", "—")
+                        hook_ev      = ip.get("hook_evidence", "")
+                        appeal       = ip.get("primary_appeal") or ai_data.get("appeal", "—")
+                        appeal_ev    = ip.get("appeal_evidence", "")
+                        target       = ip.get("target_audience") or ai_data.get("target", "—")
+                        target_ev    = ip.get("target_evidence", "")
+                        message      = ip.get("core_message") or ai_data.get("message", "—")
+                        strengths    = _safe_join((cd.get("strengths") or []))  or "—"
+                        weaknesses   = _safe_join((cd.get("weaknesses") or [])) or "—"
+                        improve      = cd.get("improvement_direction") or dg.get("improvement_direction") if (dg := ai_data.get("diagnosis") or {}) else cd.get("improvement_direction") or "—"
+
                         score_line = (
                             f'가격 {ce.get("price_emphasis","—")} / '
                             f'제품 {ce.get("product_visibility","—")} / '
                             f'가독성 {ce.get("readability","—")} / '
                             f'전환력 {ce.get("overall_conversion_power","—")}'
                         )
-                        img_badge = (
-                            '<span class="bdg b-ai" style="font-size:8px">IMG분석</span> ' if has_img
-                            else '<span class="bdg" style="background:var(--bg3);color:var(--mu);font-size:8px">텍스트추정</span> '
+                        cap_src = item.get("capture_source", "")
+                        capture_badge = (
+                            '<span class="bdg b-ai" style="font-size:8px">카드캡처</span> ' if "card" in cap_src
+                            else '<span class="bdg b-vid" style="font-size:8px">이미지캡처</span> ' if has_img
+                            else '<span class="bdg" style="background:var(--bg3);color:var(--mu);font-size:8px">캡처실패</span> '
                         )
                         tags_str = "".join(f'<span class="ai-tag">{t}</span>' for t in ai_data.get("tags", []))
+
+                        def ev_span(ev):
+                            if not ev or ev == "확인 불가":
+                                return ""
+                            return f'<span style="font-size:10px;color:var(--mu);display:block;padding-left:4px;border-left:2px solid var(--bd2);margin:1px 0 4px 0">근거: {ev[:80]}</span>'
+
                         st.markdown(
                             '<div class="ai-wrap"><div class="ai-box">'
-                            f'<div class="ai-head">STRUCTURED CREATIVE ANALYSIS {img_badge}</div>'
+                            f'<div class="ai-head">OBSERVE → INTERPRET {capture_badge}</div>'
                             '<div class="ai-body">'
+                            '<span style="font-size:9px;color:var(--ac);letter-spacing:1px">OBSERVE</span><br>'
                             f'<b>실제문구</b>&nbsp;{visible_text}<br>'
-                            f'<b>비주얼</b>&nbsp;&nbsp;&nbsp;{objects}<br>'
-                            f'<b>레이아웃</b>&nbsp;{ai_data.get("layout_type", vf.get("layout_type","—"))}<br>'
-                            f'<b>후크</b>&nbsp;&nbsp;&nbsp;{ai_data.get("hook", ma.get("hook_type","—"))}<br>'
-                            f'<b>소구</b>&nbsp;&nbsp;&nbsp;{ai_data.get("appeal","—")}<br>'
-                            f'<b>타겟</b>&nbsp;&nbsp;&nbsp;{ai_data.get("target","—")}<br>'
-                            f'<b>메시지</b>&nbsp;{ai_data.get("message","—")}<br>'
+                            f'<b>비주얼</b>&nbsp;&nbsp;&nbsp;{main_visual}<br>'
+                            f'<b>레이아웃</b>&nbsp;{layout}<br>'
+                            f'<b>색감</b>&nbsp;&nbsp;&nbsp;&nbsp;{colors_str}<br>'
+                            '<span style="font-size:9px;color:var(--ac);letter-spacing:1px;margin-top:6px;display:block">INTERPRET (관찰 근거 기반)</span>'
+                            f'<b>후크</b>&nbsp;&nbsp;&nbsp;{hook}<br>{ev_span(hook_ev)}'
+                            f'<b>소구</b>&nbsp;&nbsp;&nbsp;{appeal}<br>{ev_span(appeal_ev)}'
+                            f'<b>타겟</b>&nbsp;&nbsp;&nbsp;{target}<br>{ev_span(target_ev)}'
+                            f'<b>메시지</b>&nbsp;{message}<br>'
                             f'<b>점수</b>&nbsp;&nbsp;&nbsp;{score_line}<br>'
                             f'<b>장점</b>&nbsp;&nbsp;&nbsp;{strengths}<br>'
                             f'<b>약점</b>&nbsp;&nbsp;&nbsp;{weaknesses}<br>'
-                            f'<b>개선</b>&nbsp;&nbsp;&nbsp;{cd.get("improvement_direction","—")}<br>'
+                            f'<b>개선</b>&nbsp;&nbsp;&nbsp;{improve}<br>'
                             f'<div style="margin-top:6px">{tags_str}</div>'
                             '</div></div></div>',
                             unsafe_allow_html=True)
