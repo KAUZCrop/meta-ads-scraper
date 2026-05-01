@@ -955,39 +955,129 @@ def _anthropic_model(role: str = "analysis") -> str:
         return "claude-sonnet-4-5-20250514"
     return "claude-haiku-4-5-20251001"
 
+# ============================================================
+# JSON 파싱 — 4단계 복구 파이프라인
+# ============================================================
+import re as _re
+
 def _extract_json_block(text: str) -> str | None:
+    """마크다운 제거 후 가장 바깥 JSON object 추출."""
     if not text:
         return None
-    txt = text.strip().replace("```json", "").replace("```", "").strip()
+    txt = text.strip()
+    # 마크다운 코드블록 제거
+    txt = _re.sub(r"```json\s*", "", txt)
+    txt = _re.sub(r"```\s*", "", txt)
+    txt = txt.strip()
     s = txt.find("{")
     e = txt.rfind("}") + 1
     if s == -1 or e <= 0 or e <= s:
         return None
     return txt[s:e]
 
+
+def _fix_unescaped_newlines(text: str) -> str:
+    """JSON string values에서 이스케이프되지 않은 줄바꿈을 공백으로 교체합니다."""
+    result = []
+    in_string = False
+    escape_next = False
+    bs = "\\"
+    dq = '"'
+    nl = "\n"
+    cr = "\r"
+    for ch in text:
+        if escape_next:
+            result.append(ch)
+            escape_next = False
+        elif ch == bs and in_string:
+            result.append(ch)
+            escape_next = True
+        elif ch == dq:
+            in_string = not in_string
+            result.append(ch)
+        elif ch in (nl, cr) and in_string:
+            result.append(" ")
+        else:
+            result.append(ch)
+    return "".join(result)
+
+
+def _fix_common_json_issues(text: str) -> str:
+    """후행 쉼표 제거 및 제어 문자 제거."""
+    text = "".join(ch for ch in text if ord(ch) >= 32 or ch in ("\t", "\n", "\r"))
+    text = _re.sub(r",(?=\s*[}\]])", "", text)
+    return text
+
+
+def _parse_ai_json(txt: str) -> tuple[dict | None, str | None]:
+    """
+    4단계 복구 파이프라인:
+    1. 직접 파싱
+    2. 줄바꿈 수정 후 파싱          ← 가장 흔한 실패 원인
+    3. 공통 오류 수정 후 파싱
+    4. Claude 복구 요청
+    """
+    raw_json = _extract_json_block(txt)
+    if not raw_json:
+        return None, f"JSON 블록을 찾을 수 없습니다. 응답 일부: {txt[:180]}"
+
+    # 단계 1: 직접 파싱
+    try:
+        return json.loads(raw_json), None
+    except json.JSONDecodeError:
+        pass
+
+    # 단계 2: 줄바꿈 수정
+    step2 = _fix_unescaped_newlines(raw_json)
+    try:
+        return json.loads(step2), None
+    except json.JSONDecodeError:
+        pass
+
+    # 단계 3: 공통 오류 수정 (줄바꿈 수정 위에 추가 적용)
+    step3 = _fix_common_json_issues(step2)
+    try:
+        return json.loads(step3), None
+    except json.JSONDecodeError as ex3:
+        last_err = ex3
+
+    # 단계 4: Claude 복구 (가장 정리된 버전 전달)
+    repaired = _repair_json_with_claude(step3)
+    if repaired is not None:
+        return repaired, None
+
+    return None, f"JSON 복구 실패 (4단계 모두 실패): {last_err}. 원문 일부: {raw_json[:300]}"
+
+
 def _repair_json_with_claude(raw_json: str) -> dict | None:
+    """Claude에게 JSON 문법만 복구 요청. 내용 변경 금지."""
     if not API_KEY or not raw_json:
         return None
     try:
-        repair_prompt = f"""
-아래 텍스트는 JSON 형식으로 작성된 광고 분석 결과입니다.
-내용은 바꾸지 말고 json.loads()로 파싱 가능한 순수 JSON으로만 고쳐서 반환하세요.
+        repair_prompt = f"""아래는 JSON 파싱에 실패한 광고 분석 결과입니다.
+내용(값)은 절대 바꾸지 말고, json.loads()로 파싱 가능한 순수 JSON 문법으로만 수정하세요.
 
-규칙:
-- 마크다운/백틱/설명문 금지
-- 누락된 쉼표, 따옴표, 괄호만 수정
-- 문자열 내부의 큰따옴표는 작은따옴표로 바꾸거나 제거
-- 기존 key 구조와 값의 의미는 유지
+수정 규칙:
+- 마크다운·백틱·설명문 출력 금지
+- 문자열 내 줄바꿈(실제 개행)은 공백 한 칸으로 교체
+- 문자열 내 큰따옴표(")는 작은따옴표(')로 교체
+- 후행 쉼표(,}} 또는 ,]) 제거
+- 누락된 쉼표·따옴표·괄호 복구
+- key 이름과 값의 의미 절대 변경 금지
 
 수정할 JSON:
-{raw_json}
+{raw_json[:3000]}
 """
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": _anthropic_model(), "max_tokens": 1200, "temperature": 0,
-                  "messages": [{"role": "user", "content": repair_prompt}]},
-            timeout=35,
+            json={
+                "model": _anthropic_model("repair"),
+                "max_tokens": 2000,
+                "temperature": 0,
+                "messages": [{"role": "user", "content": repair_prompt}],
+            },
+            timeout=40,
         )
         if resp.status_code != 200:
             return None
@@ -995,23 +1085,17 @@ def _repair_json_with_claude(raw_json: str) -> dict | None:
         fixed_json = _extract_json_block(fixed_txt)
         if not fixed_json:
             return None
-        return json.loads(fixed_json)
+        # 복구 결과에도 4단계 중 1~3 적용
+        for attempt in [fixed_json,
+                        _fix_unescaped_newlines(fixed_json),
+                        _fix_common_json_issues(_fix_unescaped_newlines(fixed_json))]:
+            try:
+                return json.loads(attempt)
+            except Exception:
+                continue
+        return None
     except Exception:
         return None
-
-def _parse_ai_json(txt: str) -> tuple[dict | None, str | None]:
-    raw_json = _extract_json_block(txt)
-    if not raw_json:
-        return None, f"Claude가 JSON이 아닌 응답을 반환했습니다. 응답: {txt[:180]}"
-    try:
-        return json.loads(raw_json), None
-    except json.JSONDecodeError as ex:
-        repaired = _repair_json_with_claude(raw_json)
-        if repaired is not None:
-            return repaired, None
-        return None, f"JSON 파싱 실패 및 자동 복구 실패: {ex}. 원문 일부: {raw_json[:220]}"
-    except Exception as ex:
-        return None, f"JSON 처리 실패: {ex}"
 
 def _safe_join(value, sep=", "):
     if value is None:
@@ -1187,9 +1271,12 @@ CTA: {cta_text or "(없음)"}
 - 후크/소구 판단: 이미지에서 관찰된 레이아웃과 텍스트를 근거로만 판단하세요.
 - 전환력 점수: 실제로 보이는 요소 기준으로 채점하세요. 없으면 1점, 강하면 5점.
 
-━━━ 출력 규칙 ━━━
-- 순수 JSON만 반환. 마크다운·백틱·설명문 금지.
-- 문자열 내 큰따옴표(")는 작은따옴표(')로 교체.
+━━━ JSON 출력 필수 규칙 ━━━
+- 순수 JSON만 반환. 마크다운·백틱·설명문 절대 금지.
+- 문자열 값 내부에 실제 줄바꿈(개행) 절대 금지 — 모든 텍스트는 한 줄로.
+- 문자열 값 내부의 큰따옴표(")는 반드시 작은따옴표(')로 교체.
+- 배열 요소 사이에 실제 줄바꿈 금지 — 쉼표로만 구분.
+- 마지막 요소 뒤 쉼표(trailing comma) 금지.
 - json.loads()로 파싱 가능해야 합니다.
 
 ━━━ JSON 구조 ━━━
