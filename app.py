@@ -1,7 +1,7 @@
 # ============================================================
-# AD INTEL v3.4 — Meta Ad Library Intelligence Board
+# AD INTEL v4.0 — Meta Ad Library Intelligence Board
 # ============================================================
-import sys, asyncio, subprocess, time, uuid, io, json, requests, base64
+import sys, asyncio, subprocess, time, uuid, io, json, requests, base64, sqlite3, random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
 from urllib.parse import quote, urlparse
@@ -22,16 +22,186 @@ def get_api_key():
         return ""
 
 API_KEY = get_api_key()
+DB_PATH = "adintel.db"
 
 st.set_page_config(page_title="AD INTEL", page_icon="◼", layout="wide")
 
-for k, v in {
-    "assets": [], "hidden": set(), "history": [],
-    "log": [], "ai_on": False, "dark": False,
-    "selected": set(), "summary": None,
-}.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+
+# ============================================================
+# DB 레이어 — SQLite 영속성
+# ============================================================
+def db_init():
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.executescript("""
+    CREATE TABLE IF NOT EXISTS assets (
+        id TEXT PRIMARY KEY,
+        keyword TEXT, country TEXT, asset_type TEXT,
+        image_url TEXT, source_url TEXT, caption TEXT,
+        width INTEGER, height INTEGER, created_at TEXT,
+        starred INTEGER DEFAULT 0,
+        capture_source TEXT DEFAULT '',
+        img_b64 TEXT DEFAULT '',
+        ai_json TEXT DEFAULT ''
+    );
+    CREATE TABLE IF NOT EXISTS hidden (id TEXT PRIMARY KEY);
+    CREATE TABLE IF NOT EXISTS history (keyword TEXT PRIMARY KEY, added_at TEXT);
+    CREATE TABLE IF NOT EXISTS summary_store (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        summary_json TEXT,
+        created_at TEXT
+    );
+    """)
+    con.commit()
+    con.close()
+
+def db_upsert_assets(assets: list):
+    if not assets:
+        return
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    for a in assets:
+        cur.execute("""
+        INSERT OR REPLACE INTO assets
+        (id,keyword,country,asset_type,image_url,source_url,caption,
+         width,height,created_at,starred,capture_source,img_b64,ai_json)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            a["id"], a["keyword"], a["country"], a["asset_type"],
+            a["image_url"], a["source_url"], a["caption"],
+            a["width"], a["height"], a["created_at"],
+            1 if a.get("starred") else 0,
+            a.get("capture_source", ""),
+            a.get("img_b64", ""),
+            json.dumps(a.get("ai"), ensure_ascii=False) if a.get("ai") else ""
+        ))
+    con.commit()
+    con.close()
+
+def db_load_assets() -> list:
+    """img_b64는 세션 메모리 절약을 위해 로드하지 않음. 분석 시 DB에서 직접 조회."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        SELECT id,keyword,country,asset_type,image_url,source_url,caption,
+               width,height,created_at,starred,capture_source,ai_json
+        FROM assets ORDER BY created_at DESC
+    """)
+    rows = cur.fetchall()
+    con.close()
+    out = []
+    for r in rows:
+        ai = None
+        if r[12]:
+            try:
+                ai = json.loads(r[12])
+            except Exception:
+                pass
+        out.append({
+            "id": r[0], "keyword": r[1], "country": r[2],
+            "asset_type": r[3], "image_url": r[4], "source_url": r[5],
+            "caption": r[6], "width": r[7], "height": r[8],
+            "created_at": r[9], "starred": bool(r[10]),
+            "capture_source": r[11],
+            "img_b64": "",   # 세션에는 비워둠
+            "ai": ai
+        })
+    return out
+
+def db_get_img_b64(aid: str) -> str:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT img_b64 FROM assets WHERE id=?", (aid,))
+    row = cur.fetchone()
+    con.close()
+    return (row[0] or "") if row else ""
+
+def db_set_field(aid: str, **kwargs):
+    """allowed 필드만 업데이트"""
+    allowed = {"starred", "img_b64", "ai_json", "capture_source"}
+    pairs = [(k, v) for k, v in kwargs.items() if k in allowed]
+    if not pairs:
+        return
+    sql = ", ".join(f"{k}=?" for k, _ in pairs)
+    vals = [v for _, v in pairs] + [aid]
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute(f"UPDATE assets SET {sql} WHERE id=?", vals)
+    con.commit()
+    con.close()
+
+def db_add_hidden(aid: str):
+    con = sqlite3.connect(DB_PATH)
+    con.execute("INSERT OR IGNORE INTO hidden VALUES (?)", (aid,))
+    con.commit()
+    con.close()
+
+def db_load_hidden() -> set:
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute("SELECT id FROM hidden").fetchall()
+    con.close()
+    return {r[0] for r in rows}
+
+def db_add_history(kw: str):
+    con = sqlite3.connect(DB_PATH)
+    con.execute("INSERT OR IGNORE INTO history VALUES (?,?)",
+                (kw, time.strftime("%Y-%m-%d %H:%M:%S")))
+    con.commit()
+    con.close()
+
+def db_load_history() -> list:
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute("SELECT keyword FROM history ORDER BY added_at").fetchall()
+    con.close()
+    return [r[0] for r in rows]
+
+def db_save_summary(s: dict):
+    con = sqlite3.connect(DB_PATH)
+    con.execute("DELETE FROM summary_store")
+    con.execute("INSERT INTO summary_store (summary_json,created_at) VALUES (?,?)",
+                (json.dumps(s, ensure_ascii=False), time.strftime("%Y-%m-%d %H:%M:%S")))
+    con.commit()
+    con.close()
+
+def db_load_summary() -> dict | None:
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute("SELECT summary_json FROM summary_store ORDER BY id DESC LIMIT 1").fetchone()
+    con.close()
+    if row:
+        try:
+            return json.loads(row[0])
+        except Exception:
+            return None
+    return None
+
+def db_reset():
+    con = sqlite3.connect(DB_PATH)
+    con.executescript("""
+        DELETE FROM assets;
+        DELETE FROM hidden;
+        DELETE FROM history;
+        DELETE FROM summary_store;
+    """)
+    con.commit()
+    con.close()
+
+db_init()
+
+
+# ============================================================
+# 세션 상태 초기화 — DB에서 로드
+# ============================================================
+if "initialized" not in st.session_state:
+    st.session_state.assets   = db_load_assets()
+    st.session_state.hidden   = db_load_hidden()
+    st.session_state.history  = db_load_history()
+    st.session_state.log      = []
+    st.session_state.ai_on    = False
+    st.session_state.dark     = False
+    st.session_state.selected = set()
+    st.session_state.summary  = db_load_summary()
+    st.session_state.initialized = True
+
 
 # ============================================================
 # CSS
@@ -93,7 +263,7 @@ html,body,[class*="css"]{{font-family:'Pretendard',sans-serif;background:var(--b
 .sc-sub{{font-size:11px;color:var(--mu);margin-top:8px;}}
 
 .tags{{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:1.2rem;}}
-.tag{{font-size:11px;background:var(--ac2);border:1px solid var(--ac2);color:var(--ac);padding:4px 10px;border-radius:20px;display:inline-flex;align-items:center;gap:6px;}}
+.tag{{font-size:11px;background:var(--ac2);border:1px solid var(--ac2);color:var(--ac);padding:4px 10px;border-radius:20px;display:inline-flex;align-items:center;gap:6px;cursor:pointer;}}
 .tag-dot{{width:5px;height:5px;border-radius:50%;background:var(--ok);}}
 
 .sec{{display:flex;align-items:center;justify-content:space-between;margin-bottom:.8rem;padding-bottom:10px;border-bottom:1.5px solid var(--bd);}}
@@ -140,6 +310,8 @@ html,body,[class*="css"]{{font-family:'Pretendard',sans-serif;background:var(--b
 .dot-on{{background:var(--ok);box-shadow:0 0 6px var(--ok);}}
 .banner-txt{{font-size:11px;color:var(--tx2);}}
 
+.err-box{{background:rgba(232,40,74,.06);border:1px solid rgba(232,40,74,.2);border-radius:10px;padding:10px 14px;margin-bottom:8px;font-size:11px;color:var(--er);}}
+
 .empty{{text-align:center;padding:80px 20px;}}
 .empty-t{{font-family:'Pretendard',sans-serif;font-size:16px;font-weight:700;color:var(--mu);margin-bottom:8px;}}
 .empty-d{{font-size:13px;color:var(--mu);line-height:1.6;}}
@@ -149,31 +321,20 @@ html,body,[class*="css"]{{font-family:'Pretendard',sans-serif;background:var(--b
 .log .ok{{color:var(--ok);}}
 .log .er{{color:var(--er);}}
 
-/* 버튼 — white-space:nowrap 으로 줄바꿈 방지 */
+.persist-badge{{display:inline-flex;align-items:center;gap:5px;font-size:10px;color:var(--ok);background:rgba(0,168,107,.08);border:1px solid rgba(0,168,107,.2);border-radius:6px;padding:3px 8px;}}
+
 .stButton>button{{
-    font-family:'Pretendard',sans-serif!important;
-    font-size:13px!important;
-    font-weight:600!important;
-    border-radius:8px!important;
-    border:1.5px solid var(--bd2)!important;
-    background:var(--bg)!important;
-    color:var(--tx2)!important;
-    height:34px!important;
-    transition:.15s!important;
-    white-space:nowrap!important;
-    overflow:hidden!important;
-    padding:0 8px!important;
-    line-height:34px!important;
+    font-family:'Pretendard',sans-serif!important;font-size:13px!important;font-weight:600!important;
+    border-radius:8px!important;border:1.5px solid var(--bd2)!important;
+    background:var(--bg)!important;color:var(--tx2)!important;height:34px!important;
+    transition:.15s!important;white-space:nowrap!important;overflow:hidden!important;
+    padding:0 8px!important;line-height:34px!important;
 }}
 .stButton>button:hover{{border-color:var(--ac)!important;color:var(--ac)!important;background:var(--ac2)!important;}}
 .stDownloadButton>button{{
-    font-family:'Pretendard',sans-serif!important;
-    font-size:12px!important;
-    border-radius:8px!important;
-    border:1.5px solid var(--bd2)!important;
-    background:var(--bg)!important;
-    color:var(--tx2)!important;
-    white-space:nowrap!important;
+    font-family:'Pretendard',sans-serif!important;font-size:12px!important;
+    border-radius:8px!important;border:1.5px solid var(--bd2)!important;
+    background:var(--bg)!important;color:var(--tx2)!important;white-space:nowrap!important;
 }}
 
 .stTextInput input{{background:var(--bg)!important;border:1.5px solid var(--bd2)!important;border-radius:10px!important;color:var(--tx)!important;font-family:'Pretendard',sans-serif!important;}}
@@ -192,11 +353,12 @@ a{{color:var(--ac)!important;}}
 ::-webkit-scrollbar-track{{background:var(--bg2);}}
 ::-webkit-scrollbar-thumb{{background:var(--bd2);border-radius:4px;}}
 .stSpinner>div{{border-top-color:var(--ac)!important;}}
+[data-testid="stTabs"]{{border-bottom:2px solid var(--bd);}}
 </style>""", unsafe_allow_html=True)
 
 
 # ============================================================
-# 스크래퍼 — 빠른 목록 수집 + 선택 소재만 스크린샷 확보
+# 스크래퍼
 # ============================================================
 def valid(w, h):
     if w < 180 or h < 180:
@@ -221,7 +383,6 @@ def _bytes_to_b64(img_bytes: bytes | None) -> str:
     return base64.b64encode(img_bytes).decode("utf-8")
 
 def _close_modal(page):
-    """Meta 모달을 닫기 위한 안전 처리"""
     try:
         page.keyboard.press("Escape")
         page.wait_for_timeout(300)
@@ -229,7 +390,6 @@ def _close_modal(page):
         pass
 
 def _is_valid_screenshot(img_bytes: bytes | None) -> bool:
-    """완전 공백/너무 작은 캡처를 1차로 걸러냅니다."""
     if not img_bytes or len(img_bytes) < 3000:
         return False
     try:
@@ -239,16 +399,17 @@ def _is_valid_screenshot(img_bytes: bytes | None) -> bool:
         if w < 120 or h < 120:
             return False
         stat = ImageStat.Stat(im.resize((32, 32)))
-        # RGB 표준편차가 너무 낮으면 거의 단색/공백으로 판단
         if max(stat.stddev) < 3:
             return False
         return True
     except Exception:
-        # PIL이 없으면 사이즈 체크만 통과시킴
         return True
 
+def _url_key(url: str) -> str:
+    p = urlparse((url or "").strip())
+    return f"{p.netloc}{p.path}"
+
 def _find_media_handle_by_url(page, target_url: str, asset_type: str = "image"):
-    """DOM index가 아니라 URL path 기준으로 실제 렌더링된 img/video element를 찾습니다."""
     target_key = _url_key(target_url)
     try:
         handle = page.evaluate_handle("""({targetKey, assetType}) => {
@@ -272,23 +433,14 @@ def _find_media_handle_by_url(page, target_url: str, asset_type: str = "image"):
         return None
 
 def _capture_media_by_url_b64(page, target_url: str, asset_type: str = "image") -> tuple[str, str]:
-    """
-    선택 소재만 URL path 기준으로 다시 찾아 캡처합니다.
-    1순위: 클릭 후 열린 모달(dialog) screenshot
-    2순위: 실제 이미지/비디오 요소 screenshot
-    파일 저장 없음. 메모리에서 바로 base64 처리.
-    """
     element = _find_media_handle_by_url(page, target_url, asset_type)
     if not element:
         return "", "element_not_found"
-
     try:
         element.scroll_into_view_if_needed(timeout=7000)
         page.wait_for_timeout(700)
     except Exception:
         pass
-
-    # 1) 모달 열기 후 dialog 캡처
     try:
         element.click(timeout=5000, force=True)
         page.wait_for_timeout(1600)
@@ -300,8 +452,6 @@ def _capture_media_by_url_b64(page, target_url: str, asset_type: str = "image") 
                 return _bytes_to_b64(shot), "modal_screenshot"
     except Exception:
         _close_modal(page)
-
-    # 2) fallback: 요소 자체 캡처
     try:
         element = _find_media_handle_by_url(page, target_url, asset_type) or element
         element.scroll_into_view_if_needed(timeout=7000)
@@ -311,15 +461,9 @@ def _capture_media_by_url_b64(page, target_url: str, asset_type: str = "image") 
             return _bytes_to_b64(shot), "element_screenshot"
     except Exception:
         pass
-
     return "", "blank_or_capture_failed"
 
 def scrape(keyword, country, scrolls, limit):
-    """
-    검색 단계에서는 빠르게 소재 후보만 수집합니다.
-    모달 클릭/스크린샷은 하지 않습니다.
-    선택 분석 버튼을 눌렀을 때 선택 소재만 다시 열어 캡처합니다.
-    """
     ensure_browser()
     search_url = (
         "https://www.facebook.com/ads/library/"
@@ -331,11 +475,20 @@ def scrape(keyword, country, scrolls, limit):
             "--disable-plugins", "--disable-background-networking",
             "--no-first-run", "--disable-default-apps",
         ])
-        ctx = browser.new_context(viewport={"width": 1440, "height": 2000})
+        ctx = browser.new_context(
+            viewport={"width": 1440, "height": 2000},
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            locale="ko-KR",
+        )
         ctx.route("**/*.{woff,woff2,ttf,otf,eot}", lambda r: r.abort())
         page = ctx.new_page()
         page.goto(search_url, wait_until="domcontentloaded", timeout=90000)
-        page.wait_for_timeout(3500)
+        # 랜덤 딜레이로 봇 탐지 회피
+        page.wait_for_timeout(3000 + random.randint(500, 1500))
 
         def card_count():
             return page.evaluate("""() => {
@@ -354,11 +507,11 @@ def scrape(keyword, country, scrolls, limit):
 
         prev, stalls = 0, 0
         for _ in range(scrolls):
-            page.mouse.wheel(0, 3200)
+            page.mouse.wheel(0, random.randint(2800, 3600))
             waited = 0
             while waited < 2500:
-                page.wait_for_timeout(300)
-                waited += 300
+                page.wait_for_timeout(random.randint(250, 400))
+                waited += 350
                 cur = card_count()
                 if cur > prev:
                     prev = cur
@@ -407,7 +560,6 @@ def scrape(keyword, country, scrolls, limit):
         w, h = int(r.get("w") or 0), int(r.get("h") or 0)
         if not src or not valid(w, h):
             continue
-
         asset_type = r.get("type", "image")
         asset = {
             "id":             str(uuid.uuid4()),
@@ -434,15 +586,10 @@ def scrape(keyword, country, scrolls, limit):
     return collected
 
 
-def _url_key(url: str) -> str:
-    p = urlparse((url or "").strip())
-    return f"{p.netloc}{p.path}"
-
-
 def capture_screenshots_for_items(items, scrolls=8):
+    """선택된 소재만 캡처. 완료 후 DB에 img_b64 저장."""
     if not items:
         return items
-
     ensure_browser()
     groups = {}
     for item in items:
@@ -452,11 +599,18 @@ def capture_screenshots_for_items(items, scrolls=8):
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=[
-            "--no-sandbox", "--disable-dev-shm-usage", "--disable-extensions",
-            "--disable-plugins", "--disable-background-networking",
+            "--no-sandbox", "--disable-dev-shm-usage",
+            "--disable-extensions", "--disable-plugins",
             "--no-first-run", "--disable-default-apps",
         ])
-        ctx = browser.new_context(viewport={"width": 1440, "height": 2000})
+        ctx = browser.new_context(
+            viewport={"width": 1440, "height": 2000},
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+        )
         ctx.route("**/*.{woff,woff2,ttf,otf,eot}", lambda r: r.abort())
 
         for source_url, group_items in groups.items():
@@ -464,14 +618,12 @@ def capture_screenshots_for_items(items, scrolls=8):
                 for item in group_items:
                     item["capture_source"] = "missing_source_url"
                 continue
-
             page = ctx.new_page()
             try:
                 page.goto(source_url, wait_until="domcontentloaded", timeout=90000)
                 page.wait_for_timeout(3500)
                 target_keys = {_url_key(item.get("image_url")) for item in group_items}
                 matched = {}
-
                 for _ in range(max(3, int(scrolls))):
                     raw = page.evaluate("""() => {
                         const out = [];
@@ -509,7 +661,10 @@ def capture_screenshots_for_items(items, scrolls=8):
                         "image" if asset_type == "image" else "video_poster",
                     )
                     item["img_b64"] = img_b64
-                    item["capture_source"] = capture_source if img_b64 else capture_source
+                    item["capture_source"] = capture_source
+                    # 캡처 완료 즉시 DB에 저장
+                    if img_b64:
+                        db_set_field(item["id"], img_b64=img_b64, capture_source=capture_source)
             except Exception as ex:
                 for item in group_items:
                     if not item.get("img_b64"):
@@ -525,6 +680,7 @@ def capture_screenshots_for_items(items, scrolls=8):
 
     return items
 
+
 # ============================================================
 # AI 분석
 # ============================================================
@@ -535,7 +691,6 @@ def _anthropic_model() -> str:
         return "claude-haiku-4-5-20251001"
 
 def _extract_json_block(text: str) -> str | None:
-    """Claude 응답에서 가장 바깥 JSON object만 추출"""
     if not text:
         return None
     txt = text.strip().replace("```json", "").replace("```", "").strip()
@@ -545,9 +700,7 @@ def _extract_json_block(text: str) -> str | None:
         return None
     return txt[s:e]
 
-
 def _repair_json_with_claude(raw_json: str) -> dict | None:
-    """JSON 파싱 실패 시 Claude에게 문법만 복구시킴"""
     if not API_KEY or not raw_json:
         return None
     try:
@@ -559,7 +712,6 @@ def _repair_json_with_claude(raw_json: str) -> dict | None:
 - 마크다운/백틱/설명문 금지
 - 누락된 쉼표, 따옴표, 괄호만 수정
 - 문자열 내부의 큰따옴표는 작은따옴표로 바꾸거나 제거
-- 줄바꿈, 특수문자, >>, [SET] 등으로 JSON이 깨지지 않게 처리
 - 기존 key 구조와 값의 의미는 유지
 
 수정할 JSON:
@@ -567,17 +719,9 @@ def _repair_json_with_claude(raw_json: str) -> dict | None:
 """
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": _anthropic_model(),
-                "max_tokens": 1200,
-                "temperature": 0,
-                "messages": [{"role": "user", "content": repair_prompt}],
-            },
+            headers={"x-api-key": API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": _anthropic_model(), "max_tokens": 1200, "temperature": 0,
+                  "messages": [{"role": "user", "content": repair_prompt}]},
             timeout=35,
         )
         if resp.status_code != 200:
@@ -590,9 +734,7 @@ def _repair_json_with_claude(raw_json: str) -> dict | None:
     except Exception:
         return None
 
-
 def _parse_ai_json(txt: str) -> tuple[dict | None, str | None]:
-    """AI 응답 JSON 파싱. 실패하면 1회 자동 복구"""
     raw_json = _extract_json_block(txt)
     if not raw_json:
         return None, f"Claude가 JSON이 아닌 응답을 반환했습니다. 응답: {txt[:180]}"
@@ -606,9 +748,7 @@ def _parse_ai_json(txt: str) -> tuple[dict | None, str | None]:
     except Exception as ex:
         return None, f"JSON 처리 실패: {ex}"
 
-
 def _safe_join(value, sep=", "):
-    """list/dict/string 값을 UI에 안전하게 표시하기 위한 간단 변환"""
     if value is None:
         return ""
     if isinstance(value, list):
@@ -617,21 +757,16 @@ def _safe_join(value, sep=", "):
         return sep.join(f"{k}: {v}" for k, v in value.items())
     return str(value)
 
-
 def _normalize_ai_result(data: dict) -> dict:
-    """신규 구조형 JSON을 기존 UI/PPT에서도 깨지지 않게 top-level 필드로 보강"""
     if not isinstance(data, dict):
         return {"_error": "AI 응답이 JSON object가 아닙니다."}
-
     vf = data.get("visual_facts") or {}
     ma = data.get("marketing_analysis") or {}
     scores = data.get("conversion_elements") or {}
-
     visible_text = vf.get("visible_text", data.get("copy", ""))
     objects = vf.get("objects", [])
     colors = vf.get("colors", [])
     appeal_type = ma.get("appeal_type", data.get("appeal", ""))
-
     data["copy"] = data.get("copy") or _safe_join(visible_text, " / ") or "확인 불가"
     data["hook"] = data.get("hook") or ma.get("hook_type") or "확인 불가"
     data["appeal"] = data.get("appeal") or _safe_join(appeal_type) or "확인 불가"
@@ -642,7 +777,6 @@ def _normalize_ai_result(data: dict) -> dict:
     data["main_visual"] = data.get("main_visual") or _safe_join(objects) or vf.get("product_focus") or "확인 불가"
     data["layout_type"] = data.get("layout_type") or vf.get("layout_type") or "확인 불가"
     data["scores"] = scores
-
     tags = data.get("tags") or []
     if not tags:
         base_tags = []
@@ -652,36 +786,24 @@ def _normalize_ai_result(data: dict) -> dict:
             elif v:
                 base_tags.append(str(v))
         data["tags"] = base_tags[:5]
-
     return data
 
-
 def _force_sanitize_text(text: str) -> str:
-    """동물/객체명 임의 추론 표현을 무조건 제거.
-    OCR이 잘못 읽어 금지어가 들어가도 최종 화면에는 남기지 않는다.
-    """
     if not isinstance(text, str):
         return text
     replacements = [
-        ("곰모양", "브라운 컬러의 둥근 형태"),
-        ("곰 모양", "브라운 컬러의 둥근 형태"),
-        ("곰 캐릭터", "브라운 컬러의 둥근 형태 비주얼"),
-        ("곰", "브라운 컬러의 둥근 형태"),
-        ("동물 캐릭터", "형태 비주얼"),
-        ("캐릭터 동물", "형태 비주얼"),
-        ("동물", "형태 비주얼"),
-        ("토끼", "형태 비주얼"),
-        ("강아지", "형태 비주얼"),
-        ("고양이", "형태 비주얼"),
+        ("곰모양", "브라운 컬러의 둥근 형태"), ("곰 모양", "브라운 컬러의 둥근 형태"),
+        ("곰 캐릭터", "브라운 컬러의 둥근 형태 비주얼"), ("곰", "브라운 컬러의 둥근 형태"),
+        ("동물 캐릭터", "형태 비주얼"), ("캐릭터 동물", "형태 비주얼"),
+        ("동물", "형태 비주얼"), ("토끼", "형태 비주얼"),
+        ("강아지", "형태 비주얼"), ("고양이", "형태 비주얼"),
     ]
     out = text
     for bad, repl in replacements:
         out = out.replace(bad, repl)
     return out
 
-
 def _sanitize_json_deep(value):
-    """OCR 결과와 최종 분석 결과 전체를 재귀적으로 보정."""
     if isinstance(value, dict):
         return {k: _sanitize_json_deep(v) for k, v in value.items()}
     if isinstance(value, list):
@@ -690,58 +812,31 @@ def _sanitize_json_deep(value):
         return _force_sanitize_text(value)
     return value
 
-
-def _sanitize_no_object_inference(value, ocr_data=None):
-    """하위 호환용 래퍼. OCR 포함 여부와 무관하게 금지 표현 제거."""
-    return _sanitize_json_deep(value)
-
-
 def _extract_ocr_with_claude(img_b64: str) -> dict:
-    """Claude Vision을 OCR 전용으로 1차 호출. 광고 해석 없이 실제 문구만 추출."""
     if not API_KEY or not img_b64:
         return {"texts": [], "raw": "", "_error": "OCR 입력 이미지 없음"}
     try:
         ocr_prompt = """
 당신은 광고 이미지 OCR 추출기입니다.
-광고 분석, 해석, 추정은 절대 하지 마세요.
 이미지 안에 실제로 보이는 글자만 최대한 그대로 추출하세요.
-
 규칙:
-- 보이는 텍스트만 추출
-- 글자가 불확실하면 "확인 불가"로 작성
-- 캐릭터/동물/제품 모양 해석 금지
-- 브랜드명, 제품명, 가격, 할인율, CTA 문구를 우선 추출
-- 줄 단위로 분리
+- 보이는 텍스트만 추출, 해석 금지
+- 글자가 불확실하면 "확인 불가"
 - JSON 외 설명문/마크다운/백틱 금지
 - 반드시 json.loads() 가능한 순수 JSON만 반환
 
 반환 형식:
-{
-  "texts": ["이미지 안 실제 문구1", "이미지 안 실제 문구2"],
-  "brand_candidates": ["보이는 브랜드명"],
-  "product_candidates": ["보이는 제품명"],
-  "price_texts": ["가격/할인 관련 문구"],
-  "cta_texts": ["CTA 문구"]
-}
+{"texts":["이미지 안 실제 문구1","이미지 안 실제 문구2"],"brand_candidates":["보이는 브랜드명"],"product_candidates":["보이는 제품명"],"price_texts":["가격/할인 관련 문구"],"cta_texts":["CTA 문구"]}
 """
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
+            headers={"x-api-key": API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
             json={
-                "model": _anthropic_model(),
-                "max_tokens": 700,
-                "temperature": 0,
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
-                        {"type": "text", "text": ocr_prompt},
-                    ],
-                }],
+                "model": _anthropic_model(), "max_tokens": 700, "temperature": 0,
+                "messages": [{"role": "user", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+                    {"type": "text", "text": ocr_prompt},
+                ]}],
             },
             timeout=45,
         )
@@ -760,51 +855,36 @@ def _extract_ocr_with_claude(img_b64: str) -> dict:
             elif not isinstance(v, list):
                 parsed[k] = []
         parsed["raw"] = txt
-        parsed = _sanitize_json_deep(parsed)
-        return parsed
+        return _sanitize_json_deep(parsed)
     except Exception as ex:
         return {"texts": [], "raw": "", "_error": f"OCR 실패: {str(ex)[:200]}"}
 
 def analyze(item):
-    """모달/요소 스크린샷 base64가 있을 때만 Claude Vision 분석. 추정 fallback 없음."""
     if not API_KEY:
         return {"_error": "API Key 없음"}
-
-    b64 = item.get("img_b64", "")
+    b64 = item.get("img_b64", "") or db_get_img_b64(item["id"])
     if not b64:
-        return {"_error": "모달/요소 스크린샷 확보 실패: 실제 이미지 payload가 없어 분석하지 않았습니다."}
-
+        return {"_error": "스크린샷 확보 실패 — 선택 분석 버튼으로 재시도하세요."}
     try:
         ocr_data = _extract_ocr_with_claude(b64)
-        ocr_text = _safe_join(ocr_data.get("texts", []), " / ") or "확인 불가"
-        brand_text = _safe_join(ocr_data.get("brand_candidates", []), " / ") or "확인 불가"
-        product_text = _safe_join(ocr_data.get("product_candidates", []), " / ") or "확인 불가"
-        price_text = _safe_join(ocr_data.get("price_texts", []), " / ") or "확인 불가"
-        cta_text = _safe_join(ocr_data.get("cta_texts", []), " / ") or "확인 불가"
+        ocr_text    = _safe_join(ocr_data.get("texts", []),            " / ") or "확인 불가"
+        brand_text  = _safe_join(ocr_data.get("brand_candidates", []), " / ") or "확인 불가"
+        product_text= _safe_join(ocr_data.get("product_candidates",[])," / ") or "확인 불가"
+        price_text  = _safe_join(ocr_data.get("price_texts", []),      " / ") or "확인 불가"
+        cta_text    = _safe_join(ocr_data.get("cta_texts", []),        " / ") or "확인 불가"
 
         prompt = f"""
 당신은 광고 소재 리서치 분석가입니다.
 첨부 이미지는 Meta 광고 라이브러리에서 캡처한 실제 광고 소재 화면입니다.
 
 중요 원칙:
-- 절대 추상적 해석부터 하지 마세요.
-- 반드시 이미지에서 실제로 보이는 요소를 먼저 객관적으로 추출하세요.
-- 이미지에 없는 정보는 추정하지 말고 "확인 불가"라고 작성하세요.
-- OCR 결과에 있는 브랜드명/제품명/가격/CTA를 최우선 근거로 사용하세요.
-- 캐릭터/동물/사물의 종류를 임의로 일반화하지 마세요.
-- 금지어: "곰", "동물", "토끼", "강아지", "고양이", "캐릭터 동물", "곰모양". 어떤 경우에도 최종 JSON에 쓰지 마세요.
-- OCR 결과에 금지어가 포함되어 있어도 OCR 오인식으로 간주하고 쓰지 마세요.
-- 형태가 동물처럼 보여도 "동물"이라고 부르지 말고, "브라운 컬러의 둥근 제품 연출", "브라운 톤 제품/패키지 비주얼"처럼 색상/형태/배치만 쓰세요.
-- 브랜드/제품 텍스트가 보이면 형태 추정보다 제품명 텍스트를 우선하세요.
-- 갈색 둥근 형태처럼 보이면 "브라운 컬러의 둥근 형태 비주얼"처럼 형태 그대로만 쓰세요.
-- 제품명 또는 OCR에 특정 명칭이 보이면 그 명칭을 그대로 사용하세요.
-- "귀여운", "감성적", "프리미엄" 같은 표현은 이미지 근거가 있을 때만 사용하세요.
-- 모든 분석은 visual_facts에 적은 요소를 근거로 해야 합니다.
+- 이미지에서 실제로 보이는 요소를 먼저 객관적으로 추출하세요.
+- 이미지에 없는 정보는 추정하지 말고 "확인 불가"로 작성하세요.
+- OCR 결과의 브랜드명/제품명/가격/CTA를 최우선 근거로 사용하세요.
+- 금지어: "곰", "동물", "토끼", "강아지", "고양이". 절대 쓰지 마세요.
 - JSON 외 마크다운, 설명문, 백틱은 절대 출력하지 마세요.
 - 반드시 json.loads()로 파싱 가능한 순수 JSON만 반환하세요.
 - 문자열 안의 큰따옴표(")는 작은따옴표(')로 바꾸거나 제거하세요.
-- 이미지 문구에 [SET], >>, %, 원, /, 줄바꿈이 있어도 JSON 문자열이 깨지지 않게 작성하세요.
-- 배열 값에는 실제 문구를 문자열로만 넣고, 객체나 주석을 섞지 마세요.
 
 검색 키워드: {item['keyword']}
 캡처 방식: {item.get('capture_source', 'unknown')}
@@ -815,12 +895,6 @@ def analyze(item):
 - 제품명 후보: {product_text}
 - 가격/할인 문구: {price_text}
 - CTA 문구: {cta_text}
-
-분석 제한 규칙:
-- visible_text는 위 OCR 결과와 이미지에서 실제 확인되는 문구만 사용하세요.
-- objects에는 동물명/캐릭터명/사물명을 추정해서 쓰지 말고, 색상·형태·위치만 기술하세요. 예: "브라운 컬러의 둥근 형태 비주얼", "노란색 원형 쿠션 제품", "하단 제품 컷 3개"
-- OCR에 제품명이 있으면 objects와 message에서 해당 제품명을 우선 사용하세요.
-- OCR과 이미지가 충돌하면 OCR 텍스트를 우선하되, 불확실하면 "확인 불가"라고 쓰세요.
 
 반드시 아래 JSON 구조로만 반환하세요:
 {{
@@ -860,40 +934,28 @@ def analyze(item):
   "tags": ["태그1", "태그2", "태그3"]
 }}
 
-점수 기준:
-1 = 매우 약함, 2 = 약함, 3 = 보통, 4 = 강함, 5 = 매우 강함
+점수 기준: 1=매우 약함, 2=약함, 3=보통, 4=강함, 5=매우 강함
 """
         content = [
             {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
             {"type": "text", "text": prompt},
         ]
-
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key":         API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type":      "application/json",
-            },
-            json={
-                "model": _anthropic_model(),
-                "max_tokens": 1200,
-                "temperature": 0,
-                "messages": [{"role": "user", "content": content}],
-            },
+            headers={"x-api-key": API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": _anthropic_model(), "max_tokens": 1200, "temperature": 0,
+                  "messages": [{"role": "user", "content": content}]},
             timeout=50,
         )
         if resp.status_code != 200:
             return {"_error": f"API {resp.status_code}: {resp.text[:300]}"}
-
         txt = resp.json()["content"][0]["text"].strip()
         parsed, parse_error = _parse_ai_json(txt)
         if parse_error:
             return {"_error": parse_error}
-        ocr_data = _sanitize_json_deep(ocr_data)
         normalized = _normalize_ai_result(parsed)
         normalized = _sanitize_json_deep(normalized)
-        normalized["ocr"] = ocr_data
+        normalized["ocr"] = _sanitize_json_deep(ocr_data)
         if isinstance(normalized.get("visual_facts"), dict):
             normalized["visual_facts"].setdefault("ocr_text", ocr_data.get("texts", []))
         return normalized
@@ -901,24 +963,37 @@ def analyze(item):
         return {"_error": str(ex)[:300]}
 
 def analyze_parallel(items, max_workers=6, force=False):
-    if not API_KEY: return items
+    if not API_KEY:
+        return items, []
     id_map = {item["id"]: item for item in items}
+    errors = []
+
     def task(item):
         return item["id"], analyze(item)
+
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(task, item): item["id"] for item in items if force or not item.get("ai")}
+        futures = {
+            ex.submit(task, item): item["id"]
+            for item in items
+            if force or not item.get("ai")
+        }
         for future in as_completed(futures):
+            aid = futures[future]
             try:
-                aid, result = future.result(timeout=40)
+                aid, result = future.result(timeout=60)
                 if result and aid in id_map:
                     id_map[aid]["ai"] = result
-            except Exception as ex:
-                pass
-    return items
+                    # AI 결과를 DB에 즉시 저장
+                    db_set_field(aid, ai_json=json.dumps(result, ensure_ascii=False))
+                    if result.get("_error"):
+                        errors.append(f"[{id_map[aid]['keyword']}] {result['_error']}")
+            except Exception as ex_inner:
+                err_msg = f"[{aid[:8]}] 분석 예외: {str(ex_inner)[:120]}"
+                errors.append(err_msg)
 
+    return items, errors
 
 def test_api():
-    """API 연결 테스트 — 실제 에러 메시지 반환"""
     if not API_KEY:
         return False, "API Key가 없습니다. Streamlit Secrets를 확인하세요."
     try:
@@ -935,47 +1010,47 @@ def test_api():
         return False, f"연결 실패: {ex}"
 
 def summarize_insights(analyzed_items):
-    if not API_KEY or not analyzed_items: return None
+    if not API_KEY or not analyzed_items:
+        return None
     snippets = []
     for a in analyzed_items[:20]:
         ai = a.get("ai") or {}
-        if not ai: continue
+        if not ai:
+            continue
         snippets.append(
             "- 소구:" + ai.get("appeal", "") +
+            " / 후크:" + ai.get("hook", "") +
             " / 타겟:" + ai.get("target", "") +
-            " / 메시지:" + ai.get("message", "")
+            " / 메시지:" + ai.get("message", "") +
+            " / 약점:" + _safe_join((ai.get("creative_diagnosis") or {}).get("weaknesses", []))
         )
-    if not snippets: return None
+    if not snippets:
+        return None
     json_schema = (
         '{"dominant_appeal":"가장 많이 쓰인 소구 유형 + 비율 설명",'
         '"common_target":"공통 타겟 고객 요약",'
         '"key_message":"반복되는 핵심 메시지 패턴",'
         '"strategy":"이 광고들이 공유하는 전략적 방향 (2~3문장)",'
-        '"recommendations":"경쟁 우위를 위한 차별화 제안 (2~3문장)",'
+        '"common_weakness":"경쟁사들이 공통으로 놓친 약점 (2문장)",'
+        '"our_opportunity":"경쟁 우위를 위한 차별화 기회 (2~3문장)",'
+        '"recommendations":"구체적인 소재 제작 제안 (2~3문장)",'
         '"tags":["태그1","태그2","태그3","태그4","태그5"]}'
     )
     prompt = (
         "광고 전략 전문가입니다. 아래는 Meta 광고 소재 분석 결과들입니다.\n\n" +
         "\n".join(snippets) +
-        "\n\n이 소재들을 종합해 아래 JSON만 반환 (마크다운/백틱 없이 순수 JSON):\n" +
-        json_schema
+        "\n\n이 소재들을 종합해 아래 JSON만 반환 (마크다운/백틱 없이 순수 JSON):\n" + json_schema
     )
     try:
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model":      "claude-haiku-4-5-20251001",
-                "max_tokens": 700,
-                "messages":   [{"role": "user", "content": prompt}],
-            },
+            headers={"x-api-key": API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 900,
+                  "messages": [{"role": "user", "content": prompt}]},
             timeout=30,
         )
-        if resp.status_code != 200: return None
+        if resp.status_code != 200:
+            return None
         txt = resp.json()["content"][0]["text"].strip()
         parsed, _ = _parse_ai_json(txt)
         return parsed
@@ -992,20 +1067,28 @@ def merge(existing, new_items):
     out, n = list(existing), 0
     for item in new_items:
         k = make_fp(item)
-        if k in known: continue
-        known.add(k); out.append(item); n += 1
+        if k in known:
+            continue
+        known.add(k)
+        out.append(item)
+        n += 1
     return out, n
 
 def get_visible(ftype, fkw, fstar, fai):
     hidden = st.session_state.hidden
     items = [a for a in st.session_state.assets if a["id"] not in hidden]
-    if ftype != "전체":        items = [a for a in items if a["asset_type"] == ftype]
-    if fkw and fkw != "전체": items = [a for a in items if a["keyword"] == fkw]
-    if fstar:                  items = [a for a in items if a.get("starred")]
-    if fai:                    items = [a for a in items if a.get("ai")]
+    if ftype != "전체":
+        items = [a for a in items if a["asset_type"] == ftype]
+    if fkw and fkw != "전체":
+        items = [a for a in items if a["keyword"] == fkw]
+    if fstar:
+        items = [a for a in items if a.get("starred")]
+    if fai:
+        items = [a for a in items if a.get("ai")]
     return items
 
 def do_reset():
+    db_reset()
     st.session_state.assets   = []
     st.session_state.hidden   = set()
     st.session_state.history  = []
@@ -1016,12 +1099,14 @@ def do_reset():
 def toggle_star(aid):
     for a in st.session_state.assets:
         if a["id"] == aid:
-            a["starred"] = not a.get("starred", False); break
+            a["starred"] = not a.get("starred", False)
+            db_set_field(aid, starred=1 if a["starred"] else 0)
+            break
 
 def to_csv(items):
     import csv
-    fields = ["keyword","country","asset_type","image_url","source_url",
-              "caption","width","height","created_at","starred"]
+    fields = ["keyword", "country", "asset_type", "image_url", "source_url",
+              "caption", "width", "height", "created_at", "starred"]
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=fields)
     w.writeheader()
@@ -1029,23 +1114,20 @@ def to_csv(items):
         w.writerow({f: a.get(f, "") for f in fields})
     return buf.getvalue().encode("utf-8-sig")
 
-
 def fetch_image_bytes(url: str) -> bytes | None:
-    """이미지 URL → bytes. 직접 다운로드 실패 시 Playwright 스크린샷으로 fallback"""
-    # 1차: requests 직접 다운로드
     try:
         resp = requests.get(url, timeout=8, headers={
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/120.0.0.0 Safari/537.36",
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
             "Referer": "https://www.facebook.com/",
         })
         if resp.status_code == 200 and len(resp.content) > 1000:
             return resp.content
     except Exception:
         pass
-
-    # 2차: Playwright 스크린샷 fallback
     try:
         ensure_browser()
         with sync_playwright() as p:
@@ -1060,19 +1142,16 @@ def fetch_image_bytes(url: str) -> bytes | None:
         return None
 
 
+# ============================================================
+# PPT 내보내기 — 고도화 (경쟁 현황 + 기회 슬라이드 추가)
+# ============================================================
 def to_pptx(items: list, summary: dict | None = None) -> bytes:
-    """
-    선택된 소재 → PPT
-    슬라이드 구성:
-      1. 표지
-      2. 소재별 슬라이드 (이미지 + AI 분석)
-      3. 총합 인사이트 (summary 있을 때)
-    """
     from pptx import Presentation
     from pptx.util import Inches, Pt
     from pptx.dml.color import RGBColor
     from pptx.enum.text import PP_ALIGN
     import tempfile
+    from collections import Counter
 
     # 색상 팔레트
     C_BG    = RGBColor(0xFF, 0xFF, 0xFF)
@@ -1082,7 +1161,9 @@ def to_pptx(items: list, summary: dict | None = None) -> bytes:
     C_MUTED = RGBColor(0x8A, 0x90, 0x9E)
     C_BG2   = RGBColor(0xF7, 0xF8, 0xFA)
     C_GREEN = RGBColor(0x00, 0xA8, 0x6B)
+    C_ORANGE= RGBColor(0xE0, 0x7B, 0x00)
     C_BDBLUE= RGBColor(0xCC, 0xDD, 0xFF)
+    C_NAVY  = RGBColor(0x0A, 0x1A, 0x40)
 
     def add_text(slide, text, x, y, w, h, size=12, bold=False,
                  color=None, align=PP_ALIGN.LEFT, wrap=True):
@@ -1092,20 +1173,19 @@ def to_pptx(items: list, summary: dict | None = None) -> bytes:
         p = tf.paragraphs[0]
         p.alignment = align
         run = p.add_run()
-        run.text = text
+        run.text = str(text)
         run.font.size = Pt(size)
         run.font.bold = bold
         run.font.color.rgb = color or C_DARK
         return txBox
 
-    def add_rect(slide, x, y, w, h, fill_color, line_color=None):
-        from pptx.util import Inches
-        shape = slide.shapes.add_shape(
-            1,  # MSO_SHAPE_TYPE.RECTANGLE
-            Inches(x), Inches(y), Inches(w), Inches(h)
-        )
+    def add_rect(slide, x, y, w, h, fill_color, line_color=None, transparency=0):
+        shape = slide.shapes.add_shape(1,
+            Inches(x), Inches(y), Inches(w), Inches(h))
         shape.fill.solid()
         shape.fill.fore_color.rgb = fill_color
+        if transparency:
+            shape.fill.fore_color.theme_color = None
         if line_color:
             shape.line.color.rgb = line_color
             shape.line.width = Pt(0.5)
@@ -1116,143 +1196,359 @@ def to_pptx(items: list, summary: dict | None = None) -> bytes:
     prs = Presentation()
     prs.slide_width  = Inches(13.33)
     prs.slide_height = Inches(7.5)
-    blank = prs.slide_layouts[6]  # 완전 빈 레이아웃
+    blank = prs.slide_layouts[6]
 
-    # ── 1. 표지 슬라이드 ──────────────────────────────
+    # ── 1. 표지 슬라이드 ──
     slide = prs.slides.add_slide(blank)
+    add_rect(slide, 0, 0, 13.33, 7.5, C_NAVY)
+    add_rect(slide, 0, 0, 4.0, 7.5, C_DARK)
+    add_rect(slide, 4.0, 0, 0.06, 7.5, C_BLUE)
 
-    # 배경
-    add_rect(slide, 0, 0, 13.33, 7.5, C_DARK)
-    # 파란 포인트 바
-    add_rect(slide, 0, 0, 0.08, 7.5, C_BLUE)
-
-    add_text(slide, "AD INTEL",        0.4, 1.8, 12, 1.2, size=44, bold=True,  color=C_BG)
+    add_text(slide, "AD INTEL",               4.3, 1.6, 8, 1.2, size=44, bold=True, color=C_BG)
     add_text(slide, "META AD LIBRARY INTELLIGENCE REPORT",
-                                       0.4, 3.0, 12, 0.6, size=13, bold=False, color=C_BLUE)
-
+                                               4.3, 2.9, 8, 0.6, size=12, color=C_BLUE)
     kw_list = list(dict.fromkeys(a["keyword"] for a in items))
-    add_text(slide, "키워드: " + " · ".join(kw_list),
-                                       0.4, 3.8, 12, 0.5, size=12, color=C_MUTED)
-    add_text(slide, f"소재 {len(items)}개  ·  {time.strftime('%Y.%m.%d')}",
-                                       0.4, 4.3, 12, 0.5, size=12, color=C_MUTED)
+    add_text(slide, "분석 키워드: " + " · ".join(kw_list),
+                                               4.3, 3.6, 8, 0.5, size=11, color=C_MUTED)
+    add_text(slide, f"소재 {len(items)}개  ·  생성일 {time.strftime('%Y.%m.%d')}",
+                                               4.3, 4.1, 8, 0.5, size=11, color=C_MUTED)
 
-    # ── 2. 소재별 슬라이드 ────────────────────────────
-    for item in items:
+    analyzed_count = sum(1 for a in items if a.get("ai") and not (a.get("ai") or {}).get("_error"))
+    add_text(slide, f"AI 분석 완료: {analyzed_count}개",
+                                               4.3, 4.6, 8, 0.4, size=10, color=C_GREEN)
+
+    # 목차
+    toc_items = ["경쟁 현황 분석", "소구 유형 분포", "소재별 상세 분석"]
+    if summary:
+        toc_items += ["총합 인사이트", "기회 영역 & 제안"]
+    for i, t in enumerate(toc_items):
+        add_rect(slide, 0.3, 1.5 + i * 0.8, 3.2, 0.6, C_BLUE if i == 0 else RGBColor(0x1A, 0x22, 0x50))
+        add_text(slide, f"{i+1:02d}  {t}", 0.5, 1.6 + i * 0.8, 3.0, 0.4,
+                 size=10, bold=(i == 0), color=C_BG)
+
+    # ── 2. 경쟁 현황 요약 슬라이드 ──
+    slide = prs.slides.add_slide(blank)
+    add_rect(slide, 0, 0, 13.33, 7.5, C_BG)
+    add_rect(slide, 0, 0, 13.33, 1.1, C_DARK)
+
+    add_text(slide, "01  경쟁 현황 분석", 0.4, 0.2, 12, 0.6, size=18, bold=True, color=C_BG)
+    add_text(slide, f"총 {len(items)}개 소재 · AI 분석 {analyzed_count}개 기준",
+             0.4, 0.72, 12, 0.32, size=10, color=C_MUTED)
+
+    # 통계 카드 4개
+    ai_items = [a for a in items if a.get("ai") and not (a.get("ai") or {}).get("_error")]
+    hooks = [a["ai"].get("hook", "확인 불가") for a in ai_items]
+    appeals = []
+    for a in ai_items:
+        ap = a["ai"].get("appeal", "")
+        if isinstance(ap, list):
+            appeals += ap
+        elif ap:
+            appeals.append(ap)
+    layouts = [((a["ai"].get("visual_facts") or {}).get("layout_type") or a["ai"].get("layout_type") or "확인 불가")
+               for a in ai_items]
+    scores_all = [((a["ai"].get("conversion_elements") or {}).get("overall_conversion_power") or 0)
+                  for a in ai_items]
+    avg_score = round(sum(scores_all) / len(scores_all), 1) if scores_all else 0
+
+    top_hook   = Counter(hooks).most_common(1)[0][0] if hooks else "—"
+    top_appeal = Counter(appeals).most_common(1)[0][0] if appeals else "—"
+    top_layout = Counter(layouts).most_common(1)[0][0] if layouts else "—"
+
+    stat_cards = [
+        ("TOTAL ASSETS", str(len(items)), "수집된 소재 수"),
+        ("TOP HOOK", top_hook, "가장 많이 쓰인 후크"),
+        ("TOP APPEAL", top_appeal, "주요 소구 유형"),
+        ("AVG CONVERSION", f"{avg_score} / 5", "평균 전환력 점수"),
+    ]
+    for i, (lbl, val, sub) in enumerate(stat_cards):
+        cx = 0.3 + i * 3.25
+        add_rect(slide, cx, 1.3, 3.0, 1.6, C_BG2)
+        add_rect(slide, cx, 1.3, 0.06, 1.6, C_BLUE)
+        add_text(slide, lbl, cx + 0.2, 1.4, 2.7, 0.35, size=8, bold=True, color=C_BLUE)
+        add_text(slide, val, cx + 0.2, 1.8, 2.7, 0.7, size=20, bold=True, color=C_DARK)
+        add_text(slide, sub, cx + 0.2, 2.6, 2.7, 0.25, size=9, color=C_MUTED)
+
+    # 소재 타입 구성
+    img_cnt = sum(1 for a in items if a["asset_type"] == "image")
+    vid_cnt = sum(1 for a in items if a["asset_type"] == "video_poster")
+    add_text(slide, "소재 타입 구성", 0.3, 3.2, 6, 0.35, size=11, bold=True, color=C_DARK)
+    add_rect(slide, 0.3, 3.6, (img_cnt / max(len(items), 1)) * 6.0, 0.4, C_BLUE)
+    add_rect(slide, 0.3 + (img_cnt / max(len(items), 1)) * 6.0, 3.6,
+             (vid_cnt / max(len(items), 1)) * 6.0, 0.4, C_ORANGE)
+    add_text(slide, f"이미지 {img_cnt}개 ({img_cnt*100//max(len(items),1)}%)",
+             0.3, 4.05, 3, 0.3, size=9, color=C_BLUE)
+    add_text(slide, f"비디오 {vid_cnt}개 ({vid_cnt*100//max(len(items),1)}%)",
+             3.5, 4.05, 3, 0.3, size=9, color=C_ORANGE)
+
+    # 키워드별 소재 수
+    kw_counts = Counter(a["keyword"] for a in items)
+    add_text(slide, "키워드별 소재 수", 7.0, 3.2, 6, 0.35, size=11, bold=True, color=C_DARK)
+    y_kw = 3.6
+    for kw, cnt in kw_counts.most_common(5):
+        bar_w = (cnt / max(len(items), 1)) * 5.5
+        add_rect(slide, 7.0, y_kw, bar_w, 0.3, C_BLUE)
+        add_text(slide, f"{kw}  ({cnt})", 7.0 + bar_w + 0.1, y_kw, 2.5, 0.3,
+                 size=9, color=C_DARK)
+        y_kw += 0.42
+
+    # 분석 에러 현황
+    err_count = sum(1 for a in items if (a.get("ai") or {}).get("_error"))
+    if err_count:
+        add_rect(slide, 0.3, 6.8, 12.7, 0.4, RGBColor(0xFF, 0xF0, 0xF0))
+        add_text(slide, f"⚠  분석 오류 {err_count}개 포함 (캡처 실패 또는 API 오류)",
+                 0.5, 6.85, 12, 0.3, size=9, color=C_ORANGE)
+
+    # ── 3. 소구/후크 분포 슬라이드 ──
+    slide = prs.slides.add_slide(blank)
+    add_rect(slide, 0, 0, 13.33, 7.5, C_BG)
+    add_rect(slide, 0, 0, 13.33, 1.1, C_DARK)
+    add_text(slide, "02  소구 & 후크 유형 분포", 0.4, 0.2, 12, 0.6, size=18, bold=True, color=C_BG)
+    add_text(slide, f"AI 분석 {analyzed_count}개 기준", 0.4, 0.72, 12, 0.32, size=10, color=C_MUTED)
+
+    # 소구 분포 (좌)
+    add_text(slide, "소구 유형 분포", 0.4, 1.25, 6, 0.35, size=12, bold=True, color=C_DARK)
+    appeal_cnt = Counter(appeals).most_common(7)
+    max_ap = appeal_cnt[0][1] if appeal_cnt else 1
+    colors_ap = [C_BLUE, RGBColor(0x4F, 0x8A, 0xFF), RGBColor(0x7C, 0x5C, 0xFF),
+                 RGBColor(0x00, 0xA8, 0x6B), C_ORANGE,
+                 RGBColor(0xFF, 0x6B, 0x6B), RGBColor(0xFF, 0xB8, 0x4F)]
+    for i, (ap, cnt) in enumerate(appeal_cnt):
+        y_pos = 1.7 + i * 0.56
+        bar_w = (cnt / max(max_ap, 1)) * 5.0
+        add_rect(slide, 1.8, y_pos + 0.05, bar_w, 0.35,
+                 colors_ap[i % len(colors_ap)])
+        add_text(slide, ap, 0.4, y_pos, 1.3, 0.4, size=9, color=C_DARK)
+        add_text(slide, str(cnt), 1.8 + bar_w + 0.1, y_pos, 0.5, 0.4, size=9,
+                 bold=True, color=C_DARK)
+
+    # 후크 분포 (우)
+    add_text(slide, "후크 유형 분포", 7.0, 1.25, 6, 0.35, size=12, bold=True, color=C_DARK)
+    hook_cnt = Counter(hooks).most_common(7)
+    max_hk = hook_cnt[0][1] if hook_cnt else 1
+    for i, (hk, cnt) in enumerate(hook_cnt):
+        y_pos = 1.7 + i * 0.56
+        bar_w = (cnt / max(max_hk, 1)) * 5.0
+        add_rect(slide, 8.7, y_pos + 0.05, bar_w, 0.35, colors_ap[i % len(colors_ap)])
+        add_text(slide, hk, 7.0, y_pos, 1.6, 0.4, size=9, color=C_DARK)
+        add_text(slide, str(cnt), 8.7 + bar_w + 0.1, y_pos, 0.5, 0.4, size=9,
+                 bold=True, color=C_DARK)
+
+    # 레이아웃 분포 (하단)
+    add_text(slide, "레이아웃 유형 분포", 0.4, 6.1, 12, 0.35, size=11, bold=True, color=C_DARK)
+    layout_cnt = Counter(layouts).most_common(6)
+    total_l = sum(c for _, c in layout_cnt)
+    x_l = 0.4
+    for lyt, cnt in layout_cnt:
+        w_l = (cnt / max(total_l, 1)) * 12.0
+        if w_l < 0.3:
+            continue
+        add_rect(slide, x_l, 6.5, w_l - 0.05, 0.5, C_BLUE)
+        if w_l > 1.2:
+            add_text(slide, f"{lyt[:6]}\n{cnt}개", x_l + 0.05, 6.5, w_l - 0.1, 0.5,
+                     size=7, color=C_BG, wrap=True)
+        x_l += w_l
+
+    # ── 4. 소재별 슬라이드 ──
+    for idx, item in enumerate(items):
         slide = prs.slides.add_slide(blank)
+        add_rect(slide, 0, 0, 13.33, 7.5, C_BG)
+        add_rect(slide, 0, 0, 13.33, 0.55, C_DARK)
+        add_text(slide, f"03  소재 상세  ·  {idx+1} / {len(items)}",
+                 0.3, 0.08, 9, 0.38, size=11, bold=True, color=C_BG)
+        add_text(slide, item["keyword"].upper() + "  ·  " + item["country"],
+                 10.0, 0.08, 3, 0.38, size=10, color=C_BLUE, align=PP_ALIGN.RIGHT)
 
-        # 배경
-        add_rect(slide, 0,    0, 13.33, 7.5, C_BG)
-        add_rect(slide, 0,    0, 13.33, 0.06, C_BLUE)   # 상단 파란 선
-        add_rect(slide, 4.8,  0, 0.01,  7.5, C_BDBLUE)  # 세로 구분선
-
-        # ── 왼쪽: 이미지 영역 ──
+        # 이미지
         img_bytes = fetch_image_bytes(item["image_url"])
         if img_bytes:
             with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
                 tmp.write(img_bytes)
                 tmp_path = tmp.name
             try:
-                pic = slide.shapes.add_picture(tmp_path, Inches(0.3), Inches(0.4),
-                                               width=Inches(4.2))
-                # 이미지 높이 최대 6.5인치 제한
-                if pic.height > Inches(6.5):
-                    pic.height = Inches(6.5)
+                pic = slide.shapes.add_picture(tmp_path, Inches(0.3), Inches(0.7), width=Inches(4.2))
+                if pic.height > Inches(6.2):
+                    pic.height = Inches(6.2)
                     pic.width  = Inches(4.2)
             except Exception:
-                add_text(slide, "이미지 로드 실패", 0.3, 2.5, 4.2, 1, color=C_MUTED)
-            import os; os.unlink(tmp_path)
+                add_rect(slide, 0.3, 0.7, 4.2, 6.2, C_BG2)
+                add_text(slide, "이미지 로드 실패", 0.3, 3.5, 4.2, 0.5,
+                         align=PP_ALIGN.CENTER, color=C_MUTED)
+            import os
+            os.unlink(tmp_path)
         else:
-            add_rect(slide, 0.3, 0.4, 4.2, 6.5, C_BG2)
-            add_text(slide, "이미지 없음", 0.3, 3.2, 4.2, 0.8, align=PP_ALIGN.CENTER, color=C_MUTED)
+            add_rect(slide, 0.3, 0.7, 4.2, 6.2, C_BG2)
+            add_text(slide, "이미지 없음", 0.3, 3.5, 4.2, 0.5,
+                     align=PP_ALIGN.CENTER, color=C_MUTED)
 
-        # ── 오른쪽: 메타 + AI 분석 ──
-        rx = 5.1  # 오른쪽 시작 x
-        rw = 7.8  # 오른쪽 너비
+        # 세로 구분선
+        add_rect(slide, 4.7, 0.55, 0.02, 6.9, C_BDBLUE)
 
-        # 키워드 배지
-        add_text(slide, item["keyword"].upper() + "  ·  " + item["country"],
-                 rx, 0.25, rw, 0.35, size=9, bold=True, color=C_BLUE)
-
-        # 타입 + 사이즈
-        badge = "IMAGE" if item["asset_type"] == "image" else "VIDEO"
-        add_text(slide, f"{badge}  {item['width']}×{item['height']}px  ·  {item['created_at'][11:16]}",
-                 rx, 0.6, rw, 0.35, size=9, color=C_MUTED)
+        rx, rw = 5.0, 8.1
 
         ai = item.get("ai")
-        if ai:
-            # AI 분석 박스 배경
-            add_rect(slide, rx - 0.1, 1.05, rw + 0.2, 5.9, C_BG2)
+        if ai and not ai.get("_error"):
+            vf = ai.get("visual_facts") or {}
+            ce = ai.get("conversion_elements") or {}
+            cd = ai.get("creative_diagnosis") or {}
+            ma = ai.get("marketing_analysis") or {}
 
-            add_text(slide, "APPEAL ANALYSIS",
-                     rx, 1.15, rw, 0.35, size=9, bold=True, color=C_BLUE)
-
-            fields_ai = [
-                ("후크",   ai.get("hook",    "—")),
-                ("소구",   ai.get("appeal",  "—")),
-                ("타겟",   ai.get("target",  "—")),
-                ("메시지", ai.get("message", "—")),
+            # 분석 필드
+            fields = [
+                ("후크",    ai.get("hook") or ma.get("hook_type") or "—"),
+                ("소구",    ai.get("appeal") or "—"),
+                ("타겟",    ai.get("target") or "—"),
+                ("레이아웃", vf.get("layout_type") or ai.get("layout_type") or "—"),
+                ("메시지",  ai.get("message") or "—"),
+                ("근거",    ai.get("evidence") or "—"),
             ]
-            y_pos = 1.6
-            for label, val in fields_ai:
-                add_text(slide, label, rx, y_pos, 0.9, 0.4, size=10, bold=True, color=C_GRAY)
-                add_text(slide, val,   rx + 0.9, y_pos, rw - 1.0, 0.5,
-                         size=10, color=C_DARK, wrap=True)
-                y_pos += 0.65
+            y_f = 0.65
+            for lbl, val in fields:
+                add_rect(slide, rx, y_f, 1.0, 0.32, C_BG2)
+                add_text(slide, lbl, rx + 0.05, y_f, 0.95, 0.32, size=8, bold=True, color=C_BLUE)
+                val_str = str(val)[:100]
+                add_text(slide, val_str, rx + 1.1, y_f, rw - 1.15, 0.38, size=9, color=C_DARK, wrap=True)
+                y_f += 0.48
+
+            # 전환력 점수 바
+            add_text(slide, "전환력 점수", rx, y_f + 0.1, rw, 0.3, size=9, bold=True, color=C_DARK)
+            score_items = [
+                ("가격강조", ce.get("price_emphasis", 0)),
+                ("제품가시성", ce.get("product_visibility", 0)),
+                ("가독성", ce.get("readability", 0)),
+                ("할인가시성", ce.get("discount_visibility", 0)),
+                ("시각명확도", ce.get("visual_clarity", 0)),
+                ("전환력", ce.get("overall_conversion_power", 0)),
+            ]
+            y_sc = y_f + 0.45
+            for s_lbl, s_val in score_items:
+                s_val = int(s_val) if s_val else 0
+                add_text(slide, s_lbl, rx, y_sc, 1.3, 0.28, size=7, color=C_MUTED)
+                bar_total = 1.3
+                for b in range(5):
+                    add_rect(slide, rx + 1.35 + b * (bar_total / 5 + 0.02),
+                             y_sc + 0.04, bar_total / 5, 0.2,
+                             C_BLUE if b < s_val else C_BG2)
+                add_text(slide, str(s_val), rx + 1.35 + 5 * (bar_total / 5 + 0.02) + 0.05,
+                         y_sc, 0.3, 0.28, size=7, bold=True, color=C_DARK)
+                y_sc += 0.3
+
+            # 장점 / 약점 / 개선
+            y_dia = y_sc + 0.1
+            if y_dia < 6.5:
+                strengths = _safe_join(cd.get("strengths", []))
+                weaknesses = _safe_join(cd.get("weaknesses", []))
+                improve = cd.get("improvement_direction", "—")
+                for emoji, lbl, val in [("✓", "장점", strengths), ("✕", "약점", weaknesses), ("→", "개선", improve)]:
+                    add_text(slide, f"{emoji} {lbl}", rx, y_dia, 1.0, 0.3, size=8, bold=True, color=C_GRAY)
+                    add_text(slide, str(val)[:120], rx + 1.0, y_dia, rw - 1.05, 0.35, size=8, color=C_DARK, wrap=True)
+                    y_dia += 0.38
 
             # 태그
             tags = ai.get("tags", [])
             if tags:
-                add_text(slide, "  ".join(f"#{t}" for t in tags),
-                         rx, y_pos + 0.15, rw, 0.45, size=10, color=C_BLUE)
+                tag_str = "  ".join(f"#{t}" for t in tags[:6])
+                add_text(slide, tag_str, rx, 7.1, rw, 0.3, size=9, color=C_BLUE)
+        elif ai and ai.get("_error"):
+            add_rect(slide, rx, 1.0, rw, 0.6, RGBColor(0xFF, 0xF0, 0xF0))
+            add_text(slide, "⚠  분석 오류: " + ai["_error"][:120],
+                     rx + 0.1, 1.1, rw - 0.2, 0.4, size=9, color=C_ORANGE, wrap=True)
         else:
-            add_text(slide, "AI 분석 없음\n(소재 선택 후 [선택 분석] 실행)",
+            add_text(slide, "AI 분석 없음\n(선택 분석 실행 후 PPT 재생성 권장)",
                      rx, 2.5, rw, 1.0, size=11, color=C_MUTED)
 
-    # ── 3. 총합 인사이트 슬라이드 ─────────────────────
+    # ── 5. 총합 인사이트 슬라이드 ──
     if summary:
         slide = prs.slides.add_slide(blank)
-        add_rect(slide, 0, 0, 13.33, 7.5, C_DARK)
-        add_rect(slide, 0, 0, 0.08,  7.5, C_BLUE)
+        add_rect(slide, 0, 0, 13.33, 7.5, C_NAVY)
+        add_rect(slide, 0, 0, 13.33, 1.1, C_DARK)
+        add_text(slide, "04  총합 인사이트", 0.4, 0.2, 12, 0.6, size=18, bold=True, color=C_BG)
+        add_text(slide, "선택 소재 전체 종합 분석", 0.4, 0.72, 12, 0.32, size=10, color=C_MUTED)
 
-        add_text(slide, "TOTAL INSIGHT",
-                 0.4, 0.3, 12, 0.6, size=22, bold=True, color=C_BG)
-        add_text(slide, "선택 소재 종합 분석",
-                 0.4, 0.9, 12, 0.4, size=12, color=C_BLUE)
-
-        # 2열 그리드
-        grid = [
-            ("DOMINANT APPEAL",    summary.get("dominant_appeal", "—")),
-            ("COMMON TARGET",      summary.get("common_target",   "—")),
-            ("KEY MESSAGE PATTERN",summary.get("key_message",     "—")),
+        grid_items = [
+            ("DOMINANT APPEAL", summary.get("dominant_appeal", "—")),
+            ("COMMON TARGET",   summary.get("common_target",   "—")),
+            ("KEY MESSAGE",     summary.get("key_message",     "—")),
+            ("COMMON WEAKNESS", summary.get("common_weakness", "—")),
         ]
-        for i, (lbl, val) in enumerate(grid):
+        for i, (lbl, val) in enumerate(grid_items):
             col = i % 2
             row = i // 2
             gx = 0.4 + col * 6.4
-            gy = 1.5 + row * 1.6
-            add_rect(slide, gx, gy, 6.0, 1.4,
-                     RGBColor(0x1A, 0x20, 0x30))
-            add_text(slide, lbl, gx + 0.15, gy + 0.1,  5.7, 0.3,
-                     size=8, bold=True, color=C_BLUE)
-            add_text(slide, val, gx + 0.15, gy + 0.45, 5.7, 0.85,
-                     size=10, color=C_BG, wrap=True)
+            gy = 1.3 + row * 1.55
+            add_rect(slide, gx, gy, 6.0, 1.4, RGBColor(0x1A, 0x20, 0x30))
+            add_rect(slide, gx, gy, 0.06, 1.4, C_BLUE)
+            add_text(slide, lbl, gx + 0.18, gy + 0.1, 5.7, 0.3, size=8, bold=True, color=C_BLUE)
+            add_text(slide, str(val), gx + 0.18, gy + 0.45, 5.7, 0.85, size=10, color=C_BG, wrap=True)
 
-        # 전략 + 제안
-        sy = 4.6
+        sy = 4.55
         for lbl, key in [("STRATEGY", "strategy"), ("RECOMMENDATIONS", "recommendations")]:
-            add_text(slide, lbl, 0.4, sy, 12, 0.3,
-                     size=8, bold=True, color=C_BLUE)
-            add_text(slide, summary.get(key, "—"), 0.4, sy + 0.3, 12.5, 0.7,
+            add_rect(slide, 0.4, sy, 12.5, 0.9, RGBColor(0x0E, 0x16, 0x2E))
+            add_text(slide, lbl, 0.55, sy + 0.08, 2.5, 0.3, size=8, bold=True, color=C_BLUE)
+            add_text(slide, summary.get(key, "—"), 0.55, sy + 0.38, 12.1, 0.45,
                      size=10, color=C_BG, wrap=True)
-            sy += 1.2
+            sy += 1.05
 
-        # 태그
         tags = summary.get("tags", [])
         if tags:
             add_text(slide, "  ".join(f"#{t}" for t in tags),
-                     0.4, 7.0, 12, 0.35, size=10, color=C_BLUE)
+                     0.4, 6.85, 12.5, 0.35, size=10, color=C_BLUE)
 
-    # 버퍼로 저장
+    # ── 6. 기회 영역 & 전략 제안 슬라이드 ──
+    if summary and summary.get("our_opportunity"):
+        slide = prs.slides.add_slide(blank)
+        add_rect(slide, 0, 0, 13.33, 7.5, C_BG)
+        add_rect(slide, 0, 0, 13.33, 1.1, C_DARK)
+        add_text(slide, "05  기회 영역 & 전략 제안", 0.4, 0.2, 12, 0.6, size=18, bold=True, color=C_BG)
+        add_text(slide, "경쟁사 약점 기반 우리의 차별화 기회", 0.4, 0.72, 12, 0.32, size=10, color=C_MUTED)
+
+        # 경쟁사 약점 (좌)
+        add_rect(slide, 0.3, 1.25, 6.0, 5.8, C_BG2)
+        add_rect(slide, 0.3, 1.25, 0.08, 5.8, RGBColor(0xE8, 0x28, 0x4A))
+        add_text(slide, "경쟁사 공통 약점", 0.55, 1.35, 5.6, 0.4, size=12, bold=True,
+                 color=RGBColor(0xE8, 0x28, 0x4A))
+        add_text(slide, summary.get("common_weakness", "—"),
+                 0.55, 1.85, 5.6, 2.0, size=11, color=C_DARK, wrap=True)
+
+        # 점수 최하위 항목 추출
+        all_scores = {}
+        for a in ai_items:
+            ce = (a["ai"].get("conversion_elements") or {})
+            for k in ["price_emphasis", "product_visibility", "readability",
+                      "discount_visibility", "visual_clarity"]:
+                v = ce.get(k)
+                if v:
+                    all_scores.setdefault(k, []).append(int(v))
+        score_avgs = {k: round(sum(v)/len(v), 1) for k, v in all_scores.items() if v}
+        label_map = {"price_emphasis": "가격 강조", "product_visibility": "제품 가시성",
+                     "readability": "가독성", "discount_visibility": "할인 가시성",
+                     "visual_clarity": "시각 명확도"}
+        if score_avgs:
+            add_text(slide, "평균 취약 영역 (1-5점 기준)", 0.55, 3.6, 5.6, 0.35,
+                     size=9, bold=True, color=C_MUTED)
+            y_sc2 = 4.0
+            for k, v in sorted(score_avgs.items(), key=lambda x: x[1])[:4]:
+                bar_w = (v / 5) * 4.5
+                add_rect(slide, 2.0, y_sc2 + 0.03, bar_w, 0.28,
+                         RGBColor(0xE8, 0x28, 0x4A) if v < 3 else C_ORANGE if v < 4 else C_GREEN)
+                add_text(slide, label_map.get(k, k), 0.55, y_sc2, 1.4, 0.32, size=9, color=C_DARK)
+                add_text(slide, str(v), 2.0 + bar_w + 0.1, y_sc2, 0.4, 0.32, size=9,
+                         bold=True, color=C_DARK)
+                y_sc2 += 0.42
+
+        # 우리의 기회 (우)
+        add_rect(slide, 6.7, 1.25, 6.3, 2.7, C_BG2)
+        add_rect(slide, 6.7, 1.25, 0.08, 2.7, C_GREEN)
+        add_text(slide, "우리의 기회 영역", 6.95, 1.35, 5.9, 0.4, size=12, bold=True, color=C_GREEN)
+        add_text(slide, summary.get("our_opportunity", "—"),
+                 6.95, 1.85, 5.9, 2.0, size=11, color=C_DARK, wrap=True)
+
+        add_rect(slide, 6.7, 4.1, 6.3, 2.95, C_BG2)
+        add_rect(slide, 6.7, 4.1, 0.08, 2.95, C_BLUE)
+        add_text(slide, "소재 제작 제안", 6.95, 4.2, 5.9, 0.4, size=12, bold=True, color=C_BLUE)
+        add_text(slide, summary.get("recommendations", "—"),
+                 6.95, 4.7, 5.9, 2.2, size=11, color=C_DARK, wrap=True)
+
     buf = io.BytesIO()
     prs.save(buf)
     buf.seek(0)
@@ -1260,11 +1556,116 @@ def to_pptx(items: list, summary: dict | None = None) -> bytes:
 
 
 # ============================================================
+# 비교 테이블 뷰
+# ============================================================
+def render_comparison_table(all_items):
+    try:
+        import pandas as pd
+    except ImportError:
+        st.error("pandas가 설치되어 있지 않습니다. requirements.txt에 pandas를 추가하세요.")
+        return
+
+    analyzed = [a for a in all_items if a.get("ai") and not (a.get("ai") or {}).get("_error")]
+    if not analyzed:
+        st.markdown(
+            '<div class="empty">'
+            '<div class="empty-t">비교할 AI 분석 결과가 없습니다</div>'
+            '<div class="empty-d">소재를 선택하고 [선택 분석]을 실행하면<br>여기에 비교 테이블이 생성됩니다.</div>'
+            '</div>',
+            unsafe_allow_html=True)
+        return
+
+    rows = []
+    for item in analyzed:
+        ai  = item.get("ai") or {}
+        ce  = ai.get("conversion_elements") or {}
+        vf  = ai.get("visual_facts") or {}
+        ma  = ai.get("marketing_analysis") or {}
+        cd  = ai.get("creative_diagnosis") or {}
+        rows.append({
+            "키워드":       item["keyword"],
+            "타입":         "이미지" if item["asset_type"] == "image" else "비디오",
+            "레이아웃":     (vf.get("layout_type") or ai.get("layout_type") or "—")[:20],
+            "후크":         (ai.get("hook") or ma.get("hook_type") or "—")[:20],
+            "소구":         str(ai.get("appeal") or "—")[:30],
+            "타겟":         (ai.get("target") or "—")[:40],
+            "핵심메시지":   (ai.get("message") or "—")[:60],
+            "가격강조":     int(ce.get("price_emphasis") or 0),
+            "제품가시성":   int(ce.get("product_visibility") or 0),
+            "가독성":       int(ce.get("readability") or 0),
+            "할인가시성":   int(ce.get("discount_visibility") or 0),
+            "시각명확도":   int(ce.get("visual_clarity") or 0),
+            "전환력":       int(ce.get("overall_conversion_power") or 0),
+            "개선방향":     (cd.get("improvement_direction") or "—")[:80],
+            "썸네일":       item["image_url"],
+        })
+
+    df = pd.DataFrame(rows)
+    df = df.sort_values("전환력", ascending=False).reset_index(drop=True)
+
+    st.markdown(
+        f'<div class="sec"><div class="sec-t">소재 비교 테이블</div>'
+        f'<div class="sec-n">{len(analyzed)}개 · AI 분석 완료 소재 · 전환력 기준 정렬</div></div>',
+        unsafe_allow_html=True)
+
+    st.dataframe(
+        df,
+        column_config={
+            "썸네일":     st.column_config.ImageColumn("썸네일", width="small"),
+            "가격강조":   st.column_config.NumberColumn("가격강조",   format="%d ⭐", min_value=0, max_value=5),
+            "제품가시성": st.column_config.NumberColumn("제품가시성", format="%d ⭐", min_value=0, max_value=5),
+            "가독성":     st.column_config.NumberColumn("가독성",     format="%d ⭐", min_value=0, max_value=5),
+            "할인가시성": st.column_config.NumberColumn("할인가시성", format="%d ⭐", min_value=0, max_value=5),
+            "시각명확도": st.column_config.NumberColumn("시각명확도", format="%d ⭐", min_value=0, max_value=5),
+            "전환력":     st.column_config.ProgressColumn("전환력", min_value=0, max_value=5, format="%d"),
+            "핵심메시지": st.column_config.TextColumn("핵심메시지", width="large"),
+            "개선방향":   st.column_config.TextColumn("개선방향",   width="large"),
+        },
+        use_container_width=True,
+        height=420,
+    )
+
+    # 분포 차트
+    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown('<div class="slbl">소구 유형 분포</div>', unsafe_allow_html=True)
+        appeal_counts = df["소구"].value_counts()
+        st.bar_chart(appeal_counts, height=220)
+    with c2:
+        st.markdown('<div class="slbl">후크 유형 분포</div>', unsafe_allow_html=True)
+        hook_counts = df["후크"].value_counts()
+        st.bar_chart(hook_counts, height=220)
+    with c3:
+        st.markdown('<div class="slbl">전환력 점수 분포</div>', unsafe_allow_html=True)
+        score_dist = df["전환력"].value_counts().sort_index()
+        st.bar_chart(score_dist, height=220)
+
+    # 평균 점수 요약
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+    score_cols = ["가격강조", "제품가시성", "가독성", "할인가시성", "시각명확도", "전환력"]
+    avg_scores = df[score_cols].mean().round(2)
+    cols_s = st.columns(len(score_cols))
+    for col, (label, val) in zip(cols_s, avg_scores.items()):
+        color = "var(--ok)" if val >= 4 else "var(--wn)" if val >= 3 else "var(--er)"
+        col.markdown(
+            f'<div class="sc" style="padding:14px 16px;">'
+            f'<div class="sc-lbl">AVG {label.upper()}</div>'
+            f'<div class="sc-val" style="font-size:24px;color:{color}">{val}</div>'
+            f'<div class="sc-sub">/ 5점</div></div>',
+            unsafe_allow_html=True)
+
+
+# ============================================================
 # 헤더
 # ============================================================
 st.markdown("""
 <div class="hdr">
-  <div class="hdr-row"><div class="logo">AD<b>INTEL</b></div><div class="ver">v3.3</div></div>
+  <div class="hdr-row">
+    <div class="logo">AD<b>INTEL</b></div>
+    <div class="ver">v4.0</div>
+    <span class="persist-badge">💾 DB 자동저장</span>
+  </div>
   <div class="sub">META AD LIBRARY INTELLIGENCE BOARD</div>
 </div>""", unsafe_allow_html=True)
 
@@ -1276,7 +1677,8 @@ with st.sidebar:
     st.markdown('<div class="slbl">DISPLAY</div>', unsafe_allow_html=True)
     new_dark = st.toggle("Dark Mode", value=st.session_state.dark)
     if new_dark != st.session_state.dark:
-        st.session_state.dark = new_dark; st.rerun()
+        st.session_state.dark = new_dark
+        st.rerun()
     st.markdown("---")
 
     st.markdown('<div class="slbl">AI ANALYSIS</div>', unsafe_allow_html=True)
@@ -1288,8 +1690,10 @@ with st.sidebar:
             st.caption("선택 소재만 분석 · Haiku · 소재당 ~1원")
             if st.button("API 연결 테스트", use_container_width=True):
                 ok, msg = test_api()
-                if ok: st.success(msg)
-                else:  st.error(msg)
+                if ok:
+                    st.success(msg)
+                else:
+                    st.error(msg)
         else:
             st.error("API Key 없음")
             st.caption("Streamlit Cloud > Settings > Secrets\nANTHROPIC_API_KEY = 'sk-ant-...'")
@@ -1298,20 +1702,20 @@ with st.sidebar:
     st.markdown("---")
 
     st.markdown('<div class="slbl">SCRAPE</div>', unsafe_allow_html=True)
-    country = st.selectbox("국가", ["KR","US","JP","GB","SG","AU"], index=0, label_visibility="collapsed")
+    country = st.selectbox("국가", ["KR", "US", "JP", "GB", "SG", "AU"], index=0, label_visibility="collapsed")
     st.caption(f"대상 국가: **{country}**")
     scrolls = st.slider("스크롤 깊이", 3, 15, 8, 1)
     max_n   = st.slider("최대 수집량", 10, 150, 60, 10)
     st.markdown("---")
 
     st.markdown('<div class="slbl">FILTER & SORT</div>', unsafe_allow_html=True)
-    ftype = st.selectbox("소재 타입", ["전체","image","video_poster"], label_visibility="collapsed")
+    ftype = st.selectbox("소재 타입", ["전체", "image", "video_poster"], label_visibility="collapsed")
     kws   = ["전체"] + list(dict.fromkeys(a["keyword"] for a in st.session_state.assets))
     fkw   = st.selectbox("키워드", kws, label_visibility="collapsed")
     fstar = st.toggle("즐겨찾기만", value=False)
     fai   = st.toggle("AI 분석된 것만", value=False)
-    cols  = st.select_slider("열 수", options=[2,3,4,5], value=4)
-    sort  = st.selectbox("정렬", ["최신순","오래된순","키워드순","즐겨찾기순"], label_visibility="collapsed")
+    cols  = st.select_slider("열 수", options=[2, 3, 4, 5], value=4)
+    sort  = st.selectbox("정렬", ["최신순", "오래된순", "키워드순", "즐겨찾기순", "전환력순"], label_visibility="collapsed")
     st.markdown("---")
 
     st.markdown('<div class="slbl">EXPORT</div>', unsafe_allow_html=True)
@@ -1325,9 +1729,22 @@ with st.sidebar:
         st.download_button("즐겨찾기 CSV", data=to_csv(stars),
             file_name=f"adintel_star_{time.strftime('%Y%m%d_%H%M')}.csv",
             mime="text/csv", use_container_width=True)
+
     st.markdown('<div style="height:4px"></div>', unsafe_allow_html=True)
     if st.button("보드 초기화", use_container_width=True):
-        do_reset(); st.rerun()
+        do_reset()
+        st.rerun()
+
+    st.markdown("---")
+    st.markdown('<div class="slbl">DB 상태</div>', unsafe_allow_html=True)
+    db_count = len(st.session_state.assets)
+    st.caption(f"저장된 소재: **{db_count}개** | DB: `{DB_PATH}`")
+    if st.button("DB 새로고침", use_container_width=True):
+        st.session_state.assets = db_load_assets()
+        st.session_state.hidden = db_load_hidden()
+        st.session_state.history = db_load_history()
+        st.session_state.summary = db_load_summary()
+        st.rerun()
 
     if st.session_state.log:
         st.markdown("---")
@@ -1346,17 +1763,17 @@ with st.sidebar:
 if ai_on and API_KEY:
     st.markdown("""<div class="banner">
         <div class="dot dot-on"></div>
-        <span class="banner-txt">AI 분석 <b>ON</b> &nbsp;—&nbsp; 검색은 빠르게, 선택 소재만 캡처 분석 &nbsp;·&nbsp; Claude Vision</span>
+        <span class="banner-txt">AI 분석 <b>ON</b> &nbsp;—&nbsp; 선택 소재만 캡처 분석 · Claude Vision · 분석 결과 DB 자동저장</span>
     </div>""", unsafe_allow_html=True)
 elif ai_on and not API_KEY:
     st.markdown("""<div class="banner banner-w">
         <div class="dot" style="background:var(--wn)"></div>
-        <span class="banner-txt">AI ON — API Key 없음 &nbsp;·&nbsp; Streamlit > Settings > Secrets > <b>ANTHROPIC_API_KEY</b></span>
+        <span class="banner-txt">AI ON — API Key 없음 &nbsp;·&nbsp; Settings > Secrets > <b>ANTHROPIC_API_KEY</b></span>
     </div>""", unsafe_allow_html=True)
 
 
 # ============================================================
-# 검색창 (기존 원본 — 단일 키워드)
+# 검색창
 # ============================================================
 st.markdown('<div class="srch">', unsafe_allow_html=True)
 st.markdown('<div class="srch-lbl">KEYWORD SEARCH</div>', unsafe_allow_html=True)
@@ -1371,13 +1788,14 @@ with c2:
 with c3:
     do_add = st.button("누적 검색", use_container_width=True)
 
-if st.session_state.pop("_enter", False): do_new = True
-st.caption("엔터 / 검색 = 새 검색   ·   누적 검색 = 기존 보드에 추가 (중복·제외 자동 제외)")
+if st.session_state.pop("_enter", False):
+    do_new = True
+st.caption("엔터 / 검색 = 새 검색   ·   누적 검색 = 기존 보드에 추가   ·   💾 수집 결과 자동 DB저장")
 st.markdown('</div>', unsafe_allow_html=True)
 
 
 # ============================================================
-# 검색 실행 (기존 원본)
+# 검색 실행
 # ============================================================
 if do_new or do_add:
     q = (kw or "").strip()
@@ -1392,18 +1810,26 @@ if do_new or do_add:
                 st.session_state.summary  = None
                 st.session_state.selected = set()
 
-            with st.spinner(f"'{q}' 수집 중 — Meta Ad Library 실시간 접근..."):
-                items = scrape(q, country, scrolls, max_n)
+            pb = st.progress(0, text=f"'{q}' — Meta Ad Library 접근 중...")
+            items = scrape(q, country, scrolls, max_n)
+            pb.progress(0.7, text=f"수집 완료 {len(items)}개 · DB 저장 중...")
 
             merged, added = merge(st.session_state.assets, items)
             st.session_state.assets = merged
 
+            # 신규 소재 DB 저장
+            new_only = [a for a in merged if any(n["id"] == a["id"] for n in items)]
+            db_upsert_assets(new_only)
+
             if q not in st.session_state.history:
                 st.session_state.history.append(q)
+                db_add_history(q)
+
+            pb.progress(1.0, text="완료!")
+            pb.empty()
 
             st.session_state.log.append({"t": time.strftime("%H:%M"), "kw": q, "n": added, "ok": True})
-
-            st.success(f"{added}개 수집 완료") if added > 0 else st.info("새 소재 없음")
+            st.success(f"{added}개 수집 · DB 저장 완료") if added > 0 else st.info("새 소재 없음")
             st.rerun()
 
         except Exception as e:
@@ -1417,17 +1843,23 @@ if do_new or do_add:
 all_a = st.session_state.assets
 shown = get_visible(ftype, fkw if fkw != "전체" else None, fstar, fai)
 
-if sort == "최신순":     shown = sorted(shown, key=lambda a: a["created_at"], reverse=True)
-elif sort == "오래된순": shown = sorted(shown, key=lambda a: a["created_at"])
-elif sort == "키워드순": shown = sorted(shown, key=lambda a: a["keyword"])
+if sort == "최신순":       shown = sorted(shown, key=lambda a: a["created_at"], reverse=True)
+elif sort == "오래된순":   shown = sorted(shown, key=lambda a: a["created_at"])
+elif sort == "키워드순":   shown = sorted(shown, key=lambda a: a["keyword"])
 elif sort == "즐겨찾기순": shown = sorted(shown, key=lambda a: (not a.get("starred"), a["created_at"]))
+elif sort == "전환력순":
+    def conv_score(a):
+        ai = a.get("ai") or {}
+        ce = ai.get("conversion_elements") or {}
+        return -(ce.get("overall_conversion_power") or 0)
+    shown = sorted(shown, key=conv_score)
 
 ic = sum(1 for a in shown if a["asset_type"] == "image")
 vc = sum(1 for a in shown if a["asset_type"] == "video_poster")
 
 for col, (lbl, val, sub) in zip(st.columns(6), [
-    ("TOTAL",    len(all_a),   "누적 수집"),
-    ("SHOWN",    len(shown),   f"IMG {ic} · VID {vc}"),
+    ("TOTAL",    len(all_a), "누적 수집"),
+    ("SHOWN",    len(shown), f"IMG {ic} · VID {vc}"),
     ("KEYWORDS", len(set(a["keyword"] for a in all_a)), "검색어"),
     ("STARRED",  sum(1 for a in all_a if a.get("starred")), "즐겨찾기"),
     ("HIDDEN",   len(st.session_state.hidden), "제외"),
@@ -1469,14 +1901,17 @@ if summary:
         f'<div class="summary-item-val">{summary.get("common_target","—")}</div></div>'
         '<div class="summary-item"><div class="summary-item-lbl">KEY MESSAGE PATTERN</div>'
         f'<div class="summary-item-val">{summary.get("key_message","—")}</div></div>'
-        '<div class="summary-item"><div class="summary-item-lbl">KEYWORDS</div>'
-        f'<div class="summary-item-val"><div class="summary-tags">{tags_html}</div></div></div>'
+        '<div class="summary-item"><div class="summary-item-lbl">COMMON WEAKNESS</div>'
+        f'<div class="summary-item-val">{summary.get("common_weakness","—")}</div></div>'
         '</div>'
+        '<div class="summary-strategy"><div class="summary-strategy-lbl">OUR OPPORTUNITY</div>'
+        f'<div class="summary-strategy-val">{summary.get("our_opportunity","—")}</div></div>'
         '<div class="summary-strategy"><div class="summary-strategy-lbl">STRATEGY</div>'
         f'<div class="summary-strategy-val">{summary.get("strategy","—")}</div></div>'
         '<div class="summary-strategy" style="margin-bottom:0">'
         '<div class="summary-strategy-lbl">RECOMMENDATIONS</div>'
         f'<div class="summary-strategy-val">{summary.get("recommendations","—")}</div></div>'
+        f'<div style="margin-top:12px"><div class="summary-tags">{tags_html}</div></div>'
         '</div>',
         unsafe_allow_html=True)
     if st.button("인사이트 초기화", key="clear_summary"):
@@ -1486,175 +1921,211 @@ if summary:
 
 
 # ============================================================
-# 소재 보드
+# 메인 탭 — 소재 보드 / 비교 테이블
 # ============================================================
-sel = st.session_state.selected
+tab_board, tab_table = st.tabs(["◼ 소재 보드", "⊞ 비교 테이블"])
 
-st.markdown(
-    f'<div class="sec"><div class="sec-t">소재 보드</div>'
-    f'<div class="sec-n">{len(shown)} assets · {sort}</div></div>',
-    unsafe_allow_html=True)
 
-if ai_on and API_KEY and shown:
-    sel_items      = [a for a in st.session_state.assets if a["id"] in sel]
-    sel_unanalyzed = [a for a in sel_items if not a.get("ai")]
-    analyzed_sel   = [a for a in sel_items if a.get("ai")]
+# ── 탭1: 소재 보드 ──────────────────────────────────────────
+with tab_board:
+    sel = st.session_state.selected
 
-    bar_c, btn_c1, btn_c2, btn_c3 = st.columns([3, 1, 1, 1])
-    with bar_c:
-        st.markdown(
-            f'<div class="sel-bar"><span class="sel-count">{len(sel)}</span>'
-            '<span class="sel-bar-txt">선택됨  ·  ○ 버튼으로 소재를 선택하세요</span></div>',
-            unsafe_allow_html=True)
-    with btn_c1:
-        if sel_items:
-            btn_label = f"선택 분석 ({len(sel_unanalyzed)})" if sel_unanalyzed else f"선택 재분석 ({len(sel_items)})"
-            if st.button(btn_label, use_container_width=True):
-                target_items = sel_unanalyzed if sel_unanalyzed else sel_items
-                for it in target_items:
-                    it["ai"] = None
-                    it["img_b64"] = ""
-                pb = st.progress(0, text="선택 소재 캡처 중... (검색 단계에서는 캡처하지 않음)")
-                capture_screenshots_for_items(target_items, scrolls=scrolls)
-                captured = sum(1 for it in target_items if it.get("img_b64"))
-                pb.progress(0.35, text=f"캡처 완료 {captured}/{len(target_items)}개 · Claude 분석 중...")
-                analyze_parallel(target_items, max_workers=3, force=True)
-                done = sum(1 for it in target_items if it.get("ai") and not it.get("ai", {}).get("_error"))
-                pb.progress(1.0, text=f"완료! 이미지 기반 분석 {done}개")
-                pb.empty()
-                st.rerun()
-    with btn_c2:
-        if analyzed_sel:
-            if st.button(f"종합 인사이트 ({len(analyzed_sel)})", use_container_width=True):
-                with st.spinner("종합 인사이트 생성 중..."):
-                    st.session_state.summary = summarize_insights(analyzed_sel)
-                st.rerun()
-    with btn_c3:
-        if analyzed_sel:
-            if st.button(f"PPT 내보내기 ({len(analyzed_sel)})", use_container_width=True):
-                with st.spinner(f"PPT 생성 중... 이미지 {len(analyzed_sel)}개 수집 (잠시 기다려 주세요)"):
-                    pptx_bytes = to_pptx(analyzed_sel, st.session_state.get("summary"))
-                fname = f"adintel_{time.strftime('%Y%m%d_%H%M')}.pptx"
-                st.download_button(
-                    "다운로드",
-                    data=pptx_bytes,
-                    file_name=fname,
-                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                    use_container_width=True,
-                )
-
-if not shown:
     st.markdown(
-        '<div class="empty"><div class="empty-t">수집된 소재가 없습니다</div>'
-        '<div class="empty-d">키워드를 입력하고 검색하면<br>'
-        'Meta Ad Library에서 광고 소재를 실시간으로 수집합니다.</div></div>',
+        f'<div class="sec"><div class="sec-t">소재 보드</div>'
+        f'<div class="sec-n">{len(shown)} assets · {sort}</div></div>',
         unsafe_allow_html=True)
-else:
-    grid = st.columns(cols)
-    for i, item in enumerate(shown):
-        with grid[i % cols]:
-            is_sel = item["id"] in sel
 
-            st.markdown('<div class="card">', unsafe_allow_html=True)
+    if ai_on and API_KEY and shown:
+        sel_items      = [a for a in st.session_state.assets if a["id"] in sel]
+        sel_unanalyzed = [a for a in sel_items if not a.get("ai")]
+        analyzed_sel   = [a for a in sel_items if a.get("ai") and not (a.get("ai") or {}).get("_error")]
 
-            try:
-                st.image(item["image_url"], use_container_width=True)
-            except Exception:
-                st.markdown(
-                    '<div style="height:100px;background:var(--bg3);display:flex;'
-                    'align-items:center;justify-content:center;color:var(--mu);font-size:10px;">'
-                    'LOAD FAILED</div>', unsafe_allow_html=True)
-
-            bc   = "b-img" if item["asset_type"] == "image" else "b-vid"
-            bl   = "IMG"   if item["asset_type"] == "image" else "VID"
-            sel_b = '<span class="bdg" style="background:var(--ac);color:#fff;border-color:var(--ac)">SEL</span> ' if is_sel else ""
-            sv_b  = '<span class="bdg b-sav">★</span> ' if item.get("starred") else ""
-            ai_b  = '<span class="bdg b-ai">AI</span> ' if item.get("ai")      else ""
-            cap   = item.get("caption", "")
-            cap_h = f'<div class="card-cap">"{cap[:55]}{"..." if len(cap) > 55 else ""}"</div>' if cap else ""
-
+        bar_c, btn_c1, btn_c2, btn_c3 = st.columns([3, 1, 1, 1])
+        with bar_c:
             st.markdown(
-                '<div class="card-body">'
-                f'<div class="card-kw">{item["keyword"]} · {item["country"]}</div>'
-                + sel_b + sv_b + ai_b +
-                f'<span class="bdg {bc}">{bl}</span>'
-                + cap_h +
-                f'<div class="card-meta">{item["width"]}x{item["height"]}px · {item["created_at"][11:16]} · {item.get("capture_source","-")}</div>'
-                '</div>',
+                f'<div class="sel-bar"><span class="sel-count">{len(sel)}</span>'
+                '<span class="sel-bar-txt">선택됨  ·  ○ 버튼으로 소재를 선택하세요</span></div>',
                 unsafe_allow_html=True)
+        with btn_c1:
+            if sel_items:
+                btn_label = f"선택 분석 ({len(sel_unanalyzed)})" if sel_unanalyzed else f"선택 재분석 ({len(sel_items)})"
+                if st.button(btn_label, use_container_width=True):
+                    target_items = sel_unanalyzed if sel_unanalyzed else sel_items
+                    for it in target_items:
+                        it["ai"] = None
+                        it["img_b64"] = ""
 
-            ai_data = _sanitize_json_deep(item.get("ai")) if item.get("ai") else None
-            if ai_data:
-                if ai_data.get("_error"):
-                    # 에러 메시지 표시
-                    st.markdown(
-                        '<div class="ai-wrap"><div class="ai-box" style="border-color:var(--er)">'
-                        f'<div class="ai-head" style="color:var(--er)">분석 오류</div>'
-                        f'<div class="ai-body" style="font-size:11px">{ai_data["_error"]}</div>'
-                        '</div></div>',
-                        unsafe_allow_html=True)
-                else:
-                    has_img = bool(item.get("img_b64"))
-                    tags_str = "".join(f'<span class="ai-tag">{t}</span>' for t in ai_data.get("tags", []))
-                    vf = ai_data.get("visual_facts", {}) or {}
-                    ma = ai_data.get("marketing_analysis", {}) or {}
-                    ce = ai_data.get("conversion_elements", {}) or {}
-                    cd = ai_data.get("creative_diagnosis", {}) or {}
+                    pb = st.progress(0, text="선택 소재 캡처 중...")
+                    capture_screenshots_for_items(target_items, scrolls=scrolls)
+                    captured = sum(1 for it in target_items if it.get("img_b64"))
+                    pb.progress(0.35, text=f"캡처 완료 {captured}/{len(target_items)}개 · Claude 분석 중...")
 
-                    ocr_line = _safe_join((ai_data.get("ocr") or {}).get("texts", []), " / ")
-                    visible_text = _safe_join(vf.get("visible_text", []), " / ") or ocr_line or ai_data.get("copy", "—")
-                    objects = _safe_join(vf.get("objects", [])) or ai_data.get("main_visual", "—")
-                    colors = _safe_join(vf.get("colors", [])) or ai_data.get("tone", "—")
-                    strengths = _safe_join(cd.get("strengths", [])) or "—"
-                    weaknesses = _safe_join(cd.get("weaknesses", [])) or "—"
-                    score_line = (
-                        f'가격 {ce.get("price_emphasis", "—")} / '
-                        f'제품 {ce.get("product_visibility", "—")} / '
-                        f'가독성 {ce.get("readability", "—")} / '
-                        f'할인 {ce.get("discount_visibility", "—")} / '
-                        f'명확도 {ce.get("visual_clarity", "—")} / '
-                        f'전환력 {ce.get("overall_conversion_power", "—")}'
-                    )
-                    img_badge = '<span class="bdg b-ai" style="font-size:8px">IMG분석</span> ' if has_img else '<span class="bdg" style="background:var(--bg3);color:var(--mu);font-size:8px">텍스트추정</span> '
-                    st.markdown(
-                        '<div class="ai-wrap"><div class="ai-box">'
-                        f'<div class="ai-head">STRUCTURED CREATIVE ANALYSIS {img_badge}</div>'
-                        '<div class="ai-body">'
-                        f'<b>실제문구</b>&nbsp;{visible_text}<br>'
-                        f'<b>비주얼</b>&nbsp;&nbsp;&nbsp;{objects}<br>'
-                        f'<b>레이아웃</b>&nbsp;{ai_data.get("layout_type", vf.get("layout_type", "—"))}<br>'
-                        f'<b>후크</b>&nbsp;&nbsp;&nbsp;{ai_data.get("hook", ma.get("hook_type", "—"))}<br>'
-                        f'<b>소구</b>&nbsp;&nbsp;&nbsp;{ai_data.get("appeal", "—")}<br>'
-                        f'<b>톤&매너</b>&nbsp;{colors}<br>'
-                        f'<b>타겟</b>&nbsp;&nbsp;&nbsp;{ai_data.get("target", "—")}<br>'
-                        f'<b>메시지</b>&nbsp;{ai_data.get("message", "—")}<br>'
-                        f'<b>근거</b>&nbsp;&nbsp;&nbsp;{ai_data.get("evidence", "—")}<br>'
-                        f'<b>점수</b>&nbsp;&nbsp;&nbsp;{score_line}<br>'
-                        f'<b>점수근거</b>&nbsp;{ce.get("score_reason", "—")}<br>'
-                        f'<b>장점</b>&nbsp;&nbsp;&nbsp;{strengths}<br>'
-                        f'<b>약점</b>&nbsp;&nbsp;&nbsp;{weaknesses}<br>'
-                        f'<b>개선</b>&nbsp;&nbsp;&nbsp;{cd.get("improvement_direction", "—")}<br>'
-                        f'<div style="margin-top:6px">{tags_str}</div>'
-                        '</div></div></div>',
-                        unsafe_allow_html=True)
+                    _, errors = analyze_parallel(target_items, max_workers=3, force=True)
+                    done = sum(1 for it in target_items if it.get("ai") and not (it.get("ai") or {}).get("_error"))
+                    pb.progress(1.0, text=f"완료! 분석 성공 {done}개")
+                    pb.empty()
 
-            st.markdown('</div>', unsafe_allow_html=True)
+                    if errors:
+                        with st.expander(f"⚠ 분석 오류 {len(errors)}건", expanded=False):
+                            for e in errors:
+                                st.markdown(f'<div class="err-box">{e}</div>', unsafe_allow_html=True)
 
-            # 버튼 4개 — 아이콘으로 줄바꿈 없이
-            b1, b2, b3, b4 = st.columns(4)
-            with b1:
-                if st.button("✓" if is_sel else "○", key="sel_" + item["id"], use_container_width=True):
-                    if is_sel: st.session_state.selected.discard(item["id"])
-                    else:      st.session_state.selected.add(item["id"])
+                    # 세션 assets에도 ai 결과 반영 (DB는 analyze_parallel에서 이미 저장)
+                    id_map = {it["id"]: it for it in target_items}
+                    for a in st.session_state.assets:
+                        if a["id"] in id_map:
+                            a["ai"] = id_map[a["id"]].get("ai")
+
                     st.rerun()
-            with b2:
-                if st.button("★" if item.get("starred") else "☆", key="sv_" + item["id"], use_container_width=True):
-                    toggle_star(item["id"]); st.rerun()
-            with b3:
-                if st.button("✕", key="hd_" + item["id"], use_container_width=True):
-                    st.session_state.hidden.add(item["id"]); st.rerun()
-            with b4:
-                st.link_button("↗", item["source_url"], use_container_width=True)
+
+        with btn_c2:
+            if analyzed_sel:
+                if st.button(f"종합 인사이트 ({len(analyzed_sel)})", use_container_width=True):
+                    with st.spinner("종합 인사이트 생성 중..."):
+                        summ = summarize_insights(analyzed_sel)
+                        if summ:
+                            st.session_state.summary = summ
+                            db_save_summary(summ)
+                    st.rerun()
+        with btn_c3:
+            if analyzed_sel:
+                if st.button(f"PPT 내보내기 ({len(analyzed_sel)})", use_container_width=True):
+                    with st.spinner(f"PPT 생성 중 ({len(analyzed_sel)}개 소재)..."):
+                        pptx_bytes = to_pptx(analyzed_sel, st.session_state.get("summary"))
+                    fname = f"adintel_{time.strftime('%Y%m%d_%H%M')}.pptx"
+                    st.download_button(
+                        "다운로드",
+                        data=pptx_bytes,
+                        file_name=fname,
+                        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                        use_container_width=True,
+                    )
+
+    if not shown:
+        st.markdown(
+            '<div class="empty"><div class="empty-t">수집된 소재가 없습니다</div>'
+            '<div class="empty-d">키워드를 입력하고 검색하면<br>'
+            'Meta Ad Library에서 광고 소재를 실시간으로 수집합니다.</div></div>',
+            unsafe_allow_html=True)
+    else:
+        grid = st.columns(cols)
+        for i, item in enumerate(shown):
+            with grid[i % cols]:
+                is_sel = item["id"] in sel
+
+                st.markdown('<div class="card">', unsafe_allow_html=True)
+                try:
+                    st.image(item["image_url"], use_container_width=True)
+                except Exception:
+                    st.markdown(
+                        '<div style="height:100px;background:var(--bg3);display:flex;'
+                        'align-items:center;justify-content:center;color:var(--mu);font-size:10px;">'
+                        'LOAD FAILED</div>', unsafe_allow_html=True)
+
+                bc   = "b-img" if item["asset_type"] == "image" else "b-vid"
+                bl   = "IMG"   if item["asset_type"] == "image" else "VID"
+                sel_b = '<span class="bdg" style="background:var(--ac);color:#fff;border-color:var(--ac)">SEL</span> ' if is_sel else ""
+                sv_b  = '<span class="bdg b-sav">★</span> ' if item.get("starred") else ""
+                ai_b  = '<span class="bdg b-ai">AI</span> ' if (item.get("ai") and not (item.get("ai") or {}).get("_error")) else ""
+                er_b  = '<span class="bdg" style="background:rgba(232,40,74,.1);color:var(--er);border-color:rgba(232,40,74,.2)">ERR</span> ' if (item.get("ai") and (item.get("ai") or {}).get("_error")) else ""
+                cap   = item.get("caption", "")
+                cap_h = f'<div class="card-cap">"{cap[:55]}{"..." if len(cap) > 55 else ""}"</div>' if cap else ""
+
+                ai_data = _sanitize_json_deep(item.get("ai")) if item.get("ai") else None
+                conv_score_str = ""
+                if ai_data and not ai_data.get("_error"):
+                    ce = ai_data.get("conversion_elements") or {}
+                    s = ce.get("overall_conversion_power")
+                    if s:
+                        conv_score_str = f' · ⚡{s}/5'
+
+                st.markdown(
+                    '<div class="card-body">'
+                    f'<div class="card-kw">{item["keyword"]} · {item["country"]}{conv_score_str}</div>'
+                    + sel_b + sv_b + ai_b + er_b +
+                    f'<span class="bdg {bc}">{bl}</span>'
+                    + cap_h +
+                    f'<div class="card-meta">{item["width"]}x{item["height"]}px · {item["created_at"][11:16]}</div>'
+                    '</div>',
+                    unsafe_allow_html=True)
+
+                if ai_data:
+                    if ai_data.get("_error"):
+                        st.markdown(
+                            '<div class="ai-wrap"><div class="ai-box" style="border-color:var(--er)">'
+                            f'<div class="ai-head" style="color:var(--er)">분석 오류</div>'
+                            f'<div class="ai-body" style="font-size:11px">{ai_data["_error"]}</div>'
+                            '</div></div>',
+                            unsafe_allow_html=True)
+                    else:
+                        vf = ai_data.get("visual_facts") or {}
+                        ma = ai_data.get("marketing_analysis") or {}
+                        ce = ai_data.get("conversion_elements") or {}
+                        cd = ai_data.get("creative_diagnosis") or {}
+                        has_img = bool(db_get_img_b64(item["id"]))
+
+                        ocr_line = _safe_join((ai_data.get("ocr") or {}).get("texts", []), " / ")
+                        visible_text = _safe_join(vf.get("visible_text", []), " / ") or ocr_line or ai_data.get("copy", "—")
+                        objects  = _safe_join(vf.get("objects", [])) or ai_data.get("main_visual", "—")
+                        colors   = _safe_join(vf.get("colors", [])) or ai_data.get("tone", "—")
+                        strengths  = _safe_join((cd.get("strengths") or []))  or "—"
+                        weaknesses = _safe_join((cd.get("weaknesses") or [])) or "—"
+                        score_line = (
+                            f'가격 {ce.get("price_emphasis","—")} / '
+                            f'제품 {ce.get("product_visibility","—")} / '
+                            f'가독성 {ce.get("readability","—")} / '
+                            f'전환력 {ce.get("overall_conversion_power","—")}'
+                        )
+                        img_badge = (
+                            '<span class="bdg b-ai" style="font-size:8px">IMG분석</span> ' if has_img
+                            else '<span class="bdg" style="background:var(--bg3);color:var(--mu);font-size:8px">텍스트추정</span> '
+                        )
+                        tags_str = "".join(f'<span class="ai-tag">{t}</span>' for t in ai_data.get("tags", []))
+                        st.markdown(
+                            '<div class="ai-wrap"><div class="ai-box">'
+                            f'<div class="ai-head">STRUCTURED CREATIVE ANALYSIS {img_badge}</div>'
+                            '<div class="ai-body">'
+                            f'<b>실제문구</b>&nbsp;{visible_text}<br>'
+                            f'<b>비주얼</b>&nbsp;&nbsp;&nbsp;{objects}<br>'
+                            f'<b>레이아웃</b>&nbsp;{ai_data.get("layout_type", vf.get("layout_type","—"))}<br>'
+                            f'<b>후크</b>&nbsp;&nbsp;&nbsp;{ai_data.get("hook", ma.get("hook_type","—"))}<br>'
+                            f'<b>소구</b>&nbsp;&nbsp;&nbsp;{ai_data.get("appeal","—")}<br>'
+                            f'<b>타겟</b>&nbsp;&nbsp;&nbsp;{ai_data.get("target","—")}<br>'
+                            f'<b>메시지</b>&nbsp;{ai_data.get("message","—")}<br>'
+                            f'<b>점수</b>&nbsp;&nbsp;&nbsp;{score_line}<br>'
+                            f'<b>장점</b>&nbsp;&nbsp;&nbsp;{strengths}<br>'
+                            f'<b>약점</b>&nbsp;&nbsp;&nbsp;{weaknesses}<br>'
+                            f'<b>개선</b>&nbsp;&nbsp;&nbsp;{cd.get("improvement_direction","—")}<br>'
+                            f'<div style="margin-top:6px">{tags_str}</div>'
+                            '</div></div></div>',
+                            unsafe_allow_html=True)
+
+                st.markdown('</div>', unsafe_allow_html=True)
+
+                b1, b2, b3, b4 = st.columns(4)
+                with b1:
+                    if st.button("✓" if is_sel else "○", key="sel_" + item["id"], use_container_width=True):
+                        if is_sel:
+                            st.session_state.selected.discard(item["id"])
+                        else:
+                            st.session_state.selected.add(item["id"])
+                        st.rerun()
+                with b2:
+                    if st.button("★" if item.get("starred") else "☆", key="sv_" + item["id"], use_container_width=True):
+                        toggle_star(item["id"])
+                        st.rerun()
+                with b3:
+                    if st.button("✕", key="hd_" + item["id"], use_container_width=True):
+                        st.session_state.hidden.add(item["id"])
+                        db_add_hidden(item["id"])
+                        st.rerun()
+                with b4:
+                    st.link_button("↗", item["source_url"], use_container_width=True)
+
+
+# ── 탭2: 비교 테이블 ─────────────────────────────────────────
+with tab_table:
+    render_comparison_table(all_a)
 
 
 # ============================================================
@@ -1665,7 +2136,7 @@ th   = "DARK" if D else "LIGHT"
 ai_s = "AI ON · Haiku" if (ai_on and API_KEY) else "AI OFF"
 st.markdown(
     f'<div style="border-top:2px solid var(--bd);padding-top:14px;display:flex;justify-content:space-between;">'
-    f'<span style="font-family:Pretendard,sans-serif;font-size:10px;color:var(--mu)">ADINTEL v3.3 · {th} · {ai_s}</span>'
-    f'<span style="font-family:Pretendard,sans-serif;font-size:10px;color:var(--mu)">{time.strftime("%Y-%m-%d")}</span>'
+    f'<span style="font-size:10px;color:var(--mu)">ADINTEL v4.0 · {th} · {ai_s} · SQLite 자동저장</span>'
+    f'<span style="font-size:10px;color:var(--mu)">{time.strftime("%Y-%m-%d")}</span>'
     f'</div>',
     unsafe_allow_html=True)
