@@ -28,6 +28,205 @@ st.set_page_config(page_title="AD INTEL", page_icon="◼", layout="wide")
 
 
 # ============================================================
+# 로딩 스플래시 스크린
+# ============================================================
+st.markdown("""
+<div id="adintel-loader">
+  <div class="al-bg-grid"></div>
+  <div class="al-inner">
+    <div class="al-logo-wrap">
+      <div class="al-logo">AD<span>INTEL</span></div>
+      <div class="al-ver-badge">v4.0</div>
+    </div>
+    <div class="al-tagline">META AD LIBRARY INTELLIGENCE BOARD</div>
+    <div class="al-divider"></div>
+    <div class="al-bar-wrap">
+      <div class="al-bar"></div>
+    </div>
+    <div class="al-dots">
+      <span></span><span></span><span></span>
+    </div>
+  </div>
+</div>
+
+<style>
+/* ── 전체 오버레이 ── */
+#adintel-loader {
+  position: fixed;
+  inset: 0;
+  z-index: 999999;
+  background: #0b0d11;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: al-fadeout 0.55s cubic-bezier(.4,0,.2,1) 2.6s forwards;
+  pointer-events: none;
+}
+
+/* ── 격자 배경 ── */
+.al-bg-grid {
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(26,109,255,.06) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(26,109,255,.06) 1px, transparent 1px);
+  background-size: 48px 48px;
+  animation: al-grid-in 1.2s ease forwards;
+  opacity: 0;
+}
+
+/* ── 중앙 콘텐츠 ── */
+.al-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0;
+  animation: al-rise 0.7s cubic-bezier(.2,.8,.4,1) 0.1s forwards;
+  opacity: 0;
+  transform: translateY(18px);
+}
+
+/* ── 로고 행 ── */
+.al-logo-wrap {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.al-logo {
+  font-family: 'Pretendard', -apple-system, sans-serif;
+  font-size: 52px;
+  font-weight: 900;
+  letter-spacing: -1.5px;
+  color: #e8eaf0;
+  line-height: 1;
+}
+
+.al-logo span {
+  color: #4f8aff;
+}
+
+.al-ver-badge {
+  font-family: 'Pretendard', -apple-system, sans-serif;
+  font-size: 11px;
+  font-weight: 600;
+  color: #4f8aff;
+  border: 1.5px solid rgba(79,138,255,.35);
+  border-radius: 6px;
+  padding: 3px 9px;
+  letter-spacing: 0.5px;
+  background: rgba(79,138,255,.08);
+  align-self: flex-start;
+  margin-top: 4px;
+}
+
+/* ── 태그라인 ── */
+.al-tagline {
+  font-family: 'Pretendard', -apple-system, sans-serif;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 3px;
+  color: #4b5263;
+  text-transform: uppercase;
+  margin-bottom: 28px;
+}
+
+/* ── 가로 구분선 ── */
+.al-divider {
+  width: 280px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(79,138,255,.5), transparent);
+  margin-bottom: 24px;
+}
+
+/* ── 프로그레스 바 ── */
+.al-bar-wrap {
+  width: 280px;
+  height: 2px;
+  background: rgba(255,255,255,.06);
+  border-radius: 2px;
+  overflow: hidden;
+  margin-bottom: 20px;
+}
+
+.al-bar {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, #1a6dff, #5b9dff);
+  border-radius: 2px;
+  animation: al-progress 2.4s cubic-bezier(.1,.6,.4,1) 0.4s forwards;
+  box-shadow: 0 0 8px rgba(79,138,255,.6);
+}
+
+/* ── 점 세 개 인디케이터 ── */
+.al-dots {
+  display: flex;
+  gap: 6px;
+}
+
+.al-dots span {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #4f8aff;
+  opacity: 0.3;
+  animation: al-pulse 1.2s ease-in-out infinite;
+}
+
+.al-dots span:nth-child(1) { animation-delay: 0s; }
+.al-dots span:nth-child(2) { animation-delay: 0.2s; }
+.al-dots span:nth-child(3) { animation-delay: 0.4s; }
+
+/* ── 키프레임 ── */
+@keyframes al-fadeout {
+  0%   { opacity: 1; }
+  100% { opacity: 0; pointer-events: none; }
+}
+
+@keyframes al-grid-in {
+  0%   { opacity: 0; }
+  100% { opacity: 1; }
+}
+
+@keyframes al-rise {
+  0%   { opacity: 0; transform: translateY(18px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes al-progress {
+  0%   { width: 0%; }
+  30%  { width: 45%; }
+  65%  { width: 72%; }
+  85%  { width: 88%; }
+  100% { width: 100%; }
+}
+
+@keyframes al-pulse {
+  0%, 100% { opacity: 0.2; transform: scale(1); }
+  50%       { opacity: 1;   transform: scale(1.4); }
+}
+</style>
+
+<script>
+// CSS 애니메이션이 끝난 뒤 DOM에서 완전히 제거
+(function() {
+  const hide = () => {
+    const el = document.getElementById('adintel-loader');
+    if (el) el.remove();
+  };
+  setTimeout(hide, 3200);
+  // 사용자가 클릭하면 즉시 제거
+  document.addEventListener('click', function once() {
+    hide();
+    document.removeEventListener('click', once);
+  }, { once: true });
+})();
+</script>
+""", unsafe_allow_html=True)
+
+
+# ============================================================
 # DB 레이어 — SQLite 영속성
 # ============================================================
 def db_init():
