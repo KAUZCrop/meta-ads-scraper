@@ -2073,20 +2073,56 @@ def test_api():
 def summarize_insights(analyzed_items):
     if not API_KEY or not analyzed_items:
         return None
+
     snippets = []
     for a in analyzed_items[:20]:
         ai = a.get("ai") or {}
-        if not ai:
+        if not ai or ai.get("_error"):
             continue
-        snippets.append(
-            "- 소구:" + ai.get("appeal", "") +
-            " / 후크:" + ai.get("hook", "") +
-            " / 타겟:" + ai.get("target", "") +
-            " / 메시지:" + ai.get("message", "") +
-            " / 약점:" + _safe_join((ai.get("creative_diagnosis") or {}).get("weaknesses", []))
-        )
+
+        # 신규 프레임워크(consumer_reaction/layer_diagnosis) vs 기존(appeal/hook) 분기
+        is_framework = "consumer_reaction" in ai or "layer_diagnosis" in ai
+
+        if is_framework:
+            cr  = ai.get("consumer_reaction") or {}
+            ld  = ai.get("layer_diagnosis")   or {}
+            vd  = ai.get("verdict")           or {}
+            ap  = ld.get("appeal")            or {}
+            s03 = cr.get("step_0s3")          or {}
+            s3s = cr.get("step_3s")           or {}
+
+            hook     = s03.get("hook_strength") or cr.get("flow_summary") or ""
+            appeal   = ap.get("primary_type")   or ""
+            target   = s3s.get("target_signal") or ""
+            message  = vd.get("one_line")        or ""
+            weakness = vd.get("top_weakness")    or ld.get("weakest_layer") or ""
+            strength = vd.get("top_strength")    or ""
+            fix_pt   = vd.get("priority_fix")    or ""
+        else:
+            hook     = ai.get("hook")    or ""
+            appeal   = ai.get("appeal")  or ""
+            target   = ai.get("target")  or ""
+            message  = ai.get("message") or ""
+            cd       = ai.get("creative_diagnosis") or {}
+            weakness = _safe_join((cd.get("weaknesses") or []))
+            strength = _safe_join((cd.get("strengths")  or []))
+            fix_pt   = cd.get("improvement_direction") or ""
+
+        # 하나라도 의미 있는 값이 있을 때만 추가
+        if any(v.strip() for v in [appeal, hook, target, message] if v):
+            snippets.append(
+                f"- 소구:{appeal}"
+                f" / 후크:{hook}"
+                f" / 타겟:{target}"
+                f" / 메시지:{message}"
+                f" / 강점:{strength}"
+                f" / 약점:{weakness}"
+                f" / 개선:{fix_pt}"
+            )
+
     if not snippets:
         return None
+
     json_schema = (
         '{"dominant_appeal":"가장 많이 쓰인 소구 유형 + 비율 설명",'
         '"common_target":"공통 타겟 고객 요약",'
@@ -2098,16 +2134,20 @@ def summarize_insights(analyzed_items):
         '"tags":["태그1","태그2","태그3","태그4","태그5"]}'
     )
     prompt = (
-        "광고 전략 전문가입니다. 아래는 Meta 광고 소재 분석 결과들입니다.\n\n" +
-        "\n".join(snippets) +
-        "\n\n이 소재들을 종합해 아래 JSON만 반환 (마크다운/백틱 없이 순수 JSON):\n" + json_schema
+        f"광고 전략 전문가입니다. 아래는 Meta 광고 소재 {len(snippets)}개의 분석 결과입니다.\n\n"
+        + "\n".join(snippets)
+        + "\n\n이 소재들을 종합해 아래 JSON만 반환 (마크다운/백틱 없이 순수 JSON):\n"
+        + json_schema
     )
     try:
         resp = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 900,
-                  "messages": [{"role": "user", "content": prompt}]},
+            json={
+                "model": _anthropic_model("summary"),
+                "max_tokens": 900,
+                "messages": [{"role": "user", "content": prompt}],
+            },
             timeout=30,
         )
         if resp.status_code != 200:
@@ -3096,90 +3136,112 @@ with tab_board:
                 if analyzed_sel else False
             )
 
-        # ── 분석 애니메이션: 컬럼 밖 전체 너비 ──
-        status = st.empty()
+    else:
+        # ai_on 꺼져 있어도 — 분석된 소재 선택돼 있으면 인사이트·PPT 버튼 노출
+        sel_items      = [a for a in st.session_state.assets if a["id"] in sel]
+        sel_unanalyzed = []
+        analyzed_sel   = [a for a in sel_items if a.get("ai") and not (a.get("ai") or {}).get("_error")]
+        do_analyze     = False
 
-        if do_analyze and sel_items:
-            target_items = sel_unanalyzed if sel_unanalyzed else sel_items
+        if analyzed_sel and API_KEY and shown:
+            st.markdown(
+                f'<div class="sel-bar"><span class="sel-count">{len(sel)}</span>'
+                f'<span class="sel-bar-txt">선택됨 · 분석 완료 {len(analyzed_sel)}개 · AI ON 켜면 추가 분석 가능</span></div>',
+                unsafe_allow_html=True)
+            _c1, _c2 = st.columns(2)
+            with _c1:
+                do_insight = st.button(f"종합 인사이트 ({len(analyzed_sel)})", use_container_width=True)
+            with _c2:
+                do_ppt = st.button(f"PPT 내보내기 ({len(analyzed_sel)})", use_container_width=True)
+        else:
+            do_insight = False
+            do_ppt     = False
+
+    # 분석 애니메이션 플레이스홀더 — 항상 정의 (ai_on 여부 무관)
+    status = st.empty()
+
+    if do_analyze and sel_items:
+        target_items = sel_unanalyzed if sel_unanalyzed else sel_items
+        for it in target_items:
+            it["ai"] = None
+            it["img_b64"] = ""
+        n = len(target_items)
+        use_framework = st.session_state.get("analysis_framework", "standard") == "framework"
+
+        status.markdown(
+            _analysis_status_html("capture", 0, n, "Playwright로 광고 카드 전체 영역을 캡처합니다"),
+            unsafe_allow_html=True,
+        )
+        capture_screenshots_for_items(target_items, scrolls=scrolls)
+        captured = sum(1 for it in target_items if it.get("img_b64"))
+
+        mode_label = "소비자 반응 + 레이어 진단 중" if use_framework else "OCR + Vision 분석 병렬 실행 중"
+        status.markdown(
+            _analysis_status_html(
+                "analyze", captured, n,
+                f"캡처 완료 {captured}개 · {mode_label}",
+            ),
+            unsafe_allow_html=True,
+        )
+
+        if use_framework:
+            errors = []
             for it in target_items:
-                it["ai"] = None
-                it["img_b64"] = ""
-            n = len(target_items)
-            use_framework = st.session_state.get("analysis_framework", "standard") == "framework"
+                b64 = it.get("img_b64") or db_get_img_b64(it["id"])
+                if not b64:
+                    it["ai"] = {"_error": "캡처 실패"}
+                    errors.append(f"[{it['keyword']}] 캡처 실패")
+                    continue
+                result = analyze_new(b64, it["keyword"])
+                it["ai"] = result
+                db_set_field(it["id"], ai_json=json.dumps(result, ensure_ascii=False))
+                if result.get("_error"):
+                    errors.append(f"[{it['keyword']}] {result['_error']}")
+        else:
+            _, errors = analyze_parallel(target_items, max_workers=3, force=True)
 
-            status.markdown(
-                _analysis_status_html("capture", 0, n, "Playwright로 광고 카드 전체 영역을 캡처합니다"),
-                unsafe_allow_html=True,
-            )
-            capture_screenshots_for_items(target_items, scrolls=scrolls)
-            captured = sum(1 for it in target_items if it.get("img_b64"))
+        done = sum(1 for it in target_items if it.get("ai") and not (it.get("ai") or {}).get("_error"))
 
-            mode_label = "소비자 반응 + 레이어 진단 중" if use_framework else "OCR + Vision 분석 병렬 실행 중"
-            status.markdown(
-                _analysis_status_html(
-                    "analyze", captured, n,
-                    f"캡처 완료 {captured}개 · {mode_label}",
-                ),
-                unsafe_allow_html=True,
-            )
+        status.markdown(
+            _analysis_status_html("done", done, n),
+            unsafe_allow_html=True,
+        )
+        time.sleep(1.8)
+        status.empty()
 
-            if use_framework:
-                # 신규 프레임워크: analyze_new 직접 호출
-                errors = []
-                for it in target_items:
-                    b64 = it.get("img_b64") or db_get_img_b64(it["id"])
-                    if not b64:
-                        it["ai"] = {"_error": "캡처 실패"}
-                        errors.append(f"[{it['keyword']}] 캡처 실패")
-                        continue
-                    result = analyze_new(b64, it["keyword"])
-                    it["ai"] = result
-                    db_set_field(it["id"], ai_json=json.dumps(result, ensure_ascii=False))
-                    if result.get("_error"):
-                        errors.append(f"[{it['keyword']}] {result['_error']}")
+        if errors:
+            with st.expander(f"⚠ 분석 오류 {len(errors)}건", expanded=False):
+                for e in errors:
+                    st.markdown(f'<div class="err-box">{e}</div>', unsafe_allow_html=True)
+
+        id_map = {it["id"]: it for it in target_items}
+        for a in st.session_state.assets:
+            if a["id"] in id_map:
+                a["ai"] = id_map[a["id"]].get("ai")
+        st.rerun()
+
+    if do_insight:
+        with st.spinner("종합 인사이트 생성 중..."):
+            summ = summarize_insights(analyzed_sel)
+            if summ:
+                st.session_state.summary = summ
+                db_save_summary(summ)
             else:
-                # 기존 방식
-                _, errors = analyze_parallel(target_items, max_workers=3, force=True)
-
-            done = sum(1 for it in target_items if it.get("ai") and not (it.get("ai") or {}).get("_error"))
-
-            status.markdown(
-                _analysis_status_html("done", done, n),
-                unsafe_allow_html=True,
-            )
-            time.sleep(1.8)
-            status.empty()
-
-            if errors:
-                with st.expander(f"⚠ 분석 오류 {len(errors)}건", expanded=False):
-                    for e in errors:
-                        st.markdown(f'<div class="err-box">{e}</div>', unsafe_allow_html=True)
-
-            id_map = {it["id"]: it for it in target_items}
-            for a in st.session_state.assets:
-                if a["id"] in id_map:
-                    a["ai"] = id_map[a["id"]].get("ai")
+                st.warning("인사이트 생성 실패 — 분석 데이터가 충분하지 않거나 API 오류입니다.")
+        if summ:
             st.rerun()
 
-        if do_insight:
-            with st.spinner("종합 인사이트 생성 중..."):
-                summ = summarize_insights(analyzed_sel)
-                if summ:
-                    st.session_state.summary = summ
-                    db_save_summary(summ)
-            st.rerun()
-
-        if do_ppt:
-            with st.spinner(f"PPT 생성 중 ({len(analyzed_sel)}개 소재)..."):
-                pptx_bytes = to_pptx(analyzed_sel, st.session_state.get("summary"))
-            fname = f"adintel_{time.strftime('%Y%m%d_%H%M')}.pptx"
-            st.download_button(
-                "다운로드",
-                data=pptx_bytes,
-                file_name=fname,
-                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                use_container_width=True,
-            )
+    if do_ppt:
+        with st.spinner(f"PPT 생성 중 ({len(analyzed_sel)}개 소재)..."):
+            pptx_bytes = to_pptx(analyzed_sel, st.session_state.get("summary"))
+        fname = f"adintel_{time.strftime('%Y%m%d_%H%M')}.pptx"
+        st.download_button(
+            "다운로드",
+            data=pptx_bytes,
+            file_name=fname,
+            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            use_container_width=True,
+        )
 
     if not shown:
         st.markdown(
