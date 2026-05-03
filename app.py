@@ -399,7 +399,8 @@ if "initialized" not in st.session_state:
     st.session_state.dark           = False
     st.session_state.selected       = set()
     st.session_state.summary        = db_load_summary()
-    st.session_state.analysis_model = "haiku"   # haiku | sonnet
+    st.session_state.analysis_model     = "haiku"   # haiku | sonnet
+    st.session_state.analysis_framework = "standard"  # standard | framework
     st.session_state.initialized    = True
 
 
@@ -553,6 +554,13 @@ a{{color:var(--ac)!important;}}
 ::-webkit-scrollbar-track{{background:var(--bg2);}}
 ::-webkit-scrollbar-thumb{{background:var(--bd2);border-radius:4px;}}
 .stSpinner>div{{border-top-color:var(--ac)!important;}}
+.chip{{display:inline-block;font-size:10px;font-weight:700;padding:3px 10px;border-radius:20px;margin:2px;}}
+.chip-a{{background:var(--ac2);color:var(--ac);border:1px solid var(--ac2);}}
+.chip-ok{{background:rgba(61,255,160,.1);color:var(--ok);border:1px solid rgba(61,255,160,.25);}}
+.chip-wn{{background:rgba(255,184,79,.1);color:var(--wn);border:1px solid rgba(255,184,79,.25);}}
+.chip-er{{background:rgba(255,79,107,.1);color:var(--er);border:1px solid rgba(255,79,107,.25);}}
+.panel{{background:var(--bg2);border:1px solid var(--bd);border-radius:12px;padding:20px 22px;margin-bottom:14px;}}
+.panel-title{{font-size:9px;font-weight:700;color:var(--ac);letter-spacing:2px;text-transform:uppercase;margin-bottom:14px;}}
 [data-testid="stTabs"]{{border-bottom:2px solid var(--bd);}}
 </style>""", unsafe_allow_html=True)
 
@@ -1612,6 +1620,406 @@ def analyze_parallel(items, max_workers=6, force=False):
 
     return items, errors
 
+
+# ============================================================
+# 신규 분석 프레임워크 -- 소비자 반응 + 레이어 진단
+# ============================================================
+def score_color(s):
+    if s >= 4: return "var(--ok)"
+    if s >= 3: return "var(--wn)"
+    return "var(--er)"
+
+def risk_chip(risk: str) -> str:
+    r = risk.lower()
+    if "높음" in r or "high" in r:
+        return f'<span class="chip chip-er">이탈 위험 높음</span>'
+    if "중간" in r or "mid" in r:
+        return f'<span class="chip chip-wn">이탈 위험 중간</span>'
+    return f'<span class="chip chip-ok">이탈 위험 낮음</span>'
+
+def analyze_new(b64: str, keyword: str) -> dict:
+    prompt = f"""당신은 광고 효과 분석 전문가입니다.
+검색 키워드: {keyword}
+
+아래 두 프레임워크를 순서대로 적용하세요.
+
+=== FRAMEWORK 1: 소비자 시선 반응 시뮬레이션 ===
+실제 소비자가 피드를 스크롤하다 이 광고를 만났을 때 시간 순서대로 어떻게 반응하는지 추적하세요.
+
+[0.3초] 첫인상
+- 시선이 처음 닿는 요소가 무엇인지 (색상 대비, 크기, 위치 기준으로 판단)
+- 스크롤을 멈추게 할 만큼 강한 시각적 훅이 있는지
+- 이탈 위험도: 높음 / 중간 / 낮음
+
+[1초] 맥락 파악
+- 1초 안에 "이게 무슨 광고인지" 카테고리가 식별되는지
+- 브랜드 또는 제품이 즉시 인식 가능한지
+- 이탈 위험도: 높음 / 중간 / 낮음
+
+[3초] 관심 판단
+- "나한테 해당되는 얘기인가"를 판단할 타겟 신호가 있는지
+  (가격대, 라이프스타일, 문제 상황, 타겟 인물)
+- 스크롤을 계속 멈추고 읽을 이유가 있는지
+- 이탈 위험도: 높음 / 중간 / 낮음
+
+[클릭] 행동 유도
+- 클릭하게 만드는 트리거가 보이는지
+  (CTA 명확성, 한정성, 손실 회피, 이익 강조 중 어떤 것인지)
+- 이탈 위험도: 높음 / 중간 / 낮음
+
+=== FRAMEWORK 2: 광고 레이어 진단 ===
+광고 기획자 관점에서 4개 레이어를 독립적으로 평가하세요.
+
+[레이어 1] 주목 (Attention)
+- 컬러 대비, 인물 시선, 텍스트 크기, 여백 활용이 주목을 끄는지
+- 점수: 1-5
+
+[레이어 2] 메시지 (Message)
+- 헤드카피-서브카피-비주얼의 위계가 명확한지
+- 이미지와 텍스트가 같은 방향을 가리키는지 (일치) 또는 충돌하는지
+- 점수: 1-5
+
+[레이어 3] 소구 (Appeal)
+- 이성 소구 (가격/스펙/비교): 수치나 비교 근거가 있는지
+- 감성 소구 (공감/열망/공포/유머): 감정 트리거가 있는지
+- 사회적 증명 (후기/수치/인증): 신뢰 요소가 있는지
+- 주 소구 / 부 소구 명시, 점수: 1-5
+
+[레이어 4] 행동 (Action)
+- CTA가 명확하고 눈에 띄는지
+- 즉각 행동을 유도하는 긴박감 요소가 있는지
+- 점수: 1-5
+
+=== 출력 규칙 ===
+- 순수 JSON만 반환. 마크다운 백틱 절대 금지.
+- 문자열 내 줄바꿈 절대 금지. 모든 텍스트는 한 줄로.
+- 문자열 내 큰따옴표는 작은따옴표로 교체.
+- 이미지에서 보이는 것만 근거로 쓰고 추정은 "추정:" 접두어 사용.
+- 점수는 실제 이미지 기준으로 차등 부여. 모두 3점 금지.
+
+=== JSON 구조 ===
+{{
+  "consumer_reaction": {{
+    "step_0s3": {{
+      "first_attention": "시선이 처음 닿는 요소",
+      "hook_strength": "강함 / 보통 / 약함",
+      "hook_reason": "판단 근거 (보이는 요소 인용)",
+      "dropout_risk": "높음 / 중간 / 낮음"
+    }},
+    "step_1s": {{
+      "category_readable": true,
+      "brand_readable": true,
+      "readability_blocker": "식별 방해 요소 또는 null",
+      "dropout_risk": "높음 / 중간 / 낮음"
+    }},
+    "step_3s": {{
+      "target_signal": "타겟을 암시하는 시각적 단서",
+      "relevance_trigger": "관심을 유지시키는 요소",
+      "dropout_risk": "높음 / 중간 / 낮음"
+    }},
+    "step_click": {{
+      "cta_visible": true,
+      "cta_text": "CTA 문구 또는 null",
+      "action_trigger_type": "한정성 / 손실회피 / 이익강조 / CTA명시 / 없음",
+      "dropout_risk": "높음 / 중간 / 낮음"
+    }},
+    "biggest_dropout_point": "0.3초 / 1초 / 3초 / 클릭 중 가장 이탈 위험이 높은 단계",
+    "flow_summary": "소비자 반응 흐름 한 문장 요약"
+  }},
+  "layer_diagnosis": {{
+    "attention": {{
+      "score": 3,
+      "key_elements": ["주목을 끄는 요소들"],
+      "weakness": "주목 레이어의 약점"
+    }},
+    "message": {{
+      "score": 3,
+      "hierarchy": "헤드-서브-비주얼 위계 설명",
+      "alignment": "일치 / 충돌 / 부분충돌",
+      "weakness": "메시지 레이어의 약점"
+    }},
+    "appeal": {{
+      "score": 3,
+      "primary_type": "이성소구 / 감성소구 / 사회적증명",
+      "primary_evidence": "주 소구의 근거 요소",
+      "secondary_type": "보조 소구 또는 null",
+      "weakness": "소구 레이어의 약점"
+    }},
+    "action": {{
+      "score": 3,
+      "cta_strength": "강함 / 보통 / 약함",
+      "urgency_element": "긴박감 요소 또는 null",
+      "weakness": "행동 레이어의 약점"
+    }},
+    "weakest_layer": "attention / message / appeal / action 중 가장 낮은 것",
+    "total_score": 12
+  }},
+  "verdict": {{
+    "one_line": "이 광고를 한 문장으로 진단",
+    "top_strength": "가장 강한 점 하나",
+    "top_weakness": "가장 치명적인 약점 하나",
+    "priority_fix": "지금 당장 고쳐야 할 것 한 가지",
+    "competitive_position": "경쟁 소재 대비 포지션 추정 (상위 / 중위 / 하위)"
+  }},
+  "tags": ["태그1", "태그2", "태그3", "태그4", "태그5"]
+}}
+
+점수: 1=매우약함 2=약함 3=보통 4=강함 5=매우강함"""
+
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={"x-api-key": API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+        json={
+            "model": st.session_state.get("model", "claude-haiku-4-5-20251001"),
+            "max_tokens": 2000,
+            "temperature": 0,
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+                {"type": "text", "text": prompt},
+            ]}],
+        },
+        timeout=60,
+    )
+    if resp.status_code != 200:
+        return {"_error": f"API {resp.status_code}"}
+    txt = resp.json()["content"][0]["text"].strip().replace("```json","").replace("```","")
+    # 줄바꿈 수정
+    result = []
+    in_str = False
+    esc = False
+    for ch in txt:
+        if esc:
+            result.append(ch); esc = False
+        elif ch == "\\" and in_str:
+            result.append(ch); esc = True
+        elif ch == '"':
+            in_str = not in_str; result.append(ch)
+        elif ch in ("\n", "\r") and in_str:
+            result.append(" ")
+        else:
+            result.append(ch)
+    cleaned = "".join(result)
+    import re
+    cleaned = re.sub(r",(\s*[}\]])", r"\1", cleaned)
+    s = cleaned.find("{"); e = cleaned.rfind("}") + 1
+    try:
+        return json.loads(cleaned[s:e])
+    except Exception as ex:
+        return {"_error": str(ex), "_raw": cleaned[:400]}
+
+
+# ============================================================
+# UI 렌더링 — 새 프레임워크 결과
+
+def render_new_result(result: dict):
+    if result.get("_error"):
+        st.error(f"분석 오류: {result['_error']}")
+        if result.get("_raw"):
+            with st.expander("원본 응답"):
+                st.code(result["_raw"])
+        return
+
+    cr  = result.get("consumer_reaction", {})
+    ld  = result.get("layer_diagnosis", {})
+    vd  = result.get("verdict", {})
+
+    # ── 소비자 반응 타임라인 ──
+    st.markdown('<div class="panel"><div class="panel-title">FRAMEWORK 1 — 소비자 시선 반응 시뮬레이션</div>', unsafe_allow_html=True)
+
+    steps = [
+        ("0.3초", "첫인상 & 스크롤 훅",
+         cr.get("step_0s3", {}).get("first_attention", "—"),
+         cr.get("step_0s3", {}).get("hook_reason", ""),
+         cr.get("step_0s3", {}).get("hook_strength", "—"),
+         cr.get("step_0s3", {}).get("dropout_risk", "—")),
+        ("1초", "카테고리 & 브랜드 인식",
+         ("카테고리 식별 가능" if cr.get("step_1s", {}).get("category_readable") else "카테고리 불명확")
+         + " / " +
+         ("브랜드 인식 가능" if cr.get("step_1s", {}).get("brand_readable") else "브랜드 불명확"),
+         cr.get("step_1s", {}).get("readability_blocker") or "",
+         None,
+         cr.get("step_1s", {}).get("dropout_risk", "—")),
+        ("3초", "관심 & 타겟 신호",
+         cr.get("step_3s", {}).get("target_signal", "—"),
+         cr.get("step_3s", {}).get("relevance_trigger", ""),
+         None,
+         cr.get("step_3s", {}).get("dropout_risk", "—")),
+        ("클릭", "행동 유도",
+         (cr.get("step_click", {}).get("cta_text") or "CTA 없음")
+         + " / " + (cr.get("step_click", {}).get("action_trigger_type") or "—"),
+         "",
+         None,
+         cr.get("step_click", {}).get("dropout_risk", "—")),
+    ]
+
+    cols = st.columns(4)
+    for col, (time_lbl, title, val, sub, strength, risk) in zip(cols, steps):
+        with col:
+            risk_color = (
+                "var(--er)" if "높음" in (risk or "") else
+                "var(--wn)" if "중간" in (risk or "") else
+                "var(--ok)"
+            )
+            strength_html = ""
+            if strength:
+                s_color = (
+                    "var(--ok)" if strength == "강함" else
+                    "var(--wn)" if strength == "보통" else
+                    "var(--er)"
+                )
+                strength_html = f'<span style="font-size:10px;color:{s_color};font-weight:700;">{strength}</span> &nbsp;'
+
+            st.markdown(
+                f'<div class="step-box">'
+                f'<div class="step-num">{time_lbl}</div>'
+                f'<div class="step-label">{title}</div>'
+                f'<div class="step-val">{val}</div>'
+                + (f'<div style="font-size:10px;color:var(--mu);margin-top:4px;">{sub}</div>' if sub else "")
+                + f'<div class="step-risk" style="margin-top:8px;">{strength_html}'
+                + f'<span style="font-size:10px;color:{risk_color};font-weight:700;">이탈위험 {risk}</span></div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    # 핵심 이탈 포인트
+    biggest = cr.get("biggest_dropout_point", "—")
+    flow    = cr.get("flow_summary", "")
+    st.markdown(
+        f'<div style="margin-top:12px;background:var(--bg3);border-radius:8px;padding:12px 14px;">'
+        f'<span style="font-size:9px;font-weight:700;color:var(--er);letter-spacing:1.5px;">BIGGEST DROPOUT POINT</span>'
+        f'<span style="font-size:13px;font-weight:700;color:var(--tx);margin-left:12px;">{biggest}</span>'
+        f'<div style="font-size:11px;color:var(--mu);margin-top:6px;">{flow}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── 레이어 진단 ──
+    st.markdown('<div class="panel"><div class="panel-title">FRAMEWORK 2 — 광고 레이어 진단</div>', unsafe_allow_html=True)
+
+    layers = [
+        ("ATTENTION", "주목", ld.get("attention", {})),
+        ("MESSAGE",   "메시지", ld.get("message", {})),
+        ("APPEAL",    "소구", ld.get("appeal", {})),
+        ("ACTION",    "행동", ld.get("action", {})),
+    ]
+
+    for lbl_en, lbl_ko, layer in layers:
+        score = int(layer.get("score", 0))
+        col_score = score_color(score)
+        bar_w = score * 20
+
+        # 레이어별 세부 정보
+        detail_parts = []
+        if lbl_en == "MESSAGE":
+            align = layer.get("alignment", "")
+            if align:
+                align_col = "var(--ok)" if align == "일치" else "var(--er)" if align == "충돌" else "var(--wn)"
+                detail_parts.append(f'<span style="color:{align_col};font-size:10px;font-weight:700;">{align}</span>')
+            hier = layer.get("hierarchy", "")
+            if hier:
+                detail_parts.append(f'<span style="font-size:10px;color:var(--mu)">{hier}</span>')
+        elif lbl_en == "APPEAL":
+            p_type = layer.get("primary_type", "")
+            p_ev   = layer.get("primary_evidence", "")
+            s_type = layer.get("secondary_type", "")
+            if p_type:
+                detail_parts.append(f'<span class="chip chip-a">{p_type}</span>')
+            if p_ev:
+                detail_parts.append(f'<span style="font-size:10px;color:var(--mu)">{p_ev}</span>')
+            if s_type and s_type != "null":
+                detail_parts.append(f'<span class="chip chip-wn">{s_type}</span>')
+        elif lbl_en == "ACTION":
+            cta_str = layer.get("cta_strength", "")
+            urg     = layer.get("urgency_element", "")
+            if cta_str:
+                cta_col = "var(--ok)" if cta_str == "강함" else "var(--wn)" if cta_str == "보통" else "var(--er)"
+                detail_parts.append(f'<span style="font-size:10px;color:{cta_col};font-weight:700;">CTA {cta_str}</span>')
+            if urg and urg != "null":
+                detail_parts.append(f'<span style="font-size:10px;color:var(--mu)">{urg}</span>')
+        elif lbl_en == "ATTENTION":
+            keys = layer.get("key_elements", [])
+            if isinstance(keys, list):
+                for k in keys[:3]:
+                    detail_parts.append(f'<span class="chip chip-a">{k}</span>')
+
+        weakness = layer.get("weakness", "")
+        detail_html = " &nbsp; ".join(detail_parts)
+
+        st.markdown(
+            f'<div class="score-row" style="margin-bottom:12px;align-items:flex-start;">'
+            f'<div style="width:90px;flex-shrink:0;">'
+            f'<div style="font-size:8px;font-weight:700;color:var(--ac);letter-spacing:1px;">{lbl_en}</div>'
+            f'<div style="font-size:11px;color:var(--tx2);">{lbl_ko}</div>'
+            f'</div>'
+            f'<div style="flex:1;">'
+            f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">'
+            f'<div style="flex:1;background:var(--bg3);border-radius:3px;height:5px;overflow:hidden;">'
+            f'<div style="width:{bar_w}%;height:100%;background:{col_score};border-radius:3px;transition:.4s;"></div>'
+            f'</div>'
+            f'<span style="font-size:12px;font-weight:700;color:{col_score};width:20px;">{score}</span>'
+            f'</div>'
+            + (f'<div style="margin-bottom:4px;">{detail_html}</div>' if detail_html else "")
+            + (f'<div style="font-size:10px;color:var(--mu);">약점: {weakness}</div>' if weakness else "")
+            + f'</div></div>',
+            unsafe_allow_html=True,
+        )
+
+    # 총점
+    total = int(ld.get("total_score", 0))
+    weakest = ld.get("weakest_layer", "—")
+    total_color = score_color(total / 4)
+    st.markdown(
+        f'<div style="display:flex;justify-content:space-between;align-items:center;'
+        f'background:var(--bg3);border-radius:8px;padding:10px 14px;margin-top:4px;">'
+        f'<span style="font-size:10px;color:var(--mu);">가장 약한 레이어: '
+        f'<span style="color:var(--er);font-weight:700;">{weakest.upper()}</span></span>'
+        f'<span style="font-size:18px;font-weight:800;color:{total_color};">'
+        f'{total} <span style="font-size:11px;color:var(--mu);">/ 20</span></span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── Verdict ──
+    one_line = vd.get("one_line", "—")
+    strength = vd.get("top_strength", "—")
+    weakness = vd.get("top_weakness", "—")
+    fix      = vd.get("priority_fix", "—")
+    pos      = vd.get("competitive_position", "—")
+    pos_col  = "var(--ok)" if "상위" in pos else "var(--er)" if "하위" in pos else "var(--wn)"
+
+    tags_html = "".join(
+        f'<span class="chip chip-a">{t}</span>'
+        for t in result.get("tags", [])
+    )
+
+    st.markdown(
+        f'<div class="verdict-box">'
+        f'<div class="verdict-title">VERDICT — 종합 진단</div>'
+        f'<div style="font-size:14px;font-weight:700;color:var(--tx);margin-bottom:14px;">{one_line}</div>'
+        f'<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px;">'
+        f'<div><div style="font-size:9px;color:var(--ok);letter-spacing:1px;font-weight:700;margin-bottom:4px;">TOP STRENGTH</div>'
+        f'<div style="font-size:11px;color:var(--tx2);">{strength}</div></div>'
+        f'<div><div style="font-size:9px;color:var(--er);letter-spacing:1px;font-weight:700;margin-bottom:4px;">TOP WEAKNESS</div>'
+        f'<div style="font-size:11px;color:var(--tx2);">{weakness}</div></div>'
+        f'</div>'
+        f'<div style="background:var(--bg3);border-radius:8px;padding:10px 12px;margin-bottom:10px;">'
+        f'<div style="font-size:9px;color:var(--wn);letter-spacing:1px;font-weight:700;margin-bottom:4px;">PRIORITY FIX</div>'
+        f'<div style="font-size:12px;color:var(--tx);">{fix}</div>'
+        f'</div>'
+        f'<div style="display:flex;align-items:center;justify-content:space-between;">'
+        f'<div>{tags_html}</div>'
+        f'<span style="font-size:10px;color:var(--mu);">경쟁 포지션: '
+        f'<span style="color:{pos_col};font-weight:700;">{pos}</span></span>'
+        f'</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+# ============================================================
+# UI 렌더링 — 기존 방식 결과
+
 def test_api():
     if not API_KEY:
         return False, "API Key가 없습니다. Streamlit Secrets를 확인하세요."
@@ -2324,6 +2732,24 @@ with st.sidebar:
             if model_choice == "sonnet":
                 st.info("비전 분석 품질이 크게 높습니다.\n소재당 약 10~20원 수준.")
 
+            # 분석 프레임워크 선택
+            st.markdown('<div class="slbl">분석 프레임워크</div>', unsafe_allow_html=True)
+            framework = st.radio(
+                "framework_radio",
+                options=["standard", "framework"],
+                format_func=lambda x: (
+                    "기존 방식 (OBSERVE/INTERPRET)"
+                    if x == "standard"
+                    else "신규 프레임워크 (소비자 반응 + 레이어 진단)"
+                ),
+                index=0 if st.session_state.get("analysis_framework", "standard") == "standard" else 1,
+                label_visibility="collapsed",
+            )
+            if framework != st.session_state.get("analysis_framework"):
+                st.session_state.analysis_framework = framework
+            if framework == "framework":
+                st.info("소비자 시선 흐름 + 4레이어 진단.\n분석 시간이 다소 길어집니다.")
+
             if st.button("API 연결 테스트", use_container_width=True):
                 ok, msg = test_api()
                 if ok:
@@ -2605,6 +3031,7 @@ with tab_board:
                 it["ai"] = None
                 it["img_b64"] = ""
             n = len(target_items)
+            use_framework = st.session_state.get("analysis_framework", "standard") == "framework"
 
             status.markdown(
                 _analysis_status_html("capture", 0, n, "Playwright로 광고 카드 전체 영역을 캡처합니다"),
@@ -2613,14 +3040,33 @@ with tab_board:
             capture_screenshots_for_items(target_items, scrolls=scrolls)
             captured = sum(1 for it in target_items if it.get("img_b64"))
 
+            mode_label = "소비자 반응 + 레이어 진단 중" if use_framework else "OCR + Vision 분석 병렬 실행 중"
             status.markdown(
                 _analysis_status_html(
                     "analyze", captured, n,
-                    f"캡처 완료 {captured}개 · OCR + Vision 분석 병렬 실행 중",
+                    f"캡처 완료 {captured}개 · {mode_label}",
                 ),
                 unsafe_allow_html=True,
             )
-            _, errors = analyze_parallel(target_items, max_workers=3, force=True)
+
+            if use_framework:
+                # 신규 프레임워크: analyze_new 직접 호출
+                errors = []
+                for it in target_items:
+                    b64 = it.get("img_b64") or db_get_img_b64(it["id"])
+                    if not b64:
+                        it["ai"] = {"_error": "캡처 실패"}
+                        errors.append(f"[{it['keyword']}] 캡처 실패")
+                        continue
+                    result = analyze_new(b64, it["keyword"])
+                    it["ai"] = result
+                    db_set_field(it["id"], ai_json=json.dumps(result, ensure_ascii=False))
+                    if result.get("_error"):
+                        errors.append(f"[{it['keyword']}] {result['_error']}")
+            else:
+                # 기존 방식
+                _, errors = analyze_parallel(target_items, max_workers=3, force=True)
+
             done = sum(1 for it in target_items if it.get("ai") and not (it.get("ai") or {}).get("_error"))
 
             status.markdown(
@@ -2757,32 +3203,88 @@ with tab_board:
                         )
                         tags_str = "".join(f'<span class="ai-tag">{t}</span>' for t in ai_data.get("tags", []))
 
-                        def ev_span(ev):
-                            if not ev or ev == "확인 불가":
-                                return ""
-                            return f'<span style="font-size:10px;color:var(--mu);display:block;padding-left:4px;border-left:2px solid var(--bd2);margin:1px 0 4px 0">근거: {ev[:80]}</span>'
+                        # 신규 프레임워크 결과인지 판단
+                        is_framework = "consumer_reaction" in ai_data or "layer_diagnosis" in ai_data
 
-                        st.markdown(
-                            '<div class="ai-wrap"><div class="ai-box">'
-                            f'<div class="ai-head">OBSERVE → INTERPRET {capture_badge}</div>'
-                            '<div class="ai-body">'
-                            '<span style="font-size:9px;color:var(--ac);letter-spacing:1px">OBSERVE</span><br>'
-                            f'<b>실제문구</b>&nbsp;{visible_text}<br>'
-                            f'<b>비주얼</b>&nbsp;&nbsp;&nbsp;{main_visual}<br>'
-                            f'<b>레이아웃</b>&nbsp;{layout}<br>'
-                            f'<b>색감</b>&nbsp;&nbsp;&nbsp;&nbsp;{colors_str}<br>'
-                            '<span style="font-size:9px;color:var(--ac);letter-spacing:1px;margin-top:6px;display:block">INTERPRET (관찰 근거 기반)</span>'
-                            f'<b>후크</b>&nbsp;&nbsp;&nbsp;{hook}<br>{ev_span(hook_ev)}'
-                            f'<b>소구</b>&nbsp;&nbsp;&nbsp;{appeal}<br>{ev_span(appeal_ev)}'
-                            f'<b>타겟</b>&nbsp;&nbsp;&nbsp;{target}<br>{ev_span(target_ev)}'
-                            f'<b>메시지</b>&nbsp;{message}<br>'
-                            f'<b>점수</b>&nbsp;&nbsp;&nbsp;{score_line}<br>'
-                            f'<b>장점</b>&nbsp;&nbsp;&nbsp;{strengths}<br>'
-                            f'<b>약점</b>&nbsp;&nbsp;&nbsp;{weaknesses}<br>'
-                            f'<b>개선</b>&nbsp;&nbsp;&nbsp;{improve}<br>'
-                            f'<div style="margin-top:6px">{tags_str}</div>'
-                            '</div></div></div>',
-                            unsafe_allow_html=True)
+                        if is_framework:
+                            # 신규 프레임워크 카드 렌더링
+                            cr  = ai_data.get("consumer_reaction", {})
+                            ld  = ai_data.get("layer_diagnosis", {})
+                            vd  = ai_data.get("verdict", {})
+                            s03  = cr.get("step_0s3", {})
+                            sclk = cr.get("step_click", {})
+
+                            def risk_color(r):
+                                return "var(--er)" if "높음" in (r or "") else "var(--wn)" if "중간" in (r or "") else "var(--ok)"
+
+                            biggest = cr.get("biggest_dropout_point", "—")
+                            layers_score = [
+                                ("주목", int(ld.get("attention", {}).get("score", 0))),
+                                ("메시지", int(ld.get("message", {}).get("score", 0))),
+                                ("소구", int(ld.get("appeal", {}).get("score", 0))),
+                                ("행동", int(ld.get("action", {}).get("score", 0))),
+                            ]
+                            layers_html = " ".join(
+                                f'<span style="font-size:9px;font-weight:700;'
+                                f'color:{score_color(s)};">{l}:{s}</span>'
+                                for l, s in layers_score
+                            )
+                            verdict_line = vd.get("one_line", "—")
+                            fix_point    = vd.get("priority_fix", "—")
+                            dropout_col  = risk_color(biggest)
+                            hook_str     = s03.get("hook_strength", "—")
+                            hook_col     = "var(--ok)" if hook_str == "강함" else "var(--wn)" if hook_str == "보통" else "var(--er)"
+
+                            st.markdown(
+                                '<div class="ai-wrap"><div class="ai-box">'
+                                f'<div class="ai-head">소비자 반응 + 레이어 진단 {capture_badge}</div>'
+                                '<div class="ai-body">'
+                                f'<span style="font-size:9px;color:var(--ac);letter-spacing:1px">소비자 반응</span><br>'
+                                f'<b>첫인상</b>&nbsp;{s03.get("first_attention","—")}'
+                                f' &nbsp;<span style="font-size:10px;color:{hook_col};">훅 {hook_str}</span><br>'
+                                f'<b>이탈위험</b>&nbsp;'
+                                f'<span style="color:{risk_color(cr.get("step_0s3",{}).get("dropout_risk",""))};font-size:10px;">0.3초</span> '
+                                f'<span style="color:{risk_color(cr.get("step_1s",{}).get("dropout_risk",""))};font-size:10px;">1초</span> '
+                                f'<span style="color:{risk_color(cr.get("step_3s",{}).get("dropout_risk",""))};font-size:10px;">3초</span> '
+                                f'<span style="color:{risk_color(cr.get("step_click",{}).get("dropout_risk",""))};font-size:10px;">클릭</span><br>'
+                                f'<b>최대이탈</b>&nbsp;<span style="color:{dropout_col};font-weight:700;">{biggest}</span><br>'
+                                f'<span style="font-size:9px;color:var(--ac);letter-spacing:1px;margin-top:5px;display:block">레이어 진단</span>'
+                                f'{layers_html}<br>'
+                                f'<b>약점레이어</b>&nbsp;{ld.get("weakest_layer","—").upper()}<br>'
+                                f'<span style="font-size:9px;color:var(--ac);letter-spacing:1px;margin-top:5px;display:block">VERDICT</span>'
+                                f'<b>진단</b>&nbsp;{verdict_line}<br>'
+                                f'<b>수정포인트</b>&nbsp;{fix_point}<br>'
+                                f'<div style="margin-top:6px">{tags_str}</div>'
+                                '</div></div></div>',
+                                unsafe_allow_html=True)
+                        else:
+                            # 기존 방식 카드 렌더링
+                            def ev_span(ev):
+                                if not ev or ev == "확인 불가":
+                                    return ""
+                                return f'<span style="font-size:10px;color:var(--mu);display:block;padding-left:4px;border-left:2px solid var(--bd2);margin:1px 0 4px 0">근거: {ev[:80]}</span>'
+
+                            st.markdown(
+                                '<div class="ai-wrap"><div class="ai-box">'
+                                f'<div class="ai-head">OBSERVE → INTERPRET {capture_badge}</div>'
+                                '<div class="ai-body">'
+                                '<span style="font-size:9px;color:var(--ac);letter-spacing:1px">OBSERVE</span><br>'
+                                f'<b>실제문구</b>&nbsp;{visible_text}<br>'
+                                f'<b>비주얼</b>&nbsp;&nbsp;&nbsp;{main_visual}<br>'
+                                f'<b>레이아웃</b>&nbsp;{layout}<br>'
+                                f'<b>색감</b>&nbsp;&nbsp;&nbsp;&nbsp;{colors_str}<br>'
+                                '<span style="font-size:9px;color:var(--ac);letter-spacing:1px;margin-top:6px;display:block">INTERPRET (관찰 근거 기반)</span>'
+                                f'<b>후크</b>&nbsp;&nbsp;&nbsp;{hook}<br>{ev_span(hook_ev)}'
+                                f'<b>소구</b>&nbsp;&nbsp;&nbsp;{appeal}<br>{ev_span(appeal_ev)}'
+                                f'<b>타겟</b>&nbsp;&nbsp;&nbsp;{target}<br>{ev_span(target_ev)}'
+                                f'<b>메시지</b>&nbsp;{message}<br>'
+                                f'<b>점수</b>&nbsp;&nbsp;&nbsp;{score_line}<br>'
+                                f'<b>장점</b>&nbsp;&nbsp;&nbsp;{strengths}<br>'
+                                f'<b>약점</b>&nbsp;&nbsp;&nbsp;{weaknesses}<br>'
+                                f'<b>개선</b>&nbsp;&nbsp;&nbsp;{improve}<br>'
+                                f'<div style="margin-top:6px">{tags_str}</div>'
+                                '</div></div></div>',
+                                unsafe_allow_html=True)
 
                 st.markdown('</div>', unsafe_allow_html=True)
 
