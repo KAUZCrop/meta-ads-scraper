@@ -1782,30 +1782,13 @@ def analyze_new(b64: str, keyword: str) -> dict:
     )
     if resp.status_code != 200:
         return {"_error": f"API {resp.status_code}"}
-    txt = resp.json()["content"][0]["text"].strip().replace("```json","").replace("```","")
-    # 줄바꿈 수정
-    result = []
-    in_str = False
-    esc = False
-    for ch in txt:
-        if esc:
-            result.append(ch); esc = False
-        elif ch == "\\" and in_str:
-            result.append(ch); esc = True
-        elif ch == '"':
-            in_str = not in_str; result.append(ch)
-        elif ch in ("\n", "\r") and in_str:
-            result.append(" ")
-        else:
-            result.append(ch)
-    cleaned = "".join(result)
-    import re
-    cleaned = re.sub(r",(\s*[}\]])", r"\1", cleaned)
-    s = cleaned.find("{"); e = cleaned.rfind("}") + 1
-    try:
-        return json.loads(cleaned[s:e])
-    except Exception as ex:
-        return {"_error": str(ex), "_raw": cleaned[:400]}
+    txt = resp.json()["content"][0]["text"].strip()
+    parsed, parse_error = _parse_ai_json(txt)
+    if parse_error:
+        return {"_error": parse_error}
+    if not isinstance(parsed, dict):
+        return {"_error": "응답이 JSON object가 아닙니다."}
+    return parsed
 
 
 # ============================================================
