@@ -230,34 +230,43 @@ st.markdown("""
 # DB 레이어 — SQLite 영속성
 # ============================================================
 def db_init():
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.executescript("""
-    CREATE TABLE IF NOT EXISTS assets (
-        id TEXT PRIMARY KEY,
-        keyword TEXT, country TEXT, asset_type TEXT,
-        image_url TEXT, source_url TEXT, caption TEXT,
-        width INTEGER, height INTEGER, created_at TEXT,
-        starred INTEGER DEFAULT 0,
-        capture_source TEXT DEFAULT '',
-        img_b64 TEXT DEFAULT '',
-        ai_json TEXT DEFAULT ''
-    );
-    CREATE TABLE IF NOT EXISTS hidden (id TEXT PRIMARY KEY);
-    CREATE TABLE IF NOT EXISTS history (keyword TEXT PRIMARY KEY, added_at TEXT);
-    CREATE TABLE IF NOT EXISTS summary_store (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        summary_json TEXT,
-        created_at TEXT
-    );
-    """)
-    con.commit()
-    con.close()
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=15)
+        # WAL 모드: 동시 읽기/쓰기 개선 (analyze_parallel 스레드 충돌 방지)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA synchronous=NORMAL")
+        con.execute("PRAGMA cache_size=-8000")  # 8MB 캐시
+        cur = con.cursor()
+        cur.executescript("""
+        CREATE TABLE IF NOT EXISTS assets (
+            id TEXT PRIMARY KEY,
+            keyword TEXT, country TEXT, asset_type TEXT,
+            image_url TEXT, source_url TEXT, caption TEXT,
+            width INTEGER, height INTEGER, created_at TEXT,
+            starred INTEGER DEFAULT 0,
+            capture_source TEXT DEFAULT '',
+            img_b64 TEXT DEFAULT '',
+            ai_json TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS hidden (id TEXT PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS history (keyword TEXT PRIMARY KEY, added_at TEXT);
+        CREATE TABLE IF NOT EXISTS summary_store (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            summary_json TEXT,
+            created_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_assets_image_url ON assets(image_url);
+        CREATE INDEX IF NOT EXISTS idx_assets_keyword   ON assets(keyword);
+        """)
+        con.commit()
+        con.close()
+    except Exception as e:
+        st.error(f"DB 초기화 오류: {e}")
 
 def db_upsert_assets(assets: list):
     if not assets:
         return
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=15)
     cur = con.cursor()
     for a in assets:
         cur.execute("""
@@ -279,7 +288,7 @@ def db_upsert_assets(assets: list):
 
 def db_load_assets() -> list:
     """img_b64는 세션 메모리 절약을 위해 로드하지 않음. 분석 시 DB에서 직접 조회."""
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=15)
     cur = con.cursor()
     cur.execute("""
         SELECT id,keyword,country,asset_type,image_url,source_url,caption,
@@ -308,7 +317,7 @@ def db_load_assets() -> list:
     return out
 
 def db_get_img_b64(aid: str) -> str:
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=15)
     cur = con.cursor()
     cur.execute("SELECT img_b64 FROM assets WHERE id=?", (aid,))
     row = cur.fetchone()
@@ -323,39 +332,39 @@ def db_set_field(aid: str, **kwargs):
         return
     sql = ", ".join(f"{k}=?" for k, _ in pairs)
     vals = [v for _, v in pairs] + [aid]
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=15)
     cur = con.cursor()
     cur.execute(f"UPDATE assets SET {sql} WHERE id=?", vals)
     con.commit()
     con.close()
 
 def db_add_hidden(aid: str):
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=15)
     con.execute("INSERT OR IGNORE INTO hidden VALUES (?)", (aid,))
     con.commit()
     con.close()
 
 def db_load_hidden() -> set:
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=15)
     rows = con.execute("SELECT id FROM hidden").fetchall()
     con.close()
     return {r[0] for r in rows}
 
 def db_add_history(kw: str):
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=15)
     con.execute("INSERT OR IGNORE INTO history VALUES (?,?)",
                 (kw, time.strftime("%Y-%m-%d %H:%M:%S")))
     con.commit()
     con.close()
 
 def db_load_history() -> list:
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=15)
     rows = con.execute("SELECT keyword FROM history ORDER BY added_at").fetchall()
     con.close()
     return [r[0] for r in rows]
 
 def db_save_summary(s: dict):
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=15)
     con.execute("DELETE FROM summary_store")
     con.execute("INSERT INTO summary_store (summary_json,created_at) VALUES (?,?)",
                 (json.dumps(s, ensure_ascii=False), time.strftime("%Y-%m-%d %H:%M:%S")))
@@ -363,7 +372,7 @@ def db_save_summary(s: dict):
     con.close()
 
 def db_load_summary() -> dict | None:
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=15)
     row = con.execute("SELECT summary_json FROM summary_store ORDER BY id DESC LIMIT 1").fetchone()
     con.close()
     if row:
@@ -373,16 +382,46 @@ def db_load_summary() -> dict | None:
             return None
     return None
 
+def db_get_known_fps() -> set:
+    """
+    DB에 저장된 모든 이미지의 (path, asset_type, width, height) 지문 집합.
+    누적 검색 시 세션에 없는 이미지도 중복 탐지할 수 있도록 DB 레벨에서 조회.
+    실패 시 빈 set 반환 — 크래시 방지.
+    """
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=15)
+        rows = con.execute(
+            "SELECT image_url, asset_type, width, height FROM assets"
+        ).fetchall()
+        con.close()
+        fps: set = set()
+        for image_url, asset_type, width, height in rows:
+            path = _url_path_key(image_url or "")
+            if path:
+                fps.add((
+                    path,
+                    (asset_type or "").strip(),
+                    int(width or 0),
+                    int(height or 0),
+                ))
+        return fps
+    except Exception:
+        return set()
+
+
 def db_reset():
-    con = sqlite3.connect(DB_PATH)
-    con.executescript("""
-        DELETE FROM assets;
-        DELETE FROM hidden;
-        DELETE FROM history;
-        DELETE FROM summary_store;
-    """)
-    con.commit()
-    con.close()
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=15)
+        con.executescript("""
+            DELETE FROM assets;
+            DELETE FROM hidden;
+            DELETE FROM history;
+            DELETE FROM summary_store;
+        """)
+        con.commit()
+        con.close()
+    except Exception:
+        pass
 
 db_init()
 
@@ -574,15 +613,27 @@ def valid(w, h):
     r = w / h if h else 0
     return 0.25 <= r <= 3.0
 
+def _url_path_key(url: str) -> str:
+    """CDN 노드 무관 이미지 경로 지문 — netloc/query 제외, path만 사용.
+    같은 이미지라도 fbcdn CDN 노드가 달라지면 netloc이 바뀌므로 반드시 path만 써야 함."""
+    try:
+        return urlparse((url or "").strip()).path.rstrip("/") or url
+    except Exception:
+        return url or ""
+
+
 def make_fp(item):
-    url = (item.get("image_url") or "").strip()
-    p = urlparse(url)
+    """
+    이미지 중복 탐지 지문.
+    - netloc 제외: scontent-icn1 vs scontent-sin6 등 CDN 노드가 달라져도 동일 이미지 인식
+    - caption 제외: alt 텍스트가 요청마다 달라질 수 있음
+    """
+    path = _url_path_key(item.get("image_url") or "")
     return (
-        f"{p.netloc}{p.path}",
+        path,
         (item.get("asset_type") or "").strip(),
-        (item.get("caption") or "").strip().lower()[:80],
-        item.get("width", 0),
-        item.get("height", 0),
+        int(item.get("width") or 0),
+        int(item.get("height") or 0),
     )
 
 def _bytes_to_b64(img_bytes: bytes | None) -> str:
@@ -2071,18 +2122,28 @@ def summarize_insights(analyzed_items):
 # ============================================================
 # 유틸
 # ============================================================
-def merge(existing, new_items):
-    known = {make_fp(a) for a in existing}
-    known |= {make_fp(a) for a in existing if a["id"] in st.session_state.hidden}
-    out, n = list(existing), 0
+def merge(existing: list, new_items: list, extra_fps: set | None = None) -> tuple:
+    """
+    existing  : 세션의 현재 assets
+    new_items : 새로 스크래핑된 items
+    extra_fps : DB 전체 지문 집합 (세션에 없어도 중복 탐지, 누적 검색 전용)
+    반환      : (merged_list, added_count, skipped_count)
+    """
+    known: set = {make_fp(a) for a in existing}
+    if extra_fps:
+        known |= extra_fps
+
+    out = list(existing)
+    added = skipped = 0
     for item in new_items:
-        k = make_fp(item)
-        if k in known:
+        fp = make_fp(item)
+        if fp in known:
+            skipped += 1
             continue
-        known.add(k)
+        known.add(fp)
         out.append(item)
-        n += 1
-    return out, n
+        added += 1
+    return out, added, skipped
 
 def get_visible(ftype, fkw, fstar, fai):
     hidden = st.session_state.hidden
@@ -2849,22 +2910,30 @@ if do_new or do_add:
     else:
         try:
             if do_new:
+                # 새 검색 — 세션 + DB 완전 초기화
+                db_reset()
                 st.session_state.assets   = []
                 st.session_state.hidden   = set()
                 st.session_state.history  = []
                 st.session_state.summary  = None
                 st.session_state.selected = set()
 
+            existing_count = len(st.session_state.assets)
             pb = st.progress(0, text=f"'{q}' — Meta Ad Library 접근 중...")
             items = scrape(q, country, scrolls, max_n)
-            pb.progress(0.7, text=f"수집 완료 {len(items)}개 · DB 저장 중...")
+            pb.progress(0.6, text=f"수집 완료 {len(items)}개 · 중복 제거 중...")
 
-            merged, added = merge(st.session_state.assets, items)
+            # 누적 검색: DB 레벨 지문도 포함해 중복 탐지
+            extra_fps = db_get_known_fps() if do_add else None
+            merged, added, skipped = merge(st.session_state.assets, items, extra_fps)
             st.session_state.assets = merged
 
-            # 신규 소재 DB 저장
-            new_only = [a for a in merged if any(n["id"] == a["id"] for n in items)]
-            db_upsert_assets(new_only)
+            # 신규 소재만 DB 저장 — O(n) set 기반
+            pb.progress(0.85, text=f"{added}개 신규 소재 DB 저장 중...")
+            if added > 0:
+                new_ids = {n["id"] for n in items}
+                new_only = [a for a in merged if a["id"] in new_ids]
+                db_upsert_assets(new_only)
 
             if q not in st.session_state.history:
                 st.session_state.history.append(q)
@@ -2873,12 +2942,34 @@ if do_new or do_add:
             pb.progress(1.0, text="완료!")
             pb.empty()
 
-            st.session_state.log.append({"t": time.strftime("%H:%M"), "kw": q, "n": added, "ok": True})
-            st.success(f"{added}개 수집 · DB 저장 완료") if added > 0 else st.info("새 소재 없음")
+            st.session_state.log.append({
+                "t": time.strftime("%H:%M"), "kw": q, "n": added, "ok": True
+            })
+
+            if added > 0:
+                msg = f"**{added}개** 추가됨"
+                if skipped > 0:
+                    msg += f" · {skipped}개 중복 제외"
+                if do_add and existing_count > 0:
+                    msg += f" (보드 누적: {len(st.session_state.assets)}개)"
+                st.success(msg)
+            else:
+                if skipped > 0:
+                    st.info(
+                        f"새 소재 없음 — {skipped}개 전부 기존 보드에 이미 있어요. "
+                        f"스크롤 깊이를 높이거나 다른 키워드를 시도해보세요."
+                    )
+                else:
+                    st.warning(
+                        "수집된 소재가 없어요. Meta Ad Library에서 해당 키워드의 "
+                        "광고를 찾지 못했거나 이미지 로드에 실패했을 수 있어요."
+                    )
             st.rerun()
 
         except Exception as e:
-            st.session_state.log.append({"t": time.strftime("%H:%M"), "kw": q, "n": 0, "ok": False})
+            st.session_state.log.append({
+                "t": time.strftime("%H:%M"), "kw": q, "n": 0, "ok": False
+            })
             st.error(f"오류: {e}")
 
 
