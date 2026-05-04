@@ -493,6 +493,13 @@ html,body,[class*="css"]{{font-family:'Pretendard',sans-serif;background:var(--b
 
 .srch{{background:var(--bg2);border:1.5px solid var(--bd);border-radius:14px;padding:16px 20px;margin-bottom:1.2rem;}}
 .srch-lbl{{font-size:9px;color:var(--mu);letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;}}
+.kw-chip{{display:inline-flex;align-items:center;gap:5px;background:var(--bg3);border:1px solid var(--bd2);border-radius:6px;padding:3px 10px;font-size:11px;color:var(--tx2);margin:2px;}}
+.kw-chip-active{{background:var(--ac2);border-color:var(--ac);color:var(--ac);}}
+.kw-chip-done{{background:rgba(61,255,160,.08);border-color:rgba(61,255,160,.25);color:var(--ok);}}
+.kw-chip-error{{background:rgba(255,79,107,.08);border-color:rgba(255,79,107,.25);color:var(--er);}}
+.multi-progress{{background:var(--bg);border:1px solid var(--bd);border-radius:12px;padding:16px 20px;margin-bottom:12px;}}
+.multi-progress-title{{font-size:9px;font-weight:700;color:var(--ac);letter-spacing:2px;margin-bottom:12px;}}
+.kw-row{{display:flex;align-items:center;gap:10px;margin-bottom:8px;padding:8px 12px;background:var(--bg2);border-radius:8px;border:1px solid var(--bd);}}
 
 .sc{{background:var(--bg);border:1.5px solid var(--bd);border-radius:12px;padding:20px 20px 18px;position:relative;overflow:hidden;box-shadow:var(--sh);transition:.2s;}}
 .sc:hover{{border-color:var(--ac);box-shadow:var(--sh2);}}
@@ -2922,11 +2929,11 @@ elif ai_on and not API_KEY:
 # 검색창
 # ============================================================
 st.markdown('<div class="srch">', unsafe_allow_html=True)
-st.markdown('<div class="srch-lbl">KEYWORD SEARCH</div>', unsafe_allow_html=True)
+st.markdown('<div class="srch-lbl">KEYWORD SEARCH — 쉼표로 구분하면 다중 키워드 순차 수집</div>', unsafe_allow_html=True)
 c1, c2, c3 = st.columns([5, 1, 1])
 with c1:
     kw = st.text_input("kw",
-        placeholder="예: 캐리어, 공기청정기, 스킨케어, 다이어트",
+        placeholder="예: 캐리어, 여행가방, 트롤리  (쉼표로 구분 → 다중 수집)",
         label_visibility="collapsed",
         on_change=lambda: st.session_state.update({"_enter": True}))
 with c2:
@@ -2936,42 +2943,129 @@ with c3:
 
 if st.session_state.pop("_enter", False):
     do_new = True
-st.caption("엔터 / 검색 = 새 검색   ·   누적 검색 = 기존 보드에 추가   ·   💾 수집 결과 자동 DB저장")
+
+# 입력 파싱 — 쉼표 구분, 중복·빈값 제거
+raw_kws = [k.strip() for k in (kw or "").split(",") if k.strip()]
+kw_unique = list(dict.fromkeys(raw_kws))  # 순서 유지 중복 제거
+
+if len(kw_unique) > 1:
+    chips = "".join(
+        f'<span class="kw-chip">{k}</span>' for k in kw_unique
+    )
+    st.markdown(
+        f'<div style="margin-top:8px;">{chips}'
+        f'<span style="font-size:10px;color:var(--mu);margin-left:8px;">'
+        f'{len(kw_unique)}개 키워드 · 순차 수집</span></div>',
+        unsafe_allow_html=True,
+    )
+
+st.caption(
+    "단일 키워드: 캐리어   ·   다중 키워드: 캐리어, 여행가방, 트롤리   ·   "
+    "누적 검색 = 기존 보드에 추가"
+)
 st.markdown('</div>', unsafe_allow_html=True)
 
 
 # ============================================================
-# 검색 실행
+# 검색 실행 — 단일/다중 공통 처리
 # ============================================================
-if do_new or do_add:
-    q = (kw or "").strip()
-    if not q:
-        st.warning("검색어를 입력하세요.")
-    else:
+def _run_search(keywords: list[str], is_new: bool, is_add: bool):
+    """
+    keywords : 파싱된 키워드 목록 (1개 이상)
+    is_new   : 새 검색 (보드 초기화)
+    is_add   : 누적 검색
+
+    순차 실행 — Playwright 인스턴스를 키워드마다 열고 닫아
+    메모리 피크를 단일 검색과 동일하게 유지.
+    """
+    if is_new:
+        db_reset()
+        st.session_state.assets   = []
+        st.session_state.hidden   = set()
+        st.session_state.history  = []
+        st.session_state.summary  = None
+        st.session_state.selected = set()
+
+    total_kws    = len(keywords)
+    total_added  = 0
+    total_skip   = 0
+    failed_kws   = []
+    board_before = len(st.session_state.assets)
+
+    # ── 다중 키워드 진행 패널 ──
+    multi_slot = st.empty()
+
+    def _render_progress(statuses: list[tuple[str, str, str]]):
+        """
+        statuses: [(keyword, state, detail)]
+        state: 'wait' | 'running' | 'done' | 'error'
+        """
+        state_cfg = {
+            "wait":    ("var(--mu)",  "대기 중",  "kw-chip"),
+            "running": ("var(--ac)",  "수집 중",  "kw-chip kw-chip-active"),
+            "done":    ("var(--ok)",  "완료",     "kw-chip kw-chip-done"),
+            "error":   ("var(--er)",  "오류",     "kw-chip kw-chip-error"),
+        }
+        rows_html = ""
+        for kw_name, state, detail in statuses:
+            col, lbl, cls = state_cfg.get(state, state_cfg["wait"])
+            icon = {"wait": "○", "running": "◉", "done": "✓", "error": "✕"}.get(state, "○")
+            anim = "animation:aia-pulse 1.1s ease-in-out infinite;" if state == "running" else ""
+            rows_html += (
+                f'<div class="kw-row">'
+                f'<span style="width:10px;height:10px;border-radius:50%;background:{col};'
+                f'display:inline-block;flex-shrink:0;{anim}"></span>'
+                f'<span style="font-size:12px;font-weight:700;color:var(--tx);flex:1;">{kw_name}</span>'
+                f'<span style="font-size:10px;color:{col};font-weight:600;">{lbl}</span>'
+                f'<span style="font-size:10px;color:var(--mu);margin-left:8px;">{detail}</span>'
+                f'</div>'
+            )
+        done_count  = sum(1 for _, s, _ in statuses if s == "done")
+        run_count   = sum(1 for _, s, _ in statuses if s == "running")
+        pct         = int(done_count / max(total_kws, 1) * 100)
+        bar_col     = "var(--ok)" if done_count == total_kws else "var(--ac)"
+        bar_shimmer = "" if done_count == total_kws else "background-size:200% 100%;animation:aia-shimmer 1.8s linear infinite;"
+        bar_bg      = bar_col if done_count == total_kws else "linear-gradient(90deg,#1a6dff,var(--ac))"
+
+        multi_slot.markdown(
+            f'<style>'
+            f'@keyframes aia-pulse{{0%,100%{{opacity:.4;transform:scale(1)}}50%{{opacity:1;transform:scale(1.4)}}}}'
+            f'@keyframes aia-shimmer{{0%{{background-position:0% 50%}}100%{{background-position:200% 50%}}}}'
+            f'</style>'
+            f'<div class="multi-progress">'
+            f'<div class="multi-progress-title">MULTI-KEYWORD SEARCH — {done_count}/{total_kws} 완료</div>'
+            f'{rows_html}'
+            f'<div style="margin-top:12px;">'
+            f'<div style="background:rgba(255,255,255,.06);border-radius:2px;height:2px;overflow:hidden;">'
+            f'<div style="width:{pct}%;height:100%;background:{bar_bg};border-radius:2px;{bar_shimmer}'
+            f'transition:width .5s ease;box-shadow:0 0 6px rgba(79,138,255,.5);"></div></div>'
+            f'<div style="display:flex;justify-content:space-between;margin-top:6px;">'
+            f'<span style="font-size:9px;color:var(--mu);">순차 수집 중 — 브라우저 1개 유지</span>'
+            f'<span style="font-size:9px;color:{bar_col};font-weight:700;">{pct}%</span>'
+            f'</div></div></div>',
+            unsafe_allow_html=True,
+        )
+
+    # 초기 상태 렌더링
+    statuses = [(k, "wait", "") for k in keywords]
+    if total_kws > 1:
+        _render_progress(statuses)
+
+    for i, q in enumerate(keywords):
+        # 수집 시작
+        statuses[i] = (q, "running", "Meta Ad Library 접근 중...")
+        if total_kws > 1:
+            _render_progress(statuses)
+
         try:
-            if do_new:
-                # 새 검색 — 세션 + DB 완전 초기화
-                db_reset()
-                st.session_state.assets   = []
-                st.session_state.hidden   = set()
-                st.session_state.history  = []
-                st.session_state.summary  = None
-                st.session_state.selected = set()
-
-            existing_count = len(st.session_state.assets)
-            pb = st.progress(0, text=f"'{q}' — Meta Ad Library 접근 중...")
+            extra_fps = db_get_known_fps() if (is_add or i > 0) else None
             items = scrape(q, country, scrolls, max_n)
-            pb.progress(0.6, text=f"수집 완료 {len(items)}개 · 중복 제거 중...")
 
-            # 누적 검색: DB 레벨 지문도 포함해 중복 탐지
-            extra_fps = db_get_known_fps() if do_add else None
             merged, added, skipped = merge(st.session_state.assets, items, extra_fps)
             st.session_state.assets = merged
 
-            # 신규 소재만 DB 저장 — O(n) set 기반
-            pb.progress(0.85, text=f"{added}개 신규 소재 DB 저장 중...")
             if added > 0:
-                new_ids = {n["id"] for n in items}
+                new_ids  = {n["id"] for n in items}
                 new_only = [a for a in merged if a["id"] in new_ids]
                 db_upsert_assets(new_only)
 
@@ -2979,38 +3073,52 @@ if do_new or do_add:
                 st.session_state.history.append(q)
                 db_add_history(q)
 
-            pb.progress(1.0, text="완료!")
-            pb.empty()
-
-            st.session_state.log.append({
-                "t": time.strftime("%H:%M"), "kw": q, "n": added, "ok": True
-            })
-
-            if added > 0:
-                msg = f"**{added}개** 추가됨"
-                if skipped > 0:
-                    msg += f" · {skipped}개 중복 제외"
-                if do_add and existing_count > 0:
-                    msg += f" (보드 누적: {len(st.session_state.assets)}개)"
-                st.success(msg)
-            else:
-                if skipped > 0:
-                    st.info(
-                        f"새 소재 없음 — {skipped}개 전부 기존 보드에 이미 있어요. "
-                        f"스크롤 깊이를 높이거나 다른 키워드를 시도해보세요."
-                    )
-                else:
-                    st.warning(
-                        "수집된 소재가 없어요. Meta Ad Library에서 해당 키워드의 "
-                        "광고를 찾지 못했거나 이미지 로드에 실패했을 수 있어요."
-                    )
-            st.rerun()
+            st.session_state.log.append({"t": time.strftime("%H:%M"), "kw": q, "n": added, "ok": True})
+            total_added += added
+            total_skip  += skipped
+            statuses[i]  = (q, "done", f"+{added}개  {skipped}개 중복 제외")
 
         except Exception as e:
-            st.session_state.log.append({
-                "t": time.strftime("%H:%M"), "kw": q, "n": 0, "ok": False
-            })
-            st.error(f"오류: {e}")
+            st.session_state.log.append({"t": time.strftime("%H:%M"), "kw": q, "n": 0, "ok": False})
+            failed_kws.append(q)
+            statuses[i] = (q, "error", str(e)[:60])
+
+        if total_kws > 1:
+            _render_progress(statuses)
+
+    # 완료 후 패널 정리
+    if total_kws > 1:
+        _render_progress(statuses)
+        time.sleep(2.2)
+    multi_slot.empty()
+
+    # 결과 메시지
+    if total_added > 0:
+        msg = f"**{total_added}개** 수집 완료"
+        if total_skip > 0:
+            msg += f" · {total_skip}개 중복 제외"
+        if total_kws > 1:
+            msg += f" · {total_kws}개 키워드"
+        if board_before > 0 and is_add:
+            msg += f" (보드 누적: {len(st.session_state.assets)}개)"
+        st.success(msg)
+    elif not failed_kws:
+        st.info(
+            "새 소재가 없어요. 이미 모두 보드에 있거나 "
+            "Meta Ad Library에서 해당 키워드 광고를 찾지 못했어요."
+        )
+
+    if failed_kws:
+        st.warning(f"오류 발생 키워드: {', '.join(failed_kws)} — 개별 재시도를 권장합니다.")
+
+    st.rerun()
+
+
+if do_new or do_add:
+    if not kw_unique:
+        st.warning("검색어를 입력하세요.")
+    else:
+        _run_search(kw_unique, is_new=do_new, is_add=do_add)
 
 
 # ============================================================
