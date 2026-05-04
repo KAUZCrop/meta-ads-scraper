@@ -2079,7 +2079,7 @@ def test_api():
 
 def summarize_insights(analyzed_items):
     if not API_KEY or not analyzed_items:
-        return None
+        return None, "API Key 없음 또는 분석된 소재 없음"
 
     snippets = []
     for a in analyzed_items[:20]:
@@ -2087,7 +2087,6 @@ def summarize_insights(analyzed_items):
         if not ai or ai.get("_error"):
             continue
 
-        # 신규 프레임워크(consumer_reaction/layer_diagnosis) vs 기존(appeal/hook) 분기
         is_framework = "consumer_reaction" in ai or "layer_diagnosis" in ai
 
         if is_framework:
@@ -2097,7 +2096,6 @@ def summarize_insights(analyzed_items):
             ap  = ld.get("appeal")            or {}
             s03 = cr.get("step_0s3")          or {}
             s3s = cr.get("step_3s")           or {}
-
             hook     = s03.get("hook_strength") or cr.get("flow_summary") or ""
             appeal   = ap.get("primary_type")   or ""
             target   = s3s.get("target_signal") or ""
@@ -2115,7 +2113,6 @@ def summarize_insights(analyzed_items):
             strength = _safe_join((cd.get("strengths")  or []))
             fix_pt   = cd.get("improvement_direction") or ""
 
-        # 하나라도 의미 있는 값이 있을 때만 추가
         if any(v.strip() for v in [appeal, hook, target, message] if v):
             snippets.append(
                 f"- 소구:{appeal}"
@@ -2128,7 +2125,7 @@ def summarize_insights(analyzed_items):
             )
 
     if not snippets:
-        return None
+        return None, f"스니펫 생성 실패 — 분석된 {len(analyzed_items)}개 소재에서 유효 데이터를 추출하지 못했습니다"
 
     json_schema = (
         '{"dominant_appeal":"가장 많이 쓰인 소구 유형 + 비율 설명",'
@@ -2155,15 +2152,23 @@ def summarize_insights(analyzed_items):
                 "max_tokens": 900,
                 "messages": [{"role": "user", "content": prompt}],
             },
-            timeout=30,
+            timeout=60,  # 30 → 60초
         )
         if resp.status_code != 200:
-            return None
+            return None, f"API 오류 {resp.status_code}: {resp.text[:200]}"
+
         txt = resp.json()["content"][0]["text"].strip()
-        parsed, _ = _parse_ai_json(txt)
-        return parsed
-    except Exception:
-        return None
+        parsed, parse_err = _parse_ai_json(txt)
+        if parse_err:
+            return None, f"JSON 파싱 실패: {parse_err[:200]}"
+        if not isinstance(parsed, dict):
+            return None, "응답이 JSON object가 아닙니다"
+        return parsed, None
+
+    except requests.Timeout:
+        return None, "API 응답 시간 초과 (60초) — 잠시 후 다시 시도해주세요"
+    except Exception as ex:
+        return None, f"예외 발생: {str(ex)[:200]}"
 
 
 # ============================================================
@@ -2263,6 +2268,67 @@ def fetch_image_bytes(url: str) -> bytes | None:
 # ============================================================
 # PPT 내보내기 — 고도화 (경쟁 현황 + 기회 슬라이드 추가)
 # ============================================================
+def _extract_ai_fields(ai: dict) -> dict:
+    """
+    기존 방식(OBSERVE/INTERPRET)과 신규 프레임워크(consumer_reaction/layer_diagnosis)
+    두 구조를 모두 처리해 공통 필드 dict를 반환.
+    PPT, 통계 집계, 인사이트 패널 등에서 공통으로 사용.
+    """
+    if not ai or ai.get("_error"):
+        return {"hook": "—", "appeal": "—", "target": "—", "message": "—",
+                "layout": "—", "evidence": "—", "strengths": [], "weaknesses": [],
+                "improvement": "—", "score_overall": 0, "scores": {}}
+
+    is_fw = "consumer_reaction" in ai or "layer_diagnosis" in ai
+
+    if is_fw:
+        cr  = ai.get("consumer_reaction") or {}
+        ld  = ai.get("layer_diagnosis")   or {}
+        vd  = ai.get("verdict")           or {}
+        ap  = ld.get("appeal")            or {}
+        s03 = cr.get("step_0s3")          or {}
+        s3s = cr.get("step_3s")           or {}
+        sc  = ai.get("scores")            or {}
+
+        hook    = s03.get("hook_strength")  or s03.get("hook_type")   or cr.get("flow_summary") or "—"
+        appeal  = ap.get("primary_type")    or "—"
+        target  = s3s.get("target_signal")  or "—"
+        message = vd.get("one_line")         or "—"
+        layout  = ld.get("weakest_layer")    or "—"
+        evidence= vd.get("top_strength")     or "—"
+        strengths  = [vd.get("top_strength")]  if vd.get("top_strength")  else []
+        weaknesses = [vd.get("top_weakness")]  if vd.get("top_weakness")  else []
+        improvement= vd.get("priority_fix")    or "—"
+        score_overall = int(sc.get("overall_conversion_power") or 0)
+    else:
+        vf  = ai.get("visual_facts")      or {}
+        ma  = ai.get("marketing_analysis") or {}
+        ce  = ai.get("conversion_elements") or {}
+        cd  = ai.get("creative_diagnosis")  or {}
+        sc  = ai.get("scores")              or {}
+
+        hook    = ai.get("hook") or ma.get("hook_type") or "—"
+        appeal  = ai.get("appeal") or _safe_join(ma.get("appeal_type") or []) or "—"
+        target  = ai.get("target") or ma.get("target") or "—"
+        message = ai.get("message") or ma.get("message") or "—"
+        layout  = vf.get("layout_type") or ai.get("layout_type") or "—"
+        evidence= ai.get("evidence") or ma.get("evidence") or "—"
+        strengths  = cd.get("strengths")  or []
+        weaknesses = cd.get("weaknesses") or []
+        improvement= cd.get("improvement_direction") or "—"
+        score_overall = int((ce or sc).get("overall_conversion_power") or 0)
+
+    return {
+        "hook": hook, "appeal": appeal, "target": target,
+        "message": message, "layout": layout, "evidence": evidence,
+        "strengths": strengths if isinstance(strengths, list) else [strengths],
+        "weaknesses": weaknesses if isinstance(weaknesses, list) else [weaknesses],
+        "improvement": improvement,
+        "score_overall": score_overall,
+        "scores": ai.get("scores") or ai.get("conversion_elements") or {},
+    }
+
+
 def to_pptx(items: list, summary: dict | None = None) -> bytes:
     from pptx import Presentation
     from pptx.util import Inches, Pt
@@ -2355,18 +2421,10 @@ def to_pptx(items: list, summary: dict | None = None) -> bytes:
 
     # 통계 카드 4개
     ai_items = [a for a in items if a.get("ai") and not (a.get("ai") or {}).get("_error")]
-    hooks = [a["ai"].get("hook", "확인 불가") for a in ai_items]
-    appeals = []
-    for a in ai_items:
-        ap = a["ai"].get("appeal", "")
-        if isinstance(ap, list):
-            appeals += ap
-        elif ap:
-            appeals.append(ap)
-    layouts = [((a["ai"].get("visual_facts") or {}).get("layout_type") or a["ai"].get("layout_type") or "확인 불가")
-               for a in ai_items]
-    scores_all = [((a["ai"].get("conversion_elements") or {}).get("overall_conversion_power") or 0)
-                  for a in ai_items]
+    hooks   = [_extract_ai_fields(a["ai"])["hook"]   for a in ai_items]
+    appeals = [_extract_ai_fields(a["ai"])["appeal"] for a in ai_items]
+    layouts = [_extract_ai_fields(a["ai"])["layout"] for a in ai_items]
+    scores_all = [_extract_ai_fields(a["ai"])["score_overall"] for a in ai_items]
     avg_score = round(sum(scores_all) / len(scores_all), 1) if scores_all else 0
 
     top_hook   = Counter(hooks).most_common(1)[0][0] if hooks else "—"
@@ -2506,19 +2564,19 @@ def to_pptx(items: list, summary: dict | None = None) -> bytes:
 
         ai = item.get("ai")
         if ai and not ai.get("_error"):
-            vf = ai.get("visual_facts") or {}
-            ce = ai.get("conversion_elements") or {}
-            cd = ai.get("creative_diagnosis") or {}
-            ma = ai.get("marketing_analysis") or {}
+            f   = _extract_ai_fields(ai)
+            ce  = f["scores"]
+            cd_strengths  = f["strengths"]
+            cd_weaknesses = f["weaknesses"]
 
             # 분석 필드
             fields = [
-                ("후크",    ai.get("hook") or ma.get("hook_type") or "—"),
-                ("소구",    ai.get("appeal") or "—"),
-                ("타겟",    ai.get("target") or "—"),
-                ("레이아웃", vf.get("layout_type") or ai.get("layout_type") or "—"),
-                ("메시지",  ai.get("message") or "—"),
-                ("근거",    ai.get("evidence") or "—"),
+                ("후크",    f["hook"]),
+                ("소구",    f["appeal"]),
+                ("타겟",    f["target"]),
+                ("레이아웃", f["layout"]),
+                ("메시지",  f["message"]),
+                ("근거",    f["evidence"]),
             ]
             y_f = 0.65
             for lbl, val in fields:
@@ -2554,9 +2612,9 @@ def to_pptx(items: list, summary: dict | None = None) -> bytes:
             # 장점 / 약점 / 개선
             y_dia = y_sc + 0.1
             if y_dia < 6.5:
-                strengths = _safe_join(cd.get("strengths", []))
-                weaknesses = _safe_join(cd.get("weaknesses", []))
-                improve = cd.get("improvement_direction", "—")
+                strengths  = _safe_join(cd_strengths)
+                weaknesses = _safe_join(cd_weaknesses)
+                improve    = f["improvement"]
                 for emoji, lbl, val in [("✓", "장점", strengths), ("✕", "약점", weaknesses), ("→", "개선", improve)]:
                     add_text(slide, f"{emoji} {lbl}", rx, y_dia, 1.0, 0.3, size=8, bold=True, color=C_GRAY)
                     add_text(slide, str(val)[:120], rx + 1.0, y_dia, rw - 1.05, 0.35, size=8, color=C_DARK, wrap=True)
@@ -3330,14 +3388,13 @@ with tab_board:
 
     if do_insight:
         with st.spinner("종합 인사이트 생성 중..."):
-            summ = summarize_insights(analyzed_sel)
-            if summ:
-                st.session_state.summary = summ
-                db_save_summary(summ)
-            else:
-                st.warning("인사이트 생성 실패 — 분석 데이터가 충분하지 않거나 API 오류입니다.")
+            summ, err = summarize_insights(analyzed_sel)
         if summ:
+            st.session_state.summary = summ
+            db_save_summary(summ)
             st.rerun()
+        else:
+            st.error(f"인사이트 생성 실패 — {err}")
 
     if do_ppt:
         with st.spinner(f"PPT 생성 중 ({len(analyzed_sel)}개 소재)..."):
