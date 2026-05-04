@@ -68,8 +68,8 @@ st.markdown("""
   position: absolute;
   inset: 0;
   background-image:
-    linear-gradient(rgba(26,109,255,.06) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(26,109,255,.06) 1px, transparent 1px);
+    linear-gradient(rgba(232,40,74,.06) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(232,40,74,.06) 1px, transparent 1px);
   background-size: 48px 48px;
   animation: al-grid-in 1.2s ease forwards;
   opacity: 0;
@@ -104,19 +104,19 @@ st.markdown("""
 }
 
 .al-logo span {
-  color: #4f8aff;
+  color: #e8284a;
 }
 
 .al-ver-badge {
   font-family: 'Pretendard', -apple-system, sans-serif;
   font-size: 11px;
   font-weight: 600;
-  color: #4f8aff;
-  border: 1.5px solid rgba(79,138,255,.35);
+  color: #e8284a;
+  border: 1.5px solid rgba(232,40,74,.35);
   border-radius: 6px;
   padding: 3px 9px;
   letter-spacing: 0.5px;
-  background: rgba(79,138,255,.08);
+  background: rgba(232,40,74,.08);
   align-self: flex-start;
   margin-top: 4px;
 }
@@ -136,7 +136,7 @@ st.markdown("""
 .al-divider {
   width: 280px;
   height: 1px;
-  background: linear-gradient(90deg, transparent, rgba(79,138,255,.5), transparent);
+  background: linear-gradient(90deg, transparent, rgba(232,40,74,.5), transparent);
   margin-bottom: 24px;
 }
 
@@ -153,10 +153,10 @@ st.markdown("""
 .al-bar {
   height: 100%;
   width: 0%;
-  background: linear-gradient(90deg, #1a6dff, #5b9dff);
+  background: linear-gradient(90deg, #c0182e, #e8284a);
   border-radius: 2px;
   animation: al-progress 2.4s cubic-bezier(.1,.6,.4,1) 0.4s forwards;
-  box-shadow: 0 0 8px rgba(79,138,255,.6);
+  box-shadow: 0 0 8px rgba(232,40,74,.6);
 }
 
 /* ── 점 세 개 인디케이터 ── */
@@ -169,7 +169,7 @@ st.markdown("""
   width: 4px;
   height: 4px;
   border-radius: 50%;
-  background: #4f8aff;
+  background: #e8284a;
   opacity: 0.3;
   animation: al-pulse 1.2s ease-in-out infinite;
 }
@@ -450,24 +450,24 @@ D = st.session_state.dark
 
 LIGHT = """
 :root {
-    --bg:#fff; --bg2:#f7f8fa; --bg3:#f0f2f5;
-    --bd:#e2e5ea; --bd2:#cdd1d8;
-    --ac:#1a6dff; --ac2:rgba(26,109,255,0.10);
-    --tx:#111318; --tx2:#3a3f4a; --mu:#8a909e;
-    --ok:#00a86b; --er:#e8284a; --wn:#e07b00;
-    --sh:0 1px 3px rgba(0,0,0,.05);
-    --sh2:0 4px 20px rgba(26,109,255,.12);
+    --bg:#111114; --bg2:#1a1a1e; --bg3:#222228;
+    --bd:#2e2e36; --bd2:#3a3a44;
+    --ac:#e8284a; --ac2:rgba(232,40,74,0.12);
+    --tx:#f0f0f2; --tx2:#b8b8c0; --mu:#66666e;
+    --ok:#3dffa0; --er:#ff6b35; --wn:#ffb84f;
+    --sh:0 1px 4px rgba(0,0,0,.5);
+    --sh2:0 4px 20px rgba(232,40,74,.18);
 }"""
 
 DARK = """
 :root {
-    --bg:#0d0f12; --bg2:#13161b; --bg3:#1a1e26;
-    --bd:#252a34; --bd2:#2f3542;
-    --ac:#4f8aff; --ac2:rgba(79,138,255,0.12);
-    --tx:#e8eaf0; --tx2:#b0b8cc; --mu:#6b7280;
-    --ok:#3dffa0; --er:#ff4f6b; --wn:#ffb84f;
-    --sh:0 1px 4px rgba(0,0,0,.4);
-    --sh2:0 4px 20px rgba(79,138,255,.18);
+    --bg:#0a0a0c; --bg2:#111113; --bg3:#191919;
+    --bd:#272729; --bd2:#333338;
+    --ac:#e8284a; --ac2:rgba(232,40,74,0.12);
+    --tx:#f0f0f2; --tx2:#b0b0b8; --mu:#606068;
+    --ok:#3dffa0; --er:#ff6b35; --wn:#ffb84f;
+    --sh:0 1px 4px rgba(0,0,0,.6);
+    --sh2:0 4px 20px rgba(232,40,74,.22);
 }"""
 
 st.markdown(f"""<style>
@@ -519,6 +519,13 @@ html,body,[class*="css"]{{font-family:'Pretendard',sans-serif;background:var(--b
 
 .card{{border:1.5px solid var(--bd);border-radius:12px;overflow:hidden;margin-bottom:10px;background:var(--bg);box-shadow:var(--sh);transition:.2s;}}
 .card:hover{{border-color:var(--ac);box-shadow:var(--sh2);}}
+.card-img-wrap{{width:100%;padding-top:100%;position:relative;overflow:hidden;background:var(--bg3);display:flex;align-items:center;justify-content:center;}}
+.card-img{{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;object-position:center;transition:.2s;}}
+.card:hover .card-img{{transform:scale(1.03);}}
+.ratio-section{{margin-bottom:2rem;}}
+.ratio-header{{display:flex;align-items:center;gap:10px;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--bd);}}
+.ratio-badge{{font-size:9px;font-weight:700;color:var(--ac);background:var(--ac2);border:1px solid var(--ac2);border-radius:6px;padding:3px 9px;letter-spacing:1px;}}
+.ratio-count{{font-size:10px;color:var(--mu);}}
 .card-body{{padding:10px 12px;border-top:1px solid var(--bd);background:var(--bg2);}}
 .card-kw{{font-size:10px;color:var(--ac);letter-spacing:.8px;text-transform:uppercase;margin-bottom:4px;}}
 .card-meta{{font-size:11px;color:var(--mu);margin-top:4px;}}
@@ -1027,7 +1034,7 @@ def _anthropic_model(role: str = "analysis") -> str:
 import re as _re
 
 def _extract_json_block(text: str) -> str | None:
-    """마크다운 제거 후 가장 바깥 JSON object 추출."""
+    """마크다운 제거 후 가장 바깥 JSON object 추출. 잘린 JSON도 자동 복구 시도."""
     if not text:
         return None
     txt = text.strip()
@@ -1035,11 +1042,30 @@ def _extract_json_block(text: str) -> str | None:
     txt = _re.sub(r"```json\s*", "", txt)
     txt = _re.sub(r"```\s*", "", txt)
     txt = txt.strip()
+
     s = txt.find("{")
-    e = txt.rfind("}") + 1
-    if s == -1 or e <= 0 or e <= s:
+    if s == -1:
         return None
-    return txt[s:e]
+
+    e = txt.rfind("}") + 1
+
+    # 정상 케이스
+    if e > s:
+        return txt[s:e]
+
+    # 잘린 케이스: { 는 있는데 } 가 없음 → 열린 괄호 수만큼 닫기 시도
+    fragment = txt[s:]
+    open_count = fragment.count("{") - fragment.count("}")
+    open_arr   = fragment.count("[") - fragment.count("]")
+    if open_count > 0:
+        # 마지막 완전한 key:value 뒤에 닫는 괄호 추가
+        # 열린 문자열이 있으면 닫아주기
+        if fragment.count('"') % 2 == 1:
+            fragment += '"'
+        fragment += "]" * max(open_arr, 0) + "}" * open_count
+        return fragment
+
+    return None
 
 
 def _fix_unescaped_newlines(text: str) -> str:
@@ -1169,19 +1195,19 @@ def _repair_json_with_claude(raw_json: str) -> dict | None:
 # 분석 로딩 애니메이션 -- 스플래시 스크린과 동일 톤
 # ============================================================
 def _analysis_status_html(step, current, total, detail=""):
-    BG      = "#0d0f12"
-    BORDER  = "#252a34"
+    BG      = "#0a0a0c"
+    BORDER  = "#272729"
     TX      = "#e8eaf0"
     MU      = "#6b7280"
-    AC      = "#4f8aff"
-    AC_DIM  = "rgba(79,138,255,.08)"
-    AC_MED  = "rgba(79,138,255,.15)"
-    AC_BD   = "rgba(79,138,255,.35)"
-    AC_GLOW = "rgba(79,138,255,.6)"
+    AC      = "#e8284a"
+    AC_DIM  = "rgba(232,40,74,.08)"
+    AC_MED  = "rgba(232,40,74,.15)"
+    AC_BD   = "rgba(232,40,74,.35)"
+    AC_GLOW = "rgba(232,40,74,.6)"
     OK      = "#3dffa0"
     OK_DIM  = "rgba(61,255,160,.12)"
     OK_BD   = "rgba(61,255,160,.3)"
-    GRID    = "rgba(26,109,255,.055)"
+    GRID    = "rgba(232,40,74,.055)"
     TRACK   = "rgba(255,255,255,.06)"
 
     step_order = {"capture": 0, "analyze": 2, "done": 3}
@@ -1250,7 +1276,7 @@ def _analysis_status_html(step, current, total, detail=""):
     h_col  = OK if is_done else AC
     h_lbl  = "COMPLETE" if is_done else "ANALYZING"
     dot_a  = "" if is_done else "animation:aia-pulse 1.1s ease-in-out infinite;"
-    bar_bg = OK if is_done else f"linear-gradient(90deg,#1a6dff,{AC})"
+    bar_bg = OK if is_done else f"linear-gradient(90deg,#c0182e,{AC})"
     bar_sh = f"box-shadow:0 0 8px {AC_GLOW};" if not is_done else f"box-shadow:0 0 6px rgba(61,255,160,.4);"
     bar_ani= "background-size:200% 100%;animation:aia-shimmer 1.8s linear infinite;" if not is_done else ""
     chk    = f'<span style="color:{OK};margin-right:6px;font-size:14px;">v</span>' if is_done else ""
@@ -1263,7 +1289,7 @@ def _analysis_status_html(step, current, total, detail=""):
         "<style>"
         "@keyframes aia-scan{0%{transform:translateX(-100%);opacity:0}18%{opacity:1}82%{opacity:1}100%{transform:translateX(220%);opacity:0}}"
         "@keyframes aia-pulse{0%,100%{opacity:.3;transform:scale(1)}50%{opacity:1;transform:scale(1.5)}}"
-        "@keyframes aia-ring{0%,100%{box-shadow:0 0 0 0 rgba(79,138,255,.45)}50%{box-shadow:0 0 0 8px rgba(79,138,255,0)}}"
+        "@keyframes aia-ring{0%,100%{box-shadow:0 0 0 0 rgba(232,40,74,.45)}50%{box-shadow:0 0 0 8px rgba(232,40,74,0}}"
         "@keyframes aia-shimmer{0%{background-position:0% 50%}100%{background-position:200% 50%}}"
         "@keyframes aia-rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}"
         "</style>"
@@ -1283,7 +1309,7 @@ def _analysis_status_html(step, current, total, detail=""):
 
         # Scan line (same as splash)
         + f'<div style="position:absolute;top:0;left:0;right:0;height:2px;overflow:hidden;border-radius:14px 14px 0 0;">'
-        + f'<div style="height:100%;background:linear-gradient(90deg,transparent,rgba(79,138,255,.55),rgba(91,157,255,.4),transparent);'
+        + f'<div style="height:100%;background:linear-gradient(90deg,transparent,rgba(232,40,74,.55),rgba(220,60,70,.4),transparent);'
         + f'animation:aia-scan 2.3s ease-in-out infinite;"></div></div>'
 
         # Logo header (same as splash)
@@ -2149,7 +2175,7 @@ def summarize_insights(analyzed_items):
             headers={"x-api-key": API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
             json={
                 "model": _anthropic_model("summary"),
-                "max_tokens": 900,
+                "max_tokens": 1800,
                 "messages": [{"role": "user", "content": prompt}],
             },
             timeout=60,  # 30 → 60초
@@ -2340,14 +2366,14 @@ def to_pptx(items: list, summary: dict | None = None) -> bytes:
     # 색상 팔레트
     C_BG    = RGBColor(0xFF, 0xFF, 0xFF)
     C_DARK  = RGBColor(0x11, 0x13, 0x18)
-    C_BLUE  = RGBColor(0x1A, 0x6D, 0xFF)
+    C_BLUE  = RGBColor(0xE8, 0x28, 0x4A)
     C_GRAY  = RGBColor(0x3A, 0x3F, 0x4A)
     C_MUTED = RGBColor(0x8A, 0x90, 0x9E)
     C_BG2   = RGBColor(0xF7, 0xF8, 0xFA)
     C_GREEN = RGBColor(0x00, 0xA8, 0x6B)
     C_ORANGE= RGBColor(0xE0, 0x7B, 0x00)
-    C_BDBLUE= RGBColor(0xCC, 0xDD, 0xFF)
-    C_NAVY  = RGBColor(0x0A, 0x1A, 0x40)
+    C_BDBLUE= RGBColor(0x4A, 0x10, 0x1E)
+    C_NAVY  = RGBColor(0x0A, 0x00, 0x04)
 
     def add_text(slide, text, x, y, w, h, size=12, bold=False,
                  color=None, align=PP_ALIGN.LEFT, wrap=True):
@@ -2734,6 +2760,48 @@ def to_pptx(items: list, summary: dict | None = None) -> bytes:
 # ============================================================
 # 비교 테이블 뷰
 # ============================================================
+def _classify_ratio(item: dict) -> tuple[str, str]:
+    """
+    width/height 기반으로 비율 분류.
+    반환: (ratio_key, ratio_label)
+    ratio_key는 정렬 기준, ratio_label은 UI 표시용.
+
+    실제 Meta 광고 주요 사이즈:
+    1:1   → 600×600, 1080×1080 (ratio ≈ 1.0)
+    4:5   → 1080×1350           (ratio ≈ 0.8)
+    9:16  → 1080×1920           (ratio ≈ 0.5625)
+    1.91:1→ 1200×628            (ratio ≈ 1.91)  ← 가로 배너
+    16:9  → 1920×1080           (ratio ≈ 1.78)
+    """
+    w = int(item.get("width") or 0)
+    h = int(item.get("height") or 0)
+    if w <= 0 or h <= 0:
+        return ("z_unknown", "비율 미확인")
+    ratio = w / h
+    if   0.90 <= ratio <= 1.10: return ("a_1x1",  "1:1 정사각형")
+    elif 0.75 <= ratio <  0.90: return ("b_4x5",  "4:5 세로형")
+    elif 0.50 <= ratio <  0.75: return ("c_9x16", "9:16 세로형")
+    elif ratio <  0.50:         return ("d_tall",  "초세로형")
+    elif 1.10 <  ratio <= 1.50: return ("e_4x3",  "4:3 가로형")
+    elif 1.50 <  ratio <= 2.10: return ("f_wide",  "가로 배너형")  # 16:9(1.78), 1.91:1 포함
+    elif ratio > 2.10:          return ("g_xwide", "초가로형")
+    return ("z_unknown", "비율 미확인")
+
+
+def _group_by_ratio(items: list) -> list[tuple[str, str, list]]:
+    """
+    소재 목록을 비율별로 그룹핑.
+    반환: [(ratio_key, ratio_label, items_list), ...]  — ratio_key 오름차순 정렬
+    """
+    groups: dict[str, list] = {}
+    labels: dict[str, str]  = {}
+    for item in items:
+        key, label = _classify_ratio(item)
+        groups.setdefault(key, []).append(item)
+        labels[key] = label
+    return [(k, labels[k], groups[k]) for k in sorted(groups)]
+
+
 def render_comparison_table(all_items):
     try:
         import pandas as pd
@@ -2925,6 +2993,7 @@ with st.sidebar:
     fkw   = st.selectbox("키워드", kws, label_visibility="collapsed")
     fstar = st.toggle("즐겨찾기만", value=False)
     fai   = st.toggle("AI 분석된 것만", value=False)
+    group_ratio = st.toggle("비율별 그룹핑", value=True)
     cols  = st.select_slider("열 수", options=[2, 3, 4, 5], value=4)
     sort  = st.selectbox("정렬", ["최신순", "오래된순", "키워드순", "즐겨찾기순", "전환력순"], label_visibility="collapsed")
     st.markdown("---")
@@ -3096,7 +3165,7 @@ def _run_search(keywords: list[str], is_new: bool, is_add: bool):
             f'<div style="margin-top:12px;">'
             f'<div style="background:rgba(255,255,255,.06);border-radius:2px;height:2px;overflow:hidden;">'
             f'<div style="width:{pct}%;height:100%;background:{bar_bg};border-radius:2px;{bar_shimmer}'
-            f'transition:width .5s ease;box-shadow:0 0 6px rgba(79,138,255,.5);"></div></div>'
+            f'transition:width .5s ease;box-shadow:0 0 6px rgba(232,40,74,.5);"></div></div>'
             f'<div style="display:flex;justify-content:space-between;margin-top:6px;">'
             f'<span style="font-size:9px;color:var(--mu);">순차 수집 중 — 브라우저 1개 유지</span>'
             f'<span style="font-size:9px;color:{bar_col};font-weight:700;">{pct}%</span>'
@@ -3415,200 +3484,221 @@ with tab_board:
             'Meta Ad Library에서 광고 소재를 실시간으로 수집합니다.</div></div>',
             unsafe_allow_html=True)
     else:
-        grid = st.columns(cols)
-        for i, item in enumerate(shown):
-            with grid[i % cols]:
-                is_sel = item["id"] in sel
+        # 비율 그룹핑 or 일반 순서
+        if group_ratio:
+            ratio_groups = _group_by_ratio(shown)
+        else:
+            ratio_groups = [("all", "", shown)]
 
-                st.markdown('<div class="card">', unsafe_allow_html=True)
-                try:
-                    st.image(item["image_url"], use_container_width=True)
-                except Exception:
-                    st.markdown(
-                        '<div style="height:100px;background:var(--bg3);display:flex;'
-                        'align-items:center;justify-content:center;color:var(--mu);font-size:10px;">'
-                        'LOAD FAILED</div>', unsafe_allow_html=True)
+        item_counter = 0  # 전체 카드 순번 (key 중복 방지)
 
-                bc   = "b-img" if item["asset_type"] == "image" else "b-vid"
-                bl   = "IMG"   if item["asset_type"] == "image" else "VID"
-                sel_b = '<span class="bdg" style="background:var(--ac);color:#fff;border-color:var(--ac)">SEL</span> ' if is_sel else ""
-                sv_b  = '<span class="bdg b-sav">★</span> ' if item.get("starred") else ""
-                ai_b  = '<span class="bdg b-ai">AI</span> ' if (item.get("ai") and not (item.get("ai") or {}).get("_error")) else ""
-                er_b  = '<span class="bdg" style="background:rgba(232,40,74,.1);color:var(--er);border-color:rgba(232,40,74,.2)">ERR</span> ' if (item.get("ai") and (item.get("ai") or {}).get("_error")) else ""
-                cap   = item.get("caption", "")
-                cap_h = f'<div class="card-cap">"{cap[:55]}{"..." if len(cap) > 55 else ""}"</div>' if cap else ""
-
-                ai_data = _sanitize_json_deep(item.get("ai")) if item.get("ai") else None
-                conv_score_str = ""
-                if ai_data and not ai_data.get("_error"):
-                    ce = ai_data.get("conversion_elements") or {}
-                    s = ce.get("overall_conversion_power")
-                    if s:
-                        conv_score_str = f' · ⚡{s}/5'
-
+        for ratio_key, ratio_label, group_items in ratio_groups:
+            # 그룹 헤더 (그룹핑 ON이고 그룹이 2개 이상일 때만)
+            if group_ratio and len(ratio_groups) > 1:
+                # 이미지 비율 구하기 (첫 소재 기준)
+                sample = group_items[0]
+                w, h = int(sample.get("width") or 1), int(sample.get("height") or 1)
+                # padding-top 비율 계산 (정사각형=100%, 9:16=177%, 16:9=56%)
+                pt = round((h / w) * 100, 1)
                 st.markdown(
-                    '<div class="card-body">'
-                    f'<div class="card-kw">{item["keyword"]} · {item["country"]}{conv_score_str}</div>'
-                    + sel_b + sv_b + ai_b + er_b +
-                    f'<span class="bdg {bc}">{bl}</span>'
-                    + cap_h +
-                    f'<div class="card-meta">{item["width"]}x{item["height"]}px · {item["created_at"][11:16]}</div>'
-                    '</div>',
-                    unsafe_allow_html=True)
+                    f'<div class="ratio-section">'
+                    f'<div class="ratio-header">'
+                    f'<span class="ratio-badge">{ratio_label}</span>'
+                    f'<span class="ratio-count">{len(group_items)}개</span>'
+                    f'</div></div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                # 그룹핑 OFF: 모든 이미지 1:1
+                pt = 100
 
-                if ai_data:
-                    if ai_data.get("_error"):
-                        st.markdown(
-                            '<div class="ai-wrap"><div class="ai-box" style="border-color:var(--er)">'
-                            f'<div class="ai-head" style="color:var(--er)">분석 오류</div>'
-                            f'<div class="ai-body" style="font-size:11px">{ai_data["_error"]}</div>'
-                            '</div></div>',
-                            unsafe_allow_html=True)
-                    else:
-                        vf = ai_data.get("visual_facts") or {}
-                        ma = ai_data.get("marketing_analysis") or {}
-                        ce = ai_data.get("conversion_elements") or {}
-                        cd = ai_data.get("creative_diagnosis") or {}
-                        has_img = bool(db_get_img_b64(item["id"]))
+            # 그룹별 padding-top (비율 유지)
+            if group_ratio and ratio_key != "all":
+                sample = group_items[0]
+                w_s = int(sample.get("width") or 1)
+                h_s = int(sample.get("height") or 1)
+                pt = round((h_s / w_s) * 100, 1)
+            else:
+                pt = 100
 
-                        # 새 구조 (observe/interpret) 우선, 구버전 호환 fallback
-                        ob = ai_data.get("observe") or {}
-                        ip = ai_data.get("interpret") or {}
+            grid = st.columns(cols)
+            for j, item in enumerate(group_items):
+                with grid[j % cols]:
+                    is_sel = item["id"] in sel
+                    idx    = item_counter
+                    item_counter += 1
 
-                        visible_text = _safe_join(ob.get("text_exact", []), " / ") or _safe_join(vf.get("visible_text", []), " / ") or ai_data.get("copy", "—")
-                        main_visual  = ob.get("main_visual_description") or ai_data.get("main_visual", "—")
-                        layout       = ob.get("layout_type") or ai_data.get("layout_type", "—")
-                        colors_str   = _safe_join(ob.get("color_palette", [])) or _safe_join(vf.get("colors", [])) or "—"
-                        hook         = ip.get("hook_type") or ai_data.get("hook", "—")
-                        hook_ev      = ip.get("hook_evidence", "")
-                        appeal       = ip.get("primary_appeal") or ai_data.get("appeal", "—")
-                        appeal_ev    = ip.get("appeal_evidence", "")
-                        target       = ip.get("target_audience") or ai_data.get("target", "—")
-                        target_ev    = ip.get("target_evidence", "")
-                        message      = ip.get("core_message") or ai_data.get("message", "—")
-                        strengths    = _safe_join((cd.get("strengths") or []))  or "—"
-                        weaknesses   = _safe_join((cd.get("weaknesses") or [])) or "—"
-                        improve      = cd.get("improvement_direction") or dg.get("improvement_direction") if (dg := ai_data.get("diagnosis") or {}) else cd.get("improvement_direction") or "—"
+                    st.markdown('<div class="card">', unsafe_allow_html=True)
 
-                        score_line = (
-                            f'가격 {ce.get("price_emphasis","—")} / '
-                            f'제품 {ce.get("product_visibility","—")} / '
-                            f'가독성 {ce.get("readability","—")} / '
-                            f'전환력 {ce.get("overall_conversion_power","—")}'
-                        )
-                        cap_src = item.get("capture_source", "")
-                        capture_badge = (
-                            '<span class="bdg b-ai" style="font-size:8px">카드캡처</span> ' if "card" in cap_src
-                            else '<span class="bdg b-vid" style="font-size:8px">이미지캡처</span> ' if has_img
-                            else '<span class="bdg" style="background:var(--bg3);color:var(--mu);font-size:8px">캡처실패</span> '
-                        )
-                        tags_str = "".join(f'<span class="ai-tag">{t}</span>' for t in ai_data.get("tags", []))
+                    # 비율별 padding-top 적용
+                    st.markdown(
+                        f'<div class="card-img-wrap" style="padding-top:{pt}%;">'
+                        f'<img src="{item["image_url"]}" class="card-img" loading="lazy">'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
 
-                        # 신규 프레임워크 결과인지 판단
-                        is_framework = "consumer_reaction" in ai_data or "layer_diagnosis" in ai_data
+                    bc   = "b-img" if item["asset_type"] == "image" else "b-vid"
+                    bl   = "IMG"   if item["asset_type"] == "image" else "VID"
+                    sel_b = '<span class="bdg" style="background:var(--ac);color:#fff;border-color:var(--ac)">SEL</span> ' if is_sel else ""
+                    sv_b  = '<span class="bdg b-sav">★</span> ' if item.get("starred") else ""
+                    ai_b  = '<span class="bdg b-ai">AI</span> ' if (item.get("ai") and not (item.get("ai") or {}).get("_error")) else ""
+                    er_b  = '<span class="bdg" style="background:rgba(232,40,74,.1);color:var(--er);border-color:rgba(232,40,74,.2)">ERR</span> ' if (item.get("ai") and (item.get("ai") or {}).get("_error")) else ""
+                    cap   = item.get("caption", "")
+                    cap_h = f'<div class="card-cap">"{cap[:55]}{"..." if len(cap) > 55 else ""}"</div>' if cap else ""
 
-                        if is_framework:
-                            # 신규 프레임워크 카드 렌더링
-                            cr  = ai_data.get("consumer_reaction", {})
-                            ld  = ai_data.get("layer_diagnosis", {})
-                            vd  = ai_data.get("verdict", {})
-                            s03  = cr.get("step_0s3", {})
-                            sclk = cr.get("step_click", {})
+                    ai_data = _sanitize_json_deep(item.get("ai")) if item.get("ai") else None
+                    conv_score_str = ""
+                    if ai_data and not ai_data.get("_error"):
+                        f_ai = _extract_ai_fields(ai_data)
+                        s = f_ai.get("score_overall")
+                        if s:
+                            conv_score_str = f' · ⚡{s}/5'
 
-                            def risk_color(r):
-                                return "var(--er)" if "높음" in (r or "") else "var(--wn)" if "중간" in (r or "") else "var(--ok)"
+                    w_disp = item.get("width", 0)
+                    h_disp = item.get("height", 0)
+                    ratio_str = f"{w_disp}×{h_disp}"
 
-                            biggest = cr.get("biggest_dropout_point", "—")
-                            layers_score = [
-                                ("주목", int(ld.get("attention", {}).get("score", 0))),
-                                ("메시지", int(ld.get("message", {}).get("score", 0))),
-                                ("소구", int(ld.get("appeal", {}).get("score", 0))),
-                                ("행동", int(ld.get("action", {}).get("score", 0))),
-                            ]
-                            layers_html = " ".join(
-                                f'<span style="font-size:9px;font-weight:700;'
-                                f'color:{score_color(s)};">{l}:{s}</span>'
-                                for l, s in layers_score
+                    st.markdown(
+                        '<div class="card-body">'
+                        f'<div class="card-kw">{item["keyword"]} · {item["country"]}{conv_score_str}</div>'
+                        + sel_b + sv_b + ai_b + er_b +
+                        f'<span class="bdg {bc}">{bl}</span>'
+                        + cap_h +
+                        f'<div class="card-meta">{ratio_str}px · {item["created_at"][11:16]}</div>'
+                        '</div>',
+                        unsafe_allow_html=True)
+
+                    if ai_data:
+                        if ai_data.get("_error"):
+                            st.markdown(
+                                '<div class="ai-wrap"><div class="ai-box" style="border-color:var(--er)">'
+                                f'<div class="ai-head" style="color:var(--er)">분석 오류</div>'
+                                f'<div class="ai-body" style="font-size:11px">{ai_data["_error"]}</div>'
+                                '</div></div>',
+                                unsafe_allow_html=True)
+                        else:
+                            vf  = ai_data.get("visual_facts") or {}
+                            ma  = ai_data.get("marketing_analysis") or {}
+                            ce  = ai_data.get("conversion_elements") or {}
+                            dg  = ai_data.get("diagnosis") or {}
+                            ob  = ai_data.get("observe") or {}
+                            ip  = ai_data.get("interpret") or {}
+                            has_img = bool(db_get_img_b64(item["id"]))
+
+                            f_ai = _extract_ai_fields(ai_data)
+                            visible_text = _safe_join(ob.get("text_exact", [])) or _safe_join(vf.get("visible_text", [])) or ai_data.get("copy", "—")
+                            main_visual  = ob.get("main_visual_description") or f_ai["main_visual"] if hasattr(f_ai, "get") else ai_data.get("main_visual", "—")
+                            colors_str   = _safe_join(ob.get("color_palette", [])) or _safe_join(vf.get("colors", [])) or "—"
+                            hook         = f_ai["hook"]
+                            hook_ev      = ip.get("hook_evidence", "")
+                            appeal       = f_ai["appeal"]
+                            appeal_ev    = ip.get("appeal_evidence", "")
+                            target       = f_ai["target"]
+                            target_ev    = ip.get("target_evidence", "")
+                            message      = f_ai["message"]
+                            strengths    = _safe_join(f_ai["strengths"]) or "—"
+                            weaknesses   = _safe_join(f_ai["weaknesses"]) or "—"
+                            improve      = f_ai["improvement"]
+                            score_line   = (
+                                f'가격 {ce.get("price_emphasis","—")} / '
+                                f'제품 {ce.get("product_visibility","—")} / '
+                                f'가독성 {ce.get("readability","—")} / '
+                                f'전환력 {f_ai["score_overall"] or "—"}'
                             )
-                            verdict_line = vd.get("one_line", "—")
-                            fix_point    = vd.get("priority_fix", "—")
-                            dropout_col  = risk_color(biggest)
-                            hook_str     = s03.get("hook_strength", "—")
-                            hook_col     = "var(--ok)" if hook_str == "강함" else "var(--wn)" if hook_str == "보통" else "var(--er)"
+                            cap_src = item.get("capture_source", "")
+                            capture_badge = (
+                                '<span class="bdg b-ai" style="font-size:8px">카드캡처</span> ' if "card" in cap_src
+                                else '<span class="bdg b-vid" style="font-size:8px">이미지캡처</span> ' if has_img
+                                else '<span class="bdg" style="background:var(--bg3);color:var(--mu);font-size:8px">캡처실패</span> '
+                            )
+                            tags_str = "".join(f'<span class="ai-tag">{t}</span>' for t in ai_data.get("tags", []))
 
-                            st.markdown(
-                                '<div class="ai-wrap"><div class="ai-box">'
-                                f'<div class="ai-head">소비자 반응 + 레이어 진단 {capture_badge}</div>'
-                                '<div class="ai-body">'
-                                f'<span style="font-size:9px;color:var(--ac);letter-spacing:1px">소비자 반응</span><br>'
-                                f'<b>첫인상</b>&nbsp;{s03.get("first_attention","—")}'
-                                f' &nbsp;<span style="font-size:10px;color:{hook_col};">훅 {hook_str}</span><br>'
-                                f'<b>이탈위험</b>&nbsp;'
-                                f'<span style="color:{risk_color(cr.get("step_0s3",{}).get("dropout_risk",""))};font-size:10px;">0.3초</span> '
-                                f'<span style="color:{risk_color(cr.get("step_1s",{}).get("dropout_risk",""))};font-size:10px;">1초</span> '
-                                f'<span style="color:{risk_color(cr.get("step_3s",{}).get("dropout_risk",""))};font-size:10px;">3초</span> '
-                                f'<span style="color:{risk_color(cr.get("step_click",{}).get("dropout_risk",""))};font-size:10px;">클릭</span><br>'
-                                f'<b>최대이탈</b>&nbsp;<span style="color:{dropout_col};font-weight:700;">{biggest}</span><br>'
-                                f'<span style="font-size:9px;color:var(--ac);letter-spacing:1px;margin-top:5px;display:block">레이어 진단</span>'
-                                f'{layers_html}<br>'
-                                f'<b>약점레이어</b>&nbsp;{ld.get("weakest_layer","—").upper()}<br>'
-                                f'<span style="font-size:9px;color:var(--ac);letter-spacing:1px;margin-top:5px;display:block">VERDICT</span>'
-                                f'<b>진단</b>&nbsp;{verdict_line}<br>'
-                                f'<b>수정포인트</b>&nbsp;{fix_point}<br>'
-                                f'<div style="margin-top:6px">{tags_str}</div>'
-                                '</div></div></div>',
-                                unsafe_allow_html=True)
-                        else:
-                            # 기존 방식 카드 렌더링
-                            def ev_span(ev):
-                                if not ev or ev == "확인 불가":
-                                    return ""
-                                return f'<span style="font-size:10px;color:var(--mu);display:block;padding-left:4px;border-left:2px solid var(--bd2);margin:1px 0 4px 0">근거: {ev[:80]}</span>'
+                            # 신규 프레임워크 vs 기존 방식 카드 분기
+                            is_framework = "consumer_reaction" in ai_data or "layer_diagnosis" in ai_data
 
-                            st.markdown(
-                                '<div class="ai-wrap"><div class="ai-box">'
-                                f'<div class="ai-head">OBSERVE → INTERPRET {capture_badge}</div>'
-                                '<div class="ai-body">'
-                                '<span style="font-size:9px;color:var(--ac);letter-spacing:1px">OBSERVE</span><br>'
-                                f'<b>실제문구</b>&nbsp;{visible_text}<br>'
-                                f'<b>비주얼</b>&nbsp;&nbsp;&nbsp;{main_visual}<br>'
-                                f'<b>레이아웃</b>&nbsp;{layout}<br>'
-                                f'<b>색감</b>&nbsp;&nbsp;&nbsp;&nbsp;{colors_str}<br>'
-                                '<span style="font-size:9px;color:var(--ac);letter-spacing:1px;margin-top:6px;display:block">INTERPRET (관찰 근거 기반)</span>'
-                                f'<b>후크</b>&nbsp;&nbsp;&nbsp;{hook}<br>{ev_span(hook_ev)}'
-                                f'<b>소구</b>&nbsp;&nbsp;&nbsp;{appeal}<br>{ev_span(appeal_ev)}'
-                                f'<b>타겟</b>&nbsp;&nbsp;&nbsp;{target}<br>{ev_span(target_ev)}'
-                                f'<b>메시지</b>&nbsp;{message}<br>'
-                                f'<b>점수</b>&nbsp;&nbsp;&nbsp;{score_line}<br>'
-                                f'<b>장점</b>&nbsp;&nbsp;&nbsp;{strengths}<br>'
-                                f'<b>약점</b>&nbsp;&nbsp;&nbsp;{weaknesses}<br>'
-                                f'<b>개선</b>&nbsp;&nbsp;&nbsp;{improve}<br>'
-                                f'<div style="margin-top:6px">{tags_str}</div>'
-                                '</div></div></div>',
-                                unsafe_allow_html=True)
+                            if is_framework:
+                                cr   = ai_data.get("consumer_reaction", {})
+                                ld   = ai_data.get("layer_diagnosis", {})
+                                vd   = ai_data.get("verdict", {})
+                                s03  = cr.get("step_0s3", {})
 
-                st.markdown('</div>', unsafe_allow_html=True)
+                                def risk_color(r):
+                                    return "var(--er)" if "높음" in (r or "") else "var(--wn)" if "중간" in (r or "") else "var(--ok)"
 
-                b1, b2, b3, b4 = st.columns(4)
-                with b1:
-                    if st.button("✓" if is_sel else "○", key="sel_" + item["id"], use_container_width=True):
-                        if is_sel:
-                            st.session_state.selected.discard(item["id"])
-                        else:
-                            st.session_state.selected.add(item["id"])
-                        st.rerun()
-                with b2:
-                    if st.button("★" if item.get("starred") else "☆", key="sv_" + item["id"], use_container_width=True):
-                        toggle_star(item["id"])
-                        st.rerun()
-                with b3:
-                    if st.button("✕", key="hd_" + item["id"], use_container_width=True):
-                        st.session_state.hidden.add(item["id"])
-                        db_add_hidden(item["id"])
-                        st.rerun()
-                with b4:
-                    st.link_button("↗", item["source_url"], use_container_width=True)
+                                biggest = cr.get("biggest_dropout_point", "—")
+                                layers_score = [
+                                    ("주목",   int((ld.get("attention") or {}).get("score", 0))),
+                                    ("메시지", int((ld.get("message")   or {}).get("score", 0))),
+                                    ("소구",   int((ld.get("appeal")    or {}).get("score", 0))),
+                                    ("행동",   int((ld.get("action")    or {}).get("score", 0))),
+                                ]
+                                layers_html = " ".join(
+                                    f'<span style="font-size:9px;font-weight:700;color:{score_color(s)};">{l}:{s}</span>'
+                                    for l, s in layers_score
+                                )
+                                hook_str    = s03.get("hook_strength", "—")
+                                hook_col    = "var(--ok)" if hook_str == "강함" else "var(--wn)" if hook_str == "보통" else "var(--er)"
 
+                                st.markdown(
+                                    '<div class="ai-wrap"><div class="ai-box">'
+                                    f'<div class="ai-head">소비자 반응 + 레이어 진단 {capture_badge}</div>'
+                                    '<div class="ai-body">'
+                                    f'<b>첫인상</b>&nbsp;{s03.get("first_attention","—")}'
+                                    f' <span style="font-size:10px;color:{hook_col};">훅 {hook_str}</span><br>'
+                                    f'<b>이탈</b>&nbsp;'
+                                    f'<span style="color:{risk_color(cr.get("step_0s3",{}).get("dropout_risk",""))};font-size:10px;">0.3초</span> '
+                                    f'<span style="color:{risk_color(cr.get("step_1s",{}).get("dropout_risk",""))};font-size:10px;">1초</span> '
+                                    f'<span style="color:{risk_color(cr.get("step_3s",{}).get("dropout_risk",""))};font-size:10px;">3초</span> '
+                                    f'<span style="color:{risk_color(cr.get("step_click",{}).get("dropout_risk",""))};font-size:10px;">클릭</span><br>'
+                                    f'<b>최대이탈</b>&nbsp;<span style="color:{risk_color(biggest)};font-weight:700;">{biggest}</span><br>'
+                                    f'{layers_html}<br>'
+                                    f'<b>진단</b>&nbsp;{vd.get("one_line","—")}<br>'
+                                    f'<b>수정</b>&nbsp;{vd.get("priority_fix","—")}<br>'
+                                    f'<div style="margin-top:6px">{tags_str}</div>'
+                                    '</div></div></div>',
+                                    unsafe_allow_html=True)
+                            else:
+                                def ev_span(ev):
+                                    if not ev or ev == "확인 불가": return ""
+                                    return f'<span style="font-size:10px;color:var(--mu);display:block;padding-left:4px;border-left:2px solid var(--bd2);margin:1px 0 4px 0">근거: {ev[:80]}</span>'
+
+                                st.markdown(
+                                    '<div class="ai-wrap"><div class="ai-box">'
+                                    f'<div class="ai-head">OBSERVE → INTERPRET {capture_badge}</div>'
+                                    '<div class="ai-body">'
+                                    f'<b>실제문구</b>&nbsp;{visible_text}<br>'
+                                    f'<b>레이아웃</b>&nbsp;{f_ai["layout"]}<br>'
+                                    f'<b>색감</b>&nbsp;&nbsp;&nbsp;&nbsp;{colors_str}<br>'
+                                    f'<b>후크</b>&nbsp;&nbsp;&nbsp;{hook}<br>{ev_span(hook_ev)}'
+                                    f'<b>소구</b>&nbsp;&nbsp;&nbsp;{appeal}<br>{ev_span(appeal_ev)}'
+                                    f'<b>타겟</b>&nbsp;&nbsp;&nbsp;{target}<br>{ev_span(target_ev)}'
+                                    f'<b>메시지</b>&nbsp;{message}<br>'
+                                    f'<b>점수</b>&nbsp;&nbsp;&nbsp;{score_line}<br>'
+                                    f'<b>장점</b>&nbsp;&nbsp;&nbsp;{strengths}<br>'
+                                    f'<b>약점</b>&nbsp;&nbsp;&nbsp;{weaknesses}<br>'
+                                    f'<b>개선</b>&nbsp;&nbsp;&nbsp;{improve}<br>'
+                                    f'<div style="margin-top:6px">{tags_str}</div>'
+                                    '</div></div></div>',
+                                    unsafe_allow_html=True)
+
+                    st.markdown('</div>', unsafe_allow_html=True)
+
+                    b1, b2, b3, b4 = st.columns(4)
+                    with b1:
+                        if st.button("✓" if is_sel else "○", key=f"sel_{item['id']}_{idx}", use_container_width=True):
+                            if is_sel: st.session_state.selected.discard(item["id"])
+                            else:      st.session_state.selected.add(item["id"])
+                            st.rerun()
+                    with b2:
+                        if st.button("★" if item.get("starred") else "☆", key=f"sv_{item['id']}_{idx}", use_container_width=True):
+                            toggle_star(item["id"]); st.rerun()
+                    with b3:
+                        if st.button("✕", key=f"hd_{item['id']}_{idx}", use_container_width=True):
+                            st.session_state.hidden.add(item["id"])
+                            db_add_hidden(item["id"]); st.rerun()
+                    with b4:
+                        st.link_button("↗", item["source_url"], use_container_width=True)
 
 # ── 탭2: 비교 테이블 ─────────────────────────────────────────
 with tab_table:
