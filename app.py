@@ -3588,7 +3588,7 @@ with tab_board:
 
                             f_ai = _extract_ai_fields(ai_data)
                             visible_text = _safe_join(ob.get("text_exact", [])) or _safe_join(vf.get("visible_text", [])) or ai_data.get("copy", "—")
-                            main_visual  = ob.get("main_visual_description") or f_ai["main_visual"] if hasattr(f_ai, "get") else ai_data.get("main_visual", "—")
+                            main_visual  = ob.get("main_visual_description") or ai_data.get("main_visual", "—")
                             colors_str   = _safe_join(ob.get("color_palette", [])) or _safe_join(vf.get("colors", [])) or "—"
                             hook         = f_ai["hook"]
                             hook_ev      = ip.get("hook_evidence", "")
