@@ -1,0 +1,8 @@
+.devcontainer/
+.git/
+__pycache__/
+*.pyc
+*.pyo
+data/
+adintel.db
+.streamlit/secrets.toml
