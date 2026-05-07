@@ -25,6 +25,11 @@ def _tabs(labels):
 
 st_mock.tabs = _tabs
 
+# st.button / st.toggle 은 False를 반환해야 조건부 DB 호출을 막습니다
+st_mock.button = MagicMock(return_value=False)
+st_mock.toggle = MagicMock(return_value=False)
+st_mock.link_button = MagicMock(return_value=False)
+
 sys.modules["streamlit"] = st_mock
 
 # ── Playwright mock ────────────────────────────────────────────────────────
