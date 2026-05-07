@@ -3075,27 +3075,25 @@ def render_comparison_table(all_items):
 
     rows = []
     for item in analyzed:
-        ai  = item.get("ai") or {}
-        ce  = ai.get("conversion_elements") or {}
-        vf  = ai.get("visual_facts") or {}
-        ma  = ai.get("marketing_analysis") or {}
-        cd  = ai.get("creative_diagnosis") or {}
+        ai = item.get("ai") or {}
+        f  = _extract_ai_fields(ai)
+        sc = f["scores"]
         rows.append({
-            "키워드":       item["keyword"],
-            "타입":         "이미지" if item["asset_type"] == "image" else "비디오",
-            "레이아웃":     (vf.get("layout_type") or ai.get("layout_type") or "—")[:20],
-            "후크":         (ai.get("hook") or ma.get("hook_type") or "—")[:20],
-            "소구":         str(ai.get("appeal") or "—")[:30],
-            "타겟":         (ai.get("target") or "—")[:40],
-            "핵심메시지":   (ai.get("message") or "—")[:60],
-            "가격강조":     int(ce.get("price_emphasis") or 0),
-            "제품가시성":   int(ce.get("product_visibility") or 0),
-            "가독성":       int(ce.get("readability") or 0),
-            "할인가시성":   int(ce.get("discount_visibility") or 0),
-            "시각명확도":   int(ce.get("visual_clarity") or 0),
-            "전환력":       int(ce.get("overall_conversion_power") or 0),
-            "개선방향":     (cd.get("improvement_direction") or "—")[:80],
-            "썸네일":       item["image_url"],
+            "키워드":     item["keyword"],
+            "타입":       "이미지" if item["asset_type"] == "image" else "비디오",
+            "레이아웃":   f["layout"][:20],
+            "후크":       f["hook"][:20],
+            "소구":       f["appeal"][:30],
+            "타겟":       f["target"][:40],
+            "핵심메시지": f["message"][:60],
+            "가격강조":   int(sc.get("price_emphasis") or 0),
+            "제품가시성": int(sc.get("product_visibility") or 0),
+            "가독성":     int(sc.get("readability") or 0),
+            "할인가시성": int(sc.get("discount_visibility") or 0),
+            "시각명확도": int(sc.get("visual_clarity") or 0),
+            "전환력":     f["score_overall"],
+            "개선방향":   f["improvement"][:80],
+            "썸네일":     item["image_url"],
         })
 
     df = pd.DataFrame(rows)
