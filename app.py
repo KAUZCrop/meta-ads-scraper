@@ -332,6 +332,13 @@ def db_init():
         CREATE INDEX IF NOT EXISTS idx_trend_keyword ON trend_snapshots(keyword, snapshot_date);
         CREATE INDEX IF NOT EXISTS idx_assets_image_url ON assets(image_url);
         CREATE INDEX IF NOT EXISTS idx_assets_keyword   ON assets(keyword);
+        CREATE TABLE IF NOT EXISTS scheduled_keywords (
+            keyword TEXT PRIMARY KEY,
+            country TEXT DEFAULT 'KR',
+            interval_hours INTEGER DEFAULT 24,
+            last_run TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        );
         """)
         # 기존 DB에 memo 컬럼 없으면 추가
         try:
@@ -564,6 +571,33 @@ def db_get_known_fps() -> set:
     except Exception:
         return set()
 
+
+def db_add_schedule(keyword: str, country: str = "KR", interval_hours: int = 24):
+    con = sqlite3.connect(DB_PATH, timeout=15)
+    con.execute(
+        "INSERT OR REPLACE INTO scheduled_keywords (keyword,country,interval_hours,last_run,created_at) VALUES (?,?,?,?,?)",
+        (keyword, country, interval_hours, "", time.strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    con.commit(); con.close()
+
+def db_load_schedules() -> list:
+    con = sqlite3.connect(DB_PATH, timeout=15)
+    rows = con.execute(
+        "SELECT keyword,country,interval_hours,last_run FROM scheduled_keywords ORDER BY created_at"
+    ).fetchall()
+    con.close()
+    return [{"keyword": r[0], "country": r[1], "interval_hours": r[2], "last_run": r[3]} for r in rows]
+
+def db_delete_schedule(keyword: str):
+    con = sqlite3.connect(DB_PATH, timeout=15)
+    con.execute("DELETE FROM scheduled_keywords WHERE keyword=?", (keyword,))
+    con.commit(); con.close()
+
+def db_update_schedule_run(keyword: str):
+    con = sqlite3.connect(DB_PATH, timeout=15)
+    con.execute("UPDATE scheduled_keywords SET last_run=? WHERE keyword=?",
+                (time.strftime("%Y-%m-%d %H:%M:%S"), keyword))
+    con.commit(); con.close()
 
 def db_reset():
     try:
@@ -3161,6 +3195,177 @@ def to_html_report(items: list, summary: dict | None = None) -> str:
 </html>"""
 
 
+def _group_similar_assets(items: list) -> list[tuple[str, list]]:
+    """URL 경로 앞 3세그먼트 기준으로 유사 소재(같은 광고주 변형) 그룹핑."""
+    groups: dict[str, list] = {}
+    for item in items:
+        parsed = urlparse(item.get("image_url", ""))
+        parts = [p for p in parsed.path.split("/") if p]
+        key = "/".join(parts[:3]) if len(parts) >= 3 else f"single_{item['id']}"
+        groups.setdefault(key, []).append(item)
+    result, singles = [], []
+    for key, group in groups.items():
+        if len(group) >= 2:
+            result.append((key, group))
+        else:
+            singles.extend(group)
+    result.sort(key=lambda x: -len(x[1]))
+    if singles:
+        result.append(("__singles__", singles))
+    return result
+
+
+@st.dialog("소재 상세", width="large")
+def show_asset_detail(item: dict):
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        st.image(item["image_url"], use_container_width=True)
+        cap = item.get("caption", "")
+        if cap:
+            st.caption(f'"{cap}"')
+        st.markdown(
+            f"**{item['keyword']}** · {item['country']} · "
+            f"{'이미지' if item['asset_type']=='image' else '비디오'} · "
+            f"{item.get('width',0)}×{item.get('height',0)}px"
+        )
+        st.caption(item["created_at"][:10])
+        memo = item.get("memo","")
+        if memo:
+            st.info(f"📝 {memo}")
+        st.link_button("원본 광고 보기 ↗", item["source_url"], use_container_width=True)
+    with c2:
+        ai = item.get("ai")
+        if not ai:
+            st.info("AI 분석 결과 없음\n선택 후 분석을 실행하세요.")
+            return
+        if ai.get("_error"):
+            st.error(f"분석 오류: {ai['_error']}")
+            return
+        f = _extract_ai_fields(ai)
+        sc = f["scores"]
+        score = f["score_overall"]
+        color = "#00a86b" if score >= 4 else "#e07b00" if score >= 3 else "#e8284a"
+        st.markdown(
+            f'<div style="font-size:28px;font-weight:900;color:{color};margin-bottom:16px;">'
+            f'전환력 {score}<span style="font-size:14px;color:#8a909e;">/5</span></div>',
+            unsafe_allow_html=True,
+        )
+        for label, val in [
+            ("후크", f["hook"]), ("소구", f["appeal"]),
+            ("타겟", f["target"]), ("메시지", f["message"]),
+            ("레이아웃", f["layout"]),
+        ]:
+            st.markdown(
+                f'<div style="margin-bottom:8px;">'
+                f'<span style="font-size:9px;color:#8a909e;letter-spacing:1px;text-transform:uppercase;">{label}</span>'
+                f'<div style="font-size:12px;color:#111318;margin-top:2px;">{val}</div></div>',
+                unsafe_allow_html=True,
+            )
+        st.markdown("---")
+        for k, lbl in [
+            ("price_emphasis","가격강조"),("product_visibility","제품가시성"),
+            ("readability","가독성"),("visual_clarity","시각명확도"),
+            ("overall_conversion_power","전환력"),
+        ]:
+            v = int(sc.get(k) or 0)
+            st.progress(v / 5, text=f"{lbl}: {v}/5")
+        st.markdown("---")
+        strengths = _safe_join(f["strengths"])
+        weaknesses = _safe_join(f["weaknesses"])
+        if strengths and strengths != "—":
+            st.success(f"**강점** {strengths}")
+        if weaknesses and weaknesses != "—":
+            st.warning(f"**약점** {weaknesses}")
+        if f["improvement"] and f["improvement"] != "—":
+            st.info(f"**개선** {f['improvement']}")
+        tags = ai.get("tags", [])
+        if tags:
+            st.markdown(" ".join(f'`{t}`' for t in tags))
+
+
+def render_copy_analysis(items: list):
+    import re
+    from collections import Counter
+    try:
+        import pandas as pd
+    except ImportError:
+        st.error("pandas가 필요합니다.")
+        return
+
+    captions = [a.get("caption","").strip() for a in items if a.get("caption","").strip()]
+    if not captions:
+        st.markdown(
+            '<div class="empty"><div class="empty-t">캡션 데이터가 없습니다</div>'
+            '<div class="empty-d">소재를 수집하면 광고 텍스트가 자동으로 분석됩니다.</div></div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    st.markdown(
+        f'<div class="sec"><div class="sec-t">카피 패턴 분석</div>'
+        f'<div class="sec-n">{len(captions)}개 캡션 기준</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    all_text = " ".join(captions)
+    prices   = re.findall(r'\d[\d,]*원', all_text)
+    percents = re.findall(r'\d+%', all_text)
+    numbers  = [c for c in captions if re.search(r'\d', c)]
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("총 캡션", len(captions))
+    m2.metric("숫자 포함", len(numbers))
+    m3.metric("가격 표현", len(prices))
+    m4.metric("% 표현", len(percents))
+
+    st.markdown("---")
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.markdown("**CTA 키워드 빈도**")
+        cta_kws = ["지금","바로","무료","한정","클릭","신청","구매","주문","확인",
+                   "혜택","이벤트","할인","특가","선착순","오늘","최대","최저","단독"]
+        cta_found = {k: sum(1 for c in captions if k in c) for k in cta_kws}
+        cta_found = {k: v for k, v in cta_found.items() if v > 0}
+        if cta_found:
+            cta_df = pd.DataFrame(sorted(cta_found.items(), key=lambda x: -x[1]),
+                                  columns=["키워드","빈도"])
+            st.bar_chart(cta_df.set_index("키워드"), height=240)
+        else:
+            st.info("CTA 키워드 미감지")
+
+    with c2:
+        st.markdown("**자주 등장하는 단어**")
+        words = re.findall(r'[가-힣a-zA-Z]{2,}', all_text)
+        stop = {"이거","그게","이게","우리","하는","있는","되는","하고","으로","에서",
+                "부터","까지","에게","보다","처럼","이라","그리고","하지만","때문에",
+                "위해","통해","이후","이전","이상","이하","입니다","합니다","있습니다"}
+        filtered = [w for w in words if w not in stop]
+        word_cnt = Counter(filtered).most_common(15)
+        if word_cnt:
+            wdf = pd.DataFrame(word_cnt, columns=["단어","빈도"])
+            st.bar_chart(wdf.set_index("단어"), height=240)
+
+    st.markdown("---")
+    col1, col2, col3 = st.columns(3)
+    lengths = [len(c) for c in captions]
+    col1.metric("평균 길이", f"{sum(lengths)/len(lengths):.0f}자")
+    col2.metric("최단", f"{min(lengths)}자")
+    col3.metric("최장", f"{max(lengths)}자")
+
+    if percents:
+        st.markdown("**% 할인율 분포**")
+        pct_df = pd.DataFrame(Counter(percents).most_common(10), columns=["할인율","횟수"])
+        st.bar_chart(pct_df.set_index("할인율"), height=180)
+
+    with st.expander("전체 캡션 목록", expanded=False):
+        cap_rows = [{"키워드": a["keyword"], "캡션": a.get("caption",""),
+                     "길이": len(a.get("caption",""))}
+                    for a in items if a.get("caption","").strip()]
+        if cap_rows:
+            st.dataframe(pd.DataFrame(cap_rows), hide_index=True, use_container_width=True)
+
+
 def render_comparison_table(all_items):
     try:
         import pandas as pd
@@ -3329,7 +3534,8 @@ with st.sidebar:
     fkw   = st.selectbox("키워드", kws, label_visibility="collapsed")
     fstar = st.toggle("즐겨찾기만", value=False)
     fai   = st.toggle("AI 분석된 것만", value=False)
-    group_ratio = st.toggle("비율별 그룹핑", value=True)
+    group_ratio   = st.toggle("비율별 그룹핑", value=True)
+    group_similar = st.toggle("유사 소재 그룹핑", value=False)
     cols  = st.select_slider("열 수", options=[2, 3, 4, 5], value=4)
     sort  = st.selectbox("정렬", ["최신순", "오래된순", "키워드순", "즐겨찾기순", "전환력순"], label_visibility="collapsed")
     st.markdown("---")
@@ -3378,6 +3584,44 @@ with st.sidebar:
                 f'<span class="{cls}">{"+" if lg["ok"] else "!"} {lg["kw"]} — {lg["n"]}건</span></div>',
                 unsafe_allow_html=True)
 
+    st.markdown("---")
+    st.markdown('<div class="slbl">⏰ 자동 수집 스케줄</div>', unsafe_allow_html=True)
+    schedules = db_load_schedules()
+    if schedules:
+        for sch in schedules:
+            kw, hr, last = sch["keyword"], sch["interval_hours"], sch["last_run"]
+            if last:
+                try:
+                    import datetime as _dt
+                    elapsed = (_dt.datetime.now() - _dt.datetime.strptime(last, "%Y-%m-%d %H:%M:%S")).total_seconds() / 3600
+                    due = elapsed >= hr
+                    status_txt = f"✓ {elapsed:.0f}h 전" if not due else f"⏰ 수집 대기"
+                    status_col = "var(--ok)" if not due else "var(--ac)"
+                except Exception:
+                    due, status_txt, status_col = False, "미실행", "var(--mu)"
+            else:
+                due, status_txt, status_col = True, "미실행", "var(--mu)"
+            sc1, sc2 = st.columns([3, 1])
+            sc1.markdown(
+                f'<div style="font-size:11px;font-weight:700;">{kw}</div>'
+                f'<div style="font-size:10px;color:{status_col};">{status_txt} · {hr}h 주기</div>',
+                unsafe_allow_html=True,
+            )
+            if sc2.button("삭제", key=f"del_sch_{kw}", use_container_width=True):
+                db_delete_schedule(kw)
+                st.rerun()
+    else:
+        st.caption("등록된 스케줄 없음")
+
+    with st.expander("스케줄 추가", expanded=False):
+        sch_kw  = st.text_input("키워드", key="sch_kw_input", placeholder="예: 에어컨")
+        sch_hr  = st.select_slider("수집 주기", options=[6, 12, 24, 48, 72], value=24, key="sch_hr")
+        sch_ct  = st.selectbox("국가", ["KR","US","JP","GB"], key="sch_ct")
+        if st.button("등록", key="sch_add", use_container_width=True) and sch_kw.strip():
+            db_add_schedule(sch_kw.strip(), sch_ct, sch_hr)
+            st.success(f"'{sch_kw.strip()}' 스케줄 등록 완료")
+            st.rerun()
+
 
 # ============================================================
 # AI 배너
@@ -3392,6 +3636,28 @@ elif ai_on and not API_KEY:
         <div class="dot" style="background:var(--wn)"></div>
         <span class="banner-txt">AI ON — API Key 없음 &nbsp;·&nbsp; Settings > Secrets > <b>ANTHROPIC_API_KEY</b></span>
     </div>""", unsafe_allow_html=True)
+
+# 스케줄 대기 배너
+_due_schedules = [s for s in db_load_schedules() if (
+    (not s["last_run"]) or
+    ((__import__("datetime").datetime.now() - __import__("datetime").datetime.strptime(s["last_run"], "%Y-%m-%d %H:%M:%S")).total_seconds() / 3600 >= s["interval_hours"])
+)]
+if _due_schedules:
+    _due_kws = ", ".join(s["keyword"] for s in _due_schedules)
+    _bc, _btn_c = st.columns([5, 1])
+    with _bc:
+        st.markdown(
+            f'<div class="banner banner-w" style="margin-bottom:0">'
+            f'<div class="dot" style="background:var(--wn)"></div>'
+            f'<span class="banner-txt">⏰ 수집 대기 키워드: <b>{_due_kws}</b></span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    with _btn_c:
+        if st.button("지금 수집", key="run_due_schedules", use_container_width=True):
+            for _s in _due_schedules:
+                st.session_state["pending_keyword"] = _s["keyword"]
+            st.rerun()
 
 
 # ============================================================
@@ -3678,7 +3944,7 @@ if summary:
 # ============================================================
 # 메인 탭 — 소재 보드 / 비교 테이블
 # ============================================================
-tab_board, tab_table, tab_trend = st.tabs(["◼ 소재 보드", "⊞ 비교 테이블", "📈 트렌드 리포트"])
+tab_board, tab_table, tab_trend, tab_copy = st.tabs(["◼ 소재 보드", "⊞ 비교 테이블", "📈 트렌드 리포트", "📝 카피 분석"])
 
 
 # ── 탭1: 소재 보드 ──────────────────────────────────────────
@@ -3821,36 +4087,35 @@ with tab_board:
             'Meta Ad Library에서 광고 소재를 실시간으로 수집합니다.</div></div>',
             unsafe_allow_html=True)
     else:
-        # 비율 그룹핑 or 일반 순서
-        if group_ratio:
-            ratio_groups = _group_by_ratio(shown)
+        # 그룹 결정: 유사 소재 > 비율 > 기본
+        if group_similar:
+            _sim = _group_similar_assets(shown)
+            all_groups = [("sim", lbl, items) for lbl, items in _sim]
+        elif group_ratio:
+            all_groups = _group_by_ratio(shown)
         else:
-            ratio_groups = [("all", "", shown)]
+            all_groups = [("all", "", shown)]
 
         item_counter = 0  # 전체 카드 순번 (key 중복 방지)
 
-        for ratio_key, ratio_label, group_items in ratio_groups:
-            # 그룹 헤더 (그룹핑 ON이고 그룹이 2개 이상일 때만)
-            if group_ratio and len(ratio_groups) > 1:
-                # 이미지 비율 구하기 (첫 소재 기준)
-                sample = group_items[0]
-                w, h = int(sample.get("width") or 1), int(sample.get("height") or 1)
-                # padding-top 비율 계산 (정사각형=100%, 9:16=177%, 16:9=56%)
-                pt = round((h / w) * 100, 1)
+        for _gk, _gl, group_items in all_groups:
+            # 그룹 헤더
+            if len(all_groups) > 1:
+                if _gk == "sim":
+                    count_label = f"{len(group_items)}개 변형"
+                else:
+                    count_label = f"{len(group_items)}개"
                 st.markdown(
                     f'<div class="ratio-section">'
                     f'<div class="ratio-header">'
-                    f'<span class="ratio-badge">{ratio_label}</span>'
-                    f'<span class="ratio-count">{len(group_items)}개</span>'
+                    f'<span class="ratio-badge">{_gl}</span>'
+                    f'<span class="ratio-count">{count_label}</span>'
                     f'</div></div>',
                     unsafe_allow_html=True,
                 )
-            else:
-                # 그룹핑 OFF: 모든 이미지 1:1
-                pt = 100
 
-            # 그룹별 padding-top (비율 유지)
-            if group_ratio and ratio_key != "all":
+            # padding-top (비율 그룹핑일 때만 실제 비율 반영)
+            if group_ratio and _gk not in ("all", "sim") and group_items:
                 sample = group_items[0]
                 w_s = int(sample.get("width") or 1)
                 h_s = int(sample.get("height") or 1)
@@ -4021,7 +4286,7 @@ with tab_board:
 
                     st.markdown('</div>', unsafe_allow_html=True)
 
-                    b1, b2, b3, b4 = st.columns(4)
+                    b1, b2, b3, b4, b5 = st.columns(5)
                     with b1:
                         if st.button("✓" if is_sel else "○", key=f"sel_{item['id']}_{idx}", use_container_width=True):
                             if is_sel: st.session_state.selected.discard(item["id"])
@@ -4036,6 +4301,9 @@ with tab_board:
                             db_add_hidden(item["id"]); st.rerun()
                     with b4:
                         st.link_button("↗", item["source_url"], use_container_width=True)
+                    with b5:
+                        if st.button("⊞", key=f"dtl_{item['id']}_{idx}", use_container_width=True):
+                            show_asset_detail(item)
 
                     # 메모
                     memo_key = f"memo_{item['id']}_{idx}"
@@ -4054,6 +4322,9 @@ with tab_table:
 
 with tab_trend:
     render_trend_report()
+
+with tab_copy:
+    render_copy_analysis(all_a)
 
 
 # ============================================================
