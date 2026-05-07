@@ -2,6 +2,7 @@
 # AD INTEL v4.0 — Meta Ad Library Intelligence Board
 # ============================================================
 import sys, asyncio, subprocess, time, uuid, io, json, requests, base64, sqlite3, random
+import logging, threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
 from urllib.parse import quote, urlparse
@@ -22,7 +23,68 @@ def get_api_key():
         return ""
 
 API_KEY = get_api_key()
-DB_PATH = "adintel.db"
+import os as _os
+DB_PATH = _os.environ.get("DB_PATH", "adintel.db")
+
+# ============================================================
+# 로깅 설정
+# ============================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='{"time":"%(asctime)s","level":"%(levelname)s","msg":%(message)s}',
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+logger = logging.getLogger("adintel")
+
+# ============================================================
+# Anthropic API — rate-limit 대응 헬퍼
+# 동시 호출 상한 4개 + 429 시 지수 백오프 재시도
+# ============================================================
+_API_SEMAPHORE = threading.Semaphore(4)
+_ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+_ANTHROPIC_HEADERS = lambda key: {
+    "x-api-key": key,
+    "anthropic-version": "2023-06-01",
+    "content-type": "application/json",
+}
+
+def _anthropic_post(payload: dict, timeout: int = 60, max_retries: int = 4) -> requests.Response:
+    """
+    Anthropic API POST with semaphore-based concurrency limit and
+    exponential backoff retry on 429 (rate limit) / 5xx errors.
+    """
+    key = API_KEY
+    delays = [2, 4, 8, 16]
+    last_resp = None
+    with _API_SEMAPHORE:
+        for attempt in range(max_retries + 1):
+            try:
+                resp = requests.post(
+                    _ANTHROPIC_URL,
+                    headers=_ANTHROPIC_HEADERS(key),
+                    json=payload,
+                    timeout=timeout,
+                )
+                last_resp = resp
+                if resp.status_code == 429 and attempt < max_retries:
+                    wait = delays[min(attempt, len(delays) - 1)]
+                    logger.warning(f'"Rate limited (429). Retry {attempt+1}/{max_retries} in {wait}s"')
+                    time.sleep(wait)
+                    continue
+                if resp.status_code >= 500 and attempt < max_retries:
+                    wait = delays[min(attempt, len(delays) - 1)]
+                    logger.warning(f'"Server error {resp.status_code}. Retry {attempt+1}/{max_retries} in {wait}s"')
+                    time.sleep(wait)
+                    continue
+                return resp
+            except requests.Timeout:
+                if attempt < max_retries:
+                    wait = delays[min(attempt, len(delays) - 1)]
+                    logger.warning(f'"Request timeout. Retry {attempt+1}/{max_retries} in {wait}s"')
+                    time.sleep(wait)
+                    continue
+                raise
+        return last_resp
 
 st.set_page_config(page_title="AD INTEL", page_icon="◼", layout="wide")
 
@@ -255,6 +317,18 @@ def db_init():
             summary_json TEXT,
             created_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS trend_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_date TEXT NOT NULL,
+            keyword TEXT NOT NULL,
+            asset_count INTEGER DEFAULT 0,
+            analyzed_count INTEGER DEFAULT 0,
+            appeal_dist TEXT DEFAULT '{}',
+            hook_dist TEXT DEFAULT '{}',
+            avg_score REAL DEFAULT 0.0,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_trend_keyword ON trend_snapshots(keyword, snapshot_date);
         CREATE INDEX IF NOT EXISTS idx_assets_image_url ON assets(image_url);
         CREATE INDEX IF NOT EXISTS idx_assets_keyword   ON assets(keyword);
         """)
@@ -381,6 +455,80 @@ def db_load_summary() -> dict | None:
         except Exception:
             return None
     return None
+
+def db_save_trend_snapshot(keyword: str, assets: list) -> None:
+    """키워드별 오늘 날짜 스냅샷 저장 (하루 1회, 덮어쓰기)."""
+    today = time.strftime("%Y-%m-%d")
+    kw_assets = [a for a in assets if a.get("keyword") == keyword]
+    analyzed = [a for a in kw_assets if a.get("ai") and not (a.get("ai") or {}).get("_error")]
+
+    appeal_dist: dict[str, int] = {}
+    hook_dist: dict[str, int] = {}
+    scores: list[float] = []
+    for a in analyzed:
+        ai = a.get("ai") or {}
+        appeal = ai.get("appeal") or "미분류"
+        hook = ai.get("hook") or "미분류"
+        appeal_dist[appeal] = appeal_dist.get(appeal, 0) + 1
+        hook_dist[hook] = hook_dist.get(hook, 0) + 1
+        sc = ai.get("scores") or {}
+        ov = sc.get("overall_conversion_power")
+        if isinstance(ov, (int, float)):
+            scores.append(float(ov))
+
+    avg_score = round(sum(scores) / len(scores), 2) if scores else 0.0
+
+    con = sqlite3.connect(DB_PATH, timeout=15)
+    con.execute(
+        "DELETE FROM trend_snapshots WHERE keyword=? AND snapshot_date=?",
+        (keyword, today),
+    )
+    con.execute(
+        "INSERT INTO trend_snapshots (snapshot_date,keyword,asset_count,analyzed_count,"
+        "appeal_dist,hook_dist,avg_score,created_at) VALUES (?,?,?,?,?,?,?,?)",
+        (
+            today, keyword, len(kw_assets), len(analyzed),
+            json.dumps(appeal_dist, ensure_ascii=False),
+            json.dumps(hook_dist, ensure_ascii=False),
+            avg_score,
+            time.strftime("%Y-%m-%d %H:%M:%S"),
+        ),
+    )
+    con.commit()
+    con.close()
+    logger.info(f'"trend snapshot saved: keyword={keyword} date={today} assets={len(kw_assets)}"')
+
+
+def db_load_trend_snapshots(keyword: str | None = None) -> list[dict]:
+    """트렌드 스냅샷 로드. keyword=None이면 전체."""
+    con = sqlite3.connect(DB_PATH, timeout=15)
+    if keyword:
+        rows = con.execute(
+            "SELECT snapshot_date,keyword,asset_count,analyzed_count,appeal_dist,hook_dist,avg_score "
+            "FROM trend_snapshots WHERE keyword=? ORDER BY snapshot_date",
+            (keyword,),
+        ).fetchall()
+    else:
+        rows = con.execute(
+            "SELECT snapshot_date,keyword,asset_count,analyzed_count,appeal_dist,hook_dist,avg_score "
+            "FROM trend_snapshots ORDER BY keyword, snapshot_date"
+        ).fetchall()
+    con.close()
+    result = []
+    for r in rows:
+        try:
+            appeal_dist = json.loads(r[4]) if r[4] else {}
+            hook_dist = json.loads(r[5]) if r[5] else {}
+        except Exception:
+            appeal_dist, hook_dist = {}, {}
+        result.append({
+            "date": r[0], "keyword": r[1],
+            "asset_count": r[2], "analyzed_count": r[3],
+            "appeal_dist": appeal_dist, "hook_dist": hook_dist,
+            "avg_score": r[6],
+        })
+    return result
+
 
 def db_get_known_fps() -> set:
     """
@@ -1160,17 +1308,12 @@ def _repair_json_with_claude(raw_json: str) -> dict | None:
 수정할 JSON:
 {raw_json[:3000]}
 """
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={
-                "model": _anthropic_model("repair"),
-                "max_tokens": 2000,
-                "temperature": 0,
-                "messages": [{"role": "user", "content": repair_prompt}],
-            },
-            timeout=40,
-        )
+        resp = _anthropic_post({
+            "model": _anthropic_model("repair"),
+            "max_tokens": 2000,
+            "temperature": 0,
+            "messages": [{"role": "user", "content": repair_prompt}],
+        }, timeout=40)
         if resp.status_code != 200:
             return None
         fixed_txt = resp.json()["content"][0]["text"].strip()
@@ -1434,18 +1577,13 @@ def _extract_ocr_with_claude(img_b64: str) -> dict:
 반환 형식:
 {"texts":["이미지 안 실제 문구1","이미지 안 실제 문구2"],"brand_candidates":["보이는 브랜드명"],"product_candidates":["보이는 제품명"],"price_texts":["가격/할인 관련 문구"],"cta_texts":["CTA 문구"]}
 """
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={
-                "model": _anthropic_model(), "max_tokens": 700, "temperature": 0,
-                "messages": [{"role": "user", "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
-                    {"type": "text", "text": ocr_prompt},
-                ]}],
-            },
-            timeout=45,
-        )
+        resp = _anthropic_post({
+            "model": _anthropic_model(), "max_tokens": 700, "temperature": 0,
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img_b64}},
+                {"type": "text", "text": ocr_prompt},
+            ]}],
+        }, timeout=45)
         if resp.status_code != 200:
             return {"texts": [], "raw": "", "_error": f"OCR API {resp.status_code}: {resp.text[:200]}"}
         txt = resp.json()["content"][0]["text"].strip()
@@ -1587,17 +1725,12 @@ CTA: {cta_text or "(없음)"}
             {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
             {"type": "text", "text": prompt},
         ]
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={
-                "model": _anthropic_model("analysis"),
-                "max_tokens": 1800,
-                "temperature": 0,
-                "messages": [{"role": "user", "content": payload}],
-            },
-            timeout=60,
-        )
+        resp = _anthropic_post({
+            "model": _anthropic_model("analysis"),
+            "max_tokens": 1800,
+            "temperature": 0,
+            "messages": [{"role": "user", "content": payload}],
+        }, timeout=60)
         if resp.status_code != 200:
             return {"_error": f"API {resp.status_code}: {resp.text[:300]}"}
 
@@ -1697,10 +1830,15 @@ def analyze_parallel(items, max_workers=6, force=False):
                     id_map[aid]["ai"] = result
                     db_set_field(aid, ai_json=json.dumps(result, ensure_ascii=False))
                     if result.get("_error"):
-                        errors.append(f"[{id_map[aid]['keyword']}] {result['_error']}")
+                        err_msg = f"[{id_map[aid]['keyword']}] {result['_error']}"
+                        errors.append(err_msg)
+                        logger.warning(f'"analyze error: {err_msg}"')
+                    else:
+                        logger.info(f'"analyzed asset {aid[:8]}"')
             except Exception as ex_inner:
                 err_msg = f"[{aid[:8]}] 분석 예외: {str(ex_inner)[:120]}"
                 errors.append(err_msg)
+                logger.error(f'"analyze exception: {err_msg}"')
 
     return items, errors
 
@@ -1850,20 +1988,15 @@ def analyze_new(b64: str, keyword: str) -> dict:
 
 점수: 1=매우약함 2=약함 3=보통 4=강함 5=매우강함"""
 
-    resp = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={"x-api-key": API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-        json={
-            "model": st.session_state.get("model", "claude-haiku-4-5-20251001"),
-            "max_tokens": 2000,
-            "temperature": 0,
-            "messages": [{"role": "user", "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
-                {"type": "text", "text": prompt},
-            ]}],
-        },
-        timeout=60,
-    )
+    resp = _anthropic_post({
+        "model": st.session_state.get("model", "claude-haiku-4-5-20251001"),
+        "max_tokens": 2000,
+        "temperature": 0,
+        "messages": [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+            {"type": "text", "text": prompt},
+        ]}],
+    }, timeout=60)
     if resp.status_code != 200:
         return {"_error": f"API {resp.status_code}"}
     txt = resp.json()["content"][0]["text"].strip()
@@ -2091,11 +2224,9 @@ def test_api():
     if not API_KEY:
         return False, "API Key가 없습니다. Streamlit Secrets를 확인하세요."
     try:
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]},
-            timeout=10,
+        resp = _anthropic_post(
+            {"model": "claude-haiku-4-5-20251001", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]},
+            timeout=10, max_retries=1,
         )
         if resp.status_code == 200:
             return True, "API 정상 연결됨"
@@ -2170,16 +2301,11 @@ def summarize_insights(analyzed_items):
         + json_schema
     )
     try:
-        resp = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={
-                "model": _anthropic_model("summary"),
-                "max_tokens": 1800,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=60,  # 30 → 60초
-        )
+        resp = _anthropic_post({
+            "model": _anthropic_model("summary"),
+            "max_tokens": 1800,
+            "messages": [{"role": "user", "content": prompt}],
+        }, timeout=60)
         if resp.status_code != 200:
             return None, f"API 오류 {resp.status_code}: {resp.text[:200]}"
 
@@ -2802,6 +2928,134 @@ def _group_by_ratio(items: list) -> list[tuple[str, str, list]]:
     return [(k, labels[k], groups[k]) for k in sorted(groups)]
 
 
+def render_trend_report():
+    """트렌드 리포트 탭: 수집 이력 기반 시계열 차트 + 소구 유형 분포."""
+    snapshots = db_load_trend_snapshots()
+    if not snapshots:
+        st.markdown(
+            '<div style="text-align:center;padding:60px;color:var(--mu);font-size:13px;">'
+            '트렌드 데이터가 없습니다.<br>키워드를 수집하면 자동으로 스냅샷이 기록됩니다.</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    try:
+        import pandas as pd
+    except ImportError:
+        st.error("pandas 패키지가 필요합니다.")
+        return
+
+    df = pd.DataFrame(snapshots)
+    keywords = sorted(df["keyword"].unique().tolist())
+
+    st.markdown(
+        '<div class="sec"><div class="sec-t">트렌드 리포트</div>'
+        f'<div class="sec-n">키워드 {len(keywords)}개 · 스냅샷 {len(df)}개</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    sel_kw = st.multiselect("키워드 선택", keywords, default=keywords[:min(3, len(keywords))], key="trend_kw")
+    if not sel_kw:
+        st.info("하나 이상의 키워드를 선택하세요.")
+        return
+
+    filtered = df[df["keyword"].isin(sel_kw)].copy()
+    filtered["date"] = pd.to_datetime(filtered["date"])
+    filtered = filtered.sort_values("date")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("**소재 수 추이**")
+        pivot = filtered.pivot_table(index="date", columns="keyword", values="asset_count", aggfunc="sum")
+        st.line_chart(pivot)
+
+    with col2:
+        st.markdown("**평균 전환력 점수 추이**")
+        pivot_score = filtered.pivot_table(index="date", columns="keyword", values="avg_score", aggfunc="mean")
+        st.line_chart(pivot_score)
+
+    st.markdown("---")
+    st.markdown("**소구 유형 분포 (최신 스냅샷 기준)**")
+
+    latest = filtered.sort_values("date").groupby("keyword").last().reset_index()
+    appeal_rows = []
+    for _, row in latest.iterrows():
+        dist = row.get("appeal_dist") or {}
+        if isinstance(dist, dict):
+            for appeal, cnt in dist.items():
+                appeal_rows.append({"키워드": row["keyword"], "소구 유형": appeal, "수": cnt})
+
+    if appeal_rows:
+        ap_df = pd.DataFrame(appeal_rows)
+        pivot_appeal = ap_df.pivot_table(index="소구 유형", columns="키워드", values="수", aggfunc="sum", fill_value=0)
+        st.bar_chart(pivot_appeal)
+    else:
+        st.info("AI 분석 완료 후 소구 유형 분포가 표시됩니다.")
+
+    st.markdown("---")
+    st.markdown("**수집 이력 요약**")
+    display_df = filtered[["date", "keyword", "asset_count", "analyzed_count", "avg_score"]].copy()
+    display_df.columns = ["날짜", "키워드", "수집 수", "분석 완료", "평균 전환력"]
+    display_df["날짜"] = display_df["날짜"].dt.strftime("%Y-%m-%d")
+    display_df["평균 전환력"] = display_df["평균 전환력"].round(2)
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    # AI 트렌드 인사이트 생성
+    if API_KEY and len(snapshots) >= 2:
+        st.markdown("---")
+        if st.button("AI 트렌드 인사이트 생성", key="btn_trend_insight"):
+            with st.spinner("트렌드 분석 중..."):
+                insight, err = _generate_trend_insight(snapshots, sel_kw)
+            if err:
+                st.error(f"인사이트 생성 실패: {err}")
+            elif insight:
+                st.markdown(
+                    f'<div style="background:var(--bg2);border:1px solid var(--bd);border-radius:10px;'
+                    f'padding:20px;font-size:13px;line-height:1.8;">{insight}</div>',
+                    unsafe_allow_html=True,
+                )
+
+
+def _generate_trend_insight(snapshots: list, keywords: list) -> tuple[str | None, str | None]:
+    """수집 이력 요약을 Claude에게 전달해 트렌드 인사이트 생성."""
+    summary_lines = []
+    for s in snapshots:
+        if s["keyword"] not in keywords:
+            continue
+        top_appeal = max(s["appeal_dist"], key=s["appeal_dist"].get) if s["appeal_dist"] else "미분류"
+        summary_lines.append(
+            f"날짜={s['date']} 키워드={s['keyword']} 수집={s['asset_count']}개 "
+            f"분석={s['analyzed_count']}개 평균전환력={s['avg_score']} 주요소구={top_appeal}"
+        )
+    if not summary_lines:
+        return None, "데이터 없음"
+
+    prompt = (
+        "당신은 디지털 마케팅 트렌드 분석 전문가입니다.\n"
+        "아래는 Meta 광고 소재 수집 이력 데이터입니다:\n\n"
+        + "\n".join(summary_lines)
+        + "\n\n위 데이터를 바탕으로 다음을 분석하세요:\n"
+        "1. 각 키워드별 소재 수 증감 추이와 의미\n"
+        "2. 평균 전환력 점수의 변화 흐름\n"
+        "3. 주요 소구 유형의 변화 패턴\n"
+        "4. 현재 시장에서 주목해야 할 기회나 위협\n"
+        "5. 다음 소재 기획을 위한 구체적 제언 2~3가지\n\n"
+        "답변은 한국어로 작성하고, 각 항목을 명확히 구분하세요."
+    )
+    try:
+        resp = _anthropic_post({
+            "model": _anthropic_model("summary"),
+            "max_tokens": 1500,
+            "messages": [{"role": "user", "content": prompt}],
+        }, timeout=60)
+        if resp.status_code != 200:
+            return None, f"API 오류 {resp.status_code}"
+        return resp.json()["content"][0]["text"].strip(), None
+    except Exception as ex:
+        return None, str(ex)[:200]
+
+
 def render_comparison_table(all_items):
     try:
         import pandas as pd
@@ -2821,27 +3075,25 @@ def render_comparison_table(all_items):
 
     rows = []
     for item in analyzed:
-        ai  = item.get("ai") or {}
-        ce  = ai.get("conversion_elements") or {}
-        vf  = ai.get("visual_facts") or {}
-        ma  = ai.get("marketing_analysis") or {}
-        cd  = ai.get("creative_diagnosis") or {}
+        ai = item.get("ai") or {}
+        f  = _extract_ai_fields(ai)
+        sc = f["scores"]
         rows.append({
-            "키워드":       item["keyword"],
-            "타입":         "이미지" if item["asset_type"] == "image" else "비디오",
-            "레이아웃":     (vf.get("layout_type") or ai.get("layout_type") or "—")[:20],
-            "후크":         (ai.get("hook") or ma.get("hook_type") or "—")[:20],
-            "소구":         str(ai.get("appeal") or "—")[:30],
-            "타겟":         (ai.get("target") or "—")[:40],
-            "핵심메시지":   (ai.get("message") or "—")[:60],
-            "가격강조":     int(ce.get("price_emphasis") or 0),
-            "제품가시성":   int(ce.get("product_visibility") or 0),
-            "가독성":       int(ce.get("readability") or 0),
-            "할인가시성":   int(ce.get("discount_visibility") or 0),
-            "시각명확도":   int(ce.get("visual_clarity") or 0),
-            "전환력":       int(ce.get("overall_conversion_power") or 0),
-            "개선방향":     (cd.get("improvement_direction") or "—")[:80],
-            "썸네일":       item["image_url"],
+            "키워드":     item["keyword"],
+            "타입":       "이미지" if item["asset_type"] == "image" else "비디오",
+            "레이아웃":   f["layout"][:20],
+            "후크":       f["hook"][:20],
+            "소구":       f["appeal"][:30],
+            "타겟":       f["target"][:40],
+            "핵심메시지": f["message"][:60],
+            "가격강조":   int(sc.get("price_emphasis") or 0),
+            "제품가시성": int(sc.get("product_visibility") or 0),
+            "가독성":     int(sc.get("readability") or 0),
+            "할인가시성": int(sc.get("discount_visibility") or 0),
+            "시각명확도": int(sc.get("visual_clarity") or 0),
+            "전환력":     f["score_overall"],
+            "개선방향":   f["improvement"][:80],
+            "썸네일":     item["image_url"],
         })
 
     df = pd.DataFrame(rows)
@@ -3200,6 +3452,8 @@ def _run_search(keywords: list[str], is_new: bool, is_add: bool):
                 st.session_state.history.append(q)
                 db_add_history(q)
 
+            db_save_trend_snapshot(q, st.session_state.assets)
+
             st.session_state.log.append({"t": time.strftime("%H:%M"), "kw": q, "n": added, "ok": True})
             total_added += added
             total_skip  += skipped
@@ -3334,7 +3588,7 @@ if summary:
 # ============================================================
 # 메인 탭 — 소재 보드 / 비교 테이블
 # ============================================================
-tab_board, tab_table = st.tabs(["◼ 소재 보드", "⊞ 비교 테이블"])
+tab_board, tab_table, tab_trend = st.tabs(["◼ 소재 보드", "⊞ 비교 테이블", "📈 트렌드 리포트"])
 
 
 # ── 탭1: 소재 보드 ──────────────────────────────────────────
@@ -3703,6 +3957,9 @@ with tab_board:
 # ── 탭2: 비교 테이블 ─────────────────────────────────────────
 with tab_table:
     render_comparison_table(all_a)
+
+with tab_trend:
+    render_trend_report()
 
 
 # ============================================================
