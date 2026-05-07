@@ -117,7 +117,7 @@ st.markdown("""
   position: fixed;
   inset: 0;
   z-index: 999999;
-  background: #0b0d11;
+  background: #ffffff;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -161,7 +161,7 @@ st.markdown("""
   font-size: 52px;
   font-weight: 900;
   letter-spacing: -1.5px;
-  color: #e8eaf0;
+  color: #111318;
   line-height: 1;
 }
 
@@ -189,7 +189,7 @@ st.markdown("""
   font-size: 10px;
   font-weight: 500;
   letter-spacing: 3px;
-  color: #4b5263;
+  color: #8a909e;
   text-transform: uppercase;
   margin-bottom: 28px;
 }
@@ -206,7 +206,7 @@ st.markdown("""
 .al-bar-wrap {
   width: 280px;
   height: 2px;
-  background: rgba(255,255,255,.06);
+  background: rgba(0,0,0,.08);
   border-radius: 2px;
   overflow: hidden;
   margin-bottom: 20px;
@@ -591,7 +591,6 @@ if "initialized" not in st.session_state:
     st.session_state.history  = db_load_history()
     st.session_state.log            = []
     st.session_state.ai_on          = False
-    st.session_state.dark           = False
     st.session_state.selected       = set()
     st.session_state.summary        = db_load_summary()
     st.session_state.analysis_model     = "haiku"   # haiku | sonnet
@@ -602,34 +601,18 @@ if "initialized" not in st.session_state:
 # ============================================================
 # CSS
 # ============================================================
-D = st.session_state.dark
-
-LIGHT = """
-:root {
-    --bg:#111114; --bg2:#1a1a1e; --bg3:#222228;
-    --bd:#2e2e36; --bd2:#3a3a44;
-    --ac:#e8284a; --ac2:rgba(232,40,74,0.12);
-    --tx:#f0f0f2; --tx2:#b8b8c0; --mu:#66666e;
-    --ok:#3dffa0; --er:#ff6b35; --wn:#ffb84f;
-    --sh:0 1px 4px rgba(0,0,0,.5);
-    --sh2:0 4px 20px rgba(232,40,74,.18);
-}"""
-
-DARK = """
-:root {
-    --bg:#0a0a0c; --bg2:#111113; --bg3:#191919;
-    --bd:#272729; --bd2:#333338;
-    --ac:#e8284a; --ac2:rgba(232,40,74,0.12);
-    --tx:#f0f0f2; --tx2:#b0b0b8; --mu:#606068;
-    --ok:#3dffa0; --er:#ff6b35; --wn:#ffb84f;
-    --sh:0 1px 4px rgba(0,0,0,.6);
-    --sh2:0 4px 20px rgba(232,40,74,.22);
-}"""
-
 st.markdown(f"""<style>
 @import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css');
 
-{DARK if D else LIGHT}
+:root {{
+    --bg:#ffffff; --bg2:#f7f8fa; --bg3:#eef0f4;
+    --bd:#e2e4ea; --bd2:#d0d3dc;
+    --ac:#e8284a; --ac2:rgba(232,40,74,0.08);
+    --tx:#111318; --tx2:#3a3f4a; --mu:#8a909e;
+    --ok:#00a86b; --er:#e8284a; --wn:#e07b00;
+    --sh:0 1px 4px rgba(0,0,0,.06);
+    --sh2:0 4px 20px rgba(232,40,74,.12);
+}}
 
 html,body,[class*="css"]{{font-family:'Pretendard',sans-serif;background:var(--bg)!important;color:var(--tx)!important;}}
 .stApp{{background:var(--bg)!important;}}
@@ -3292,11 +3275,6 @@ st.markdown("""
 # 사이드바
 # ============================================================
 with st.sidebar:
-    st.markdown('<div class="slbl">DISPLAY</div>', unsafe_allow_html=True)
-    new_dark = st.toggle("Dark Mode", value=st.session_state.dark)
-    if new_dark != st.session_state.dark:
-        st.session_state.dark = new_dark
-        st.rerun()
     st.markdown("---")
 
     st.markdown('<div class="slbl">AI ANALYSIS</div>', unsafe_allow_html=True)
@@ -4082,12 +4060,11 @@ with tab_trend:
 # 푸터
 # ============================================================
 st.markdown("<div style='height:40px'></div>", unsafe_allow_html=True)
-th   = "DARK" if D else "LIGHT"
 model_label = "Sonnet" if st.session_state.get("analysis_model")=="sonnet" else "Haiku"
 ai_s = f"AI ON · {model_label}" if (ai_on and API_KEY) else "AI OFF"
 st.markdown(
     f'<div style="border-top:2px solid var(--bd);padding-top:14px;display:flex;justify-content:space-between;">'
-    f'<span style="font-size:10px;color:var(--mu)">ADINTEL v4.0 · {th} · {ai_s} · SQLite 자동저장</span>'
+    f'<span style="font-size:10px;color:var(--mu)">ADINTEL v4.0 · {ai_s} · SQLite 자동저장</span>'
     f'<span style="font-size:10px;color:var(--mu)">{time.strftime("%Y-%m-%d")}</span>'
     f'</div>',
     unsafe_allow_html=True)
