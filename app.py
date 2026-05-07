@@ -308,7 +308,8 @@ def db_init():
             starred INTEGER DEFAULT 0,
             capture_source TEXT DEFAULT '',
             img_b64 TEXT DEFAULT '',
-            ai_json TEXT DEFAULT ''
+            ai_json TEXT DEFAULT '',
+            memo TEXT DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS hidden (id TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS history (keyword TEXT PRIMARY KEY, added_at TEXT);
@@ -332,7 +333,12 @@ def db_init():
         CREATE INDEX IF NOT EXISTS idx_assets_image_url ON assets(image_url);
         CREATE INDEX IF NOT EXISTS idx_assets_keyword   ON assets(keyword);
         """)
-        con.commit()
+        # 기존 DB에 memo 컬럼 없으면 추가
+        try:
+            con.execute("ALTER TABLE assets ADD COLUMN memo TEXT DEFAULT ''")
+            con.commit()
+        except sqlite3.OperationalError:
+            pass  # 이미 존재
         con.close()
     except Exception as e:
         st.error(f"DB 초기화 오류: {e}")
@@ -346,8 +352,8 @@ def db_upsert_assets(assets: list):
         cur.execute("""
         INSERT OR REPLACE INTO assets
         (id,keyword,country,asset_type,image_url,source_url,caption,
-         width,height,created_at,starred,capture_source,img_b64,ai_json)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         width,height,created_at,starred,capture_source,img_b64,ai_json,memo)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             a["id"], a["keyword"], a["country"], a["asset_type"],
             a["image_url"], a["source_url"], a["caption"],
@@ -355,7 +361,8 @@ def db_upsert_assets(assets: list):
             1 if a.get("starred") else 0,
             a.get("capture_source", ""),
             a.get("img_b64", ""),
-            json.dumps(a.get("ai"), ensure_ascii=False) if a.get("ai") else ""
+            json.dumps(a.get("ai"), ensure_ascii=False) if a.get("ai") else "",
+            a.get("memo", ""),
         ))
     con.commit()
     con.close()
@@ -366,7 +373,7 @@ def db_load_assets() -> list:
     cur = con.cursor()
     cur.execute("""
         SELECT id,keyword,country,asset_type,image_url,source_url,caption,
-               width,height,created_at,starred,capture_source,ai_json
+               width,height,created_at,starred,capture_source,ai_json,memo
         FROM assets ORDER BY created_at DESC
     """)
     rows = cur.fetchall()
@@ -386,7 +393,8 @@ def db_load_assets() -> list:
             "created_at": r[9], "starred": bool(r[10]),
             "capture_source": r[11],
             "img_b64": "",   # 세션에는 비워둠
-            "ai": ai
+            "ai": ai,
+            "memo": r[13] if len(r) > 13 else "",
         })
     return out
 
@@ -400,7 +408,7 @@ def db_get_img_b64(aid: str) -> str:
 
 def db_set_field(aid: str, **kwargs):
     """allowed 필드만 업데이트"""
-    allowed = {"starred", "img_b64", "ai_json", "capture_source"}
+    allowed = {"starred", "img_b64", "ai_json", "capture_source", "memo"}
     pairs = [(k, v) for k, v in kwargs.items() if k in allowed]
     if not pairs:
         return
@@ -941,7 +949,7 @@ def _capture_media_by_url_b64(page, target_url: str, asset_type: str = "image") 
 
     return "", "capture_failed"
 
-def scrape(keyword, country, scrolls, limit):
+def scrape(keyword, country, scrolls, limit, known_fps: set | None = None):
     ensure_browser()
     search_url = (
         "https://www.facebook.com/ads/library/"
@@ -1031,6 +1039,7 @@ def scrape(keyword, country, scrolls, limit):
         browser.close()
 
     seen, collected, now = set(), [], time.strftime("%Y-%m-%d %H:%M:%S")
+    consec_known = 0  # 연속 기존 중복 카운트 → 조기 종료 판단
     for r in raw:
         if len(collected) >= limit:
             break
@@ -1054,11 +1063,19 @@ def scrape(keyword, country, scrolls, limit):
             "ai":             None,
             "img_b64":        "",
             "capture_source": "not_captured",
+            "memo":           "",
         }
         fp = make_fp(asset)
         if fp in seen:
             continue
         seen.add(fp)
+        # 이미 DB에 있는 지문이면 중복 카운트 (신규면 리셋)
+        if known_fps and fp in known_fps:
+            consec_known += 1
+            if consec_known >= 10:
+                break  # 연속 10개 기존 항목 → 이미 수집된 구간, 조기 종료
+            continue
+        consec_known = 0
         collected.append(asset)
 
     return collected
@@ -1814,7 +1831,10 @@ def analyze_parallel(items, max_workers=6, force=False):
     errors = []
 
     def task(item):
-        return item["id"], analyze(item)
+        b64 = item.get("img_b64", "") or db_get_img_b64(item["id"])
+        if not b64:
+            return item["id"], {"_error": "스크린샷 확보 실패 — 선택 분석 버튼으로 재시도하세요."}
+        return item["id"], analyze_new(b64, item["keyword"])
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {
@@ -1859,9 +1879,37 @@ def risk_chip(risk: str) -> str:
         return f'<span class="chip chip-wn">이탈 위험 중간</span>'
     return f'<span class="chip chip-ok">이탈 위험 낮음</span>'
 
+def _infer_category(keyword: str) -> str:
+    """키워드에서 광고 카테고리를 자동 추론."""
+    kw = keyword.lower()
+    if any(w in kw for w in ["앱", "app", "구독", "saas", "소프트웨어", "플랫폼"]):
+        return "앱/서비스"
+    if any(w in kw for w in ["부동산", "아파트", "분양", "임대"]):
+        return "부동산"
+    if any(w in kw for w in ["보험", "대출", "금융", "투자", "카드"]):
+        return "금융/보험"
+    if any(w in kw for w in ["교육", "학원", "강의", "자격증", "어학"]):
+        return "교육"
+    if any(w in kw for w in ["음식", "배달", "식품", "카페", "레스토랑"]):
+        return "식품/외식"
+    if any(w in kw for w in ["여행", "호텔", "항공", "숙박", "투어"]):
+        return "여행/숙박"
+    if any(w in kw for w in ["뷰티", "화장품", "스킨케어", "헤어", "향수"]):
+        return "뷰티/화장품"
+    if any(w in kw for w in ["패션", "옷", "의류", "신발", "가방", "악세서리"]):
+        return "패션/의류"
+    if any(w in kw for w in ["건강", "영양제", "다이어트", "헬스", "운동"]):
+        return "건강/웰니스"
+    if any(w in kw for w in ["가전", "전자", "스마트", "노트북", "폰", "태블릿"]):
+        return "가전/전자"
+    return "이커머스/일반 상품"
+
+
 def analyze_new(b64: str, keyword: str) -> dict:
+    category = _infer_category(keyword)
     prompt = f"""당신은 광고 효과 분석 전문가입니다.
 검색 키워드: {keyword}
+광고 카테고리: {category} (이 카테고리 맥락에서 소비자 반응을 평가하세요)
 
 아래 두 프레임워크를 순서대로 적용하세요.
 
@@ -3056,6 +3104,80 @@ def _generate_trend_insight(snapshots: list, keywords: list) -> tuple[str | None
         return None, str(ex)[:200]
 
 
+def to_html_report(items: list, summary: dict | None = None) -> str:
+    """분석 결과를 독립 실행 HTML 파일로 생성."""
+    analyzed = [a for a in items if a.get("ai") and not (a.get("ai") or {}).get("_error")]
+    gen_date = time.strftime("%Y년 %m월 %d일 %H:%M")
+    keywords = list(dict.fromkeys(a["keyword"] for a in items))
+
+    cards_html = ""
+    for item in analyzed:
+        f = _extract_ai_fields(item["ai"])
+        sc = f["scores"]
+        score = f["score_overall"]
+        score_pct = score / 5 * 100
+        score_col = "#00a86b" if score >= 4 else "#e07b00" if score >= 3 else "#e8284a"
+        tags_html = " ".join(
+            f'<span style="background:#1a2340;color:#4a8aff;border-radius:4px;padding:2px 7px;font-size:11px;">{t}</span>'
+            for t in (item["ai"].get("tags") or [])
+        )
+        cards_html += f"""
+        <div style="background:#13151d;border:1px solid #2a2f3e;border-radius:12px;padding:20px;break-inside:avoid;">
+          <div style="display:flex;gap:16px;margin-bottom:14px;">
+            <img src="{item['image_url']}" style="width:100px;height:100px;object-fit:cover;border-radius:8px;flex-shrink:0;" onerror="this.style.display='none'">
+            <div style="flex:1;">
+              <div style="font-size:11px;color:#8a909e;margin-bottom:4px;">{item['keyword']} · {item['country']} · {item['asset_type']}</div>
+              <div style="font-size:13px;font-weight:700;color:#e8eaf0;margin-bottom:8px;">{f['hook'][:60]}</div>
+              <div style="display:flex;align-items:center;gap:8px;">
+                <div style="flex:1;height:6px;background:#1e2330;border-radius:3px;overflow:hidden;">
+                  <div style="width:{score_pct}%;height:100%;background:{score_col};border-radius:3px;"></div>
+                </div>
+                <span style="font-size:13px;font-weight:800;color:{score_col};">{score}/5</span>
+              </div>
+            </div>
+          </div>
+          <table style="width:100%;font-size:11px;border-collapse:collapse;">
+            {''.join(f'<tr><td style="color:#8a909e;padding:3px 0;width:60px;">{k}</td><td style="color:#c8cad0;">{v}</td></tr>' for k, v in [("소구", f["appeal"]), ("타겟", f["target"]), ("메시지", f["message"][:80]), ("개선", f["improvement"][:80])])}
+          </table>
+          <div style="margin-top:10px;">{tags_html}</div>
+          {'<div style="margin-top:10px;font-size:11px;color:#8a909e;border-top:1px solid #2a2f3e;padding-top:8px;">📝 ' + item.get("memo","") + '</div>' if item.get("memo") else ""}
+        </div>"""
+
+    summary_html = ""
+    if summary:
+        summary_html = f"""
+        <div style="background:#13151d;border:1px solid #e8284a;border-radius:12px;padding:24px;margin-bottom:32px;">
+          <div style="font-size:10px;color:#e8284a;letter-spacing:2px;font-weight:700;margin-bottom:16px;">TOTAL INSIGHT</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+            {''.join(f'<div><div style="font-size:9px;color:#8a909e;margin-bottom:4px;">{k}</div><div style="font-size:12px;color:#e8eaf0;">{v}</div></div>' for k,v in [("주요 소구","dominant_appeal"),("공통 타겟","common_target"),("핵심 메시지","key_message"),("약점","common_weakness")] if summary.get(v))}
+          </div>
+          {'<div style="margin-top:16px;font-size:12px;color:#c8cad0;line-height:1.8;">' + summary.get("strategy","") + '</div>' if summary.get("strategy") else ""}
+        </div>"""
+
+    return f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AD INTEL 리포트 — {", ".join(keywords)}</title>
+<style>
+  body {{ margin:0; padding:32px; background:#0b0d11; color:#e8eaf0;
+         font-family:-apple-system,BlinkMacSystemFont,'Pretendard',sans-serif; }}
+  h1 {{ font-size:28px; font-weight:900; letter-spacing:-1px; }}
+  h1 span {{ color:#e8284a; }}
+  .meta {{ font-size:11px; color:#8a909e; margin:4px 0 32px; }}
+  .grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:16px; }}
+</style>
+</head>
+<body>
+  <h1>AD<span>INTEL</span> 리포트</h1>
+  <div class="meta">{gen_date} · {", ".join(keywords)} · 소재 {len(items)}개 · AI 분석 {len(analyzed)}개</div>
+  {summary_html}
+  <div class="grid">{cards_html}</div>
+</body>
+</html>"""
+
+
 def render_comparison_table(all_items):
     try:
         import pandas as pd
@@ -3201,23 +3323,7 @@ with st.sidebar:
             if model_choice == "sonnet":
                 st.info("비전 분석 품질이 크게 높습니다.\n소재당 약 10~20원 수준.")
 
-            # 분석 프레임워크 선택
-            st.markdown('<div class="slbl">분석 프레임워크</div>', unsafe_allow_html=True)
-            framework = st.radio(
-                "framework_radio",
-                options=["standard", "framework"],
-                format_func=lambda x: (
-                    "기존 방식 (OBSERVE/INTERPRET)"
-                    if x == "standard"
-                    else "신규 프레임워크 (소비자 반응 + 레이어 진단)"
-                ),
-                index=0 if st.session_state.get("analysis_framework", "standard") == "standard" else 1,
-                label_visibility="collapsed",
-            )
-            if framework != st.session_state.get("analysis_framework"):
-                st.session_state.analysis_framework = framework
-            if framework == "framework":
-                st.info("소비자 시선 흐름 + 4레이어 진단.\n분석 시간이 다소 길어집니다.")
+            st.caption("소비자 반응 시뮬레이션 + 4레이어 진단 프레임워크 사용")
 
             if st.button("API 연결 테스트", use_container_width=True):
                 ok, msg = test_api()
@@ -3257,6 +3363,12 @@ with st.sidebar:
         st.download_button("CSV 내보내기", data=to_csv(exp_items),
             file_name=f"adintel_{time.strftime('%Y%m%d_%H%M')}.csv",
             mime="text/csv", use_container_width=True)
+        analyzed_exp = [a for a in exp_items if a.get("ai") and not (a.get("ai") or {}).get("_error")]
+        if analyzed_exp:
+            html_bytes = to_html_report(exp_items, st.session_state.get("summary")).encode("utf-8")
+            st.download_button("HTML 리포트", data=html_bytes,
+                file_name=f"adintel_report_{time.strftime('%Y%m%d_%H%M')}.html",
+                mime="text/html", use_container_width=True)
     if stars:
         st.download_button("즐겨찾기 CSV", data=to_csv(stars),
             file_name=f"adintel_star_{time.strftime('%Y%m%d_%H%M')}.csv",
@@ -3438,7 +3550,7 @@ def _run_search(keywords: list[str], is_new: bool, is_add: bool):
 
         try:
             extra_fps = db_get_known_fps() if (is_add or i > 0) else None
-            items = scrape(q, country, scrolls, max_n)
+            items = scrape(q, country, scrolls, max_n, known_fps=extra_fps)
 
             merged, added, skipped = merge(st.session_state.assets, items, extra_fps)
             st.session_state.assets = merged
@@ -3595,10 +3707,20 @@ tab_board, tab_table, tab_trend = st.tabs(["◼ 소재 보드", "⊞ 비교 테�
 with tab_board:
     sel = st.session_state.selected
 
-    st.markdown(
-        f'<div class="sec"><div class="sec-t">소재 보드</div>'
-        f'<div class="sec-n">{len(shown)} assets · {sort}</div></div>',
-        unsafe_allow_html=True)
+    _hd1, _hd2, _hd3 = st.columns([4, 1, 1])
+    with _hd1:
+        st.markdown(
+            f'<div class="sec"><div class="sec-t">소재 보드</div>'
+            f'<div class="sec-n">{len(shown)} assets · {sort}</div></div>',
+            unsafe_allow_html=True)
+    with _hd2:
+        if shown and st.button("전체 선택", use_container_width=True):
+            st.session_state.selected = {a["id"] for a in shown}
+            st.rerun()
+    with _hd3:
+        if sel and st.button("선택 해제", use_container_width=True):
+            st.session_state.selected = set()
+            st.rerun()
 
     if ai_on and API_KEY and shown:
         sel_items      = [a for a in st.session_state.assets if a["id"] in sel]
@@ -3655,8 +3777,6 @@ with tab_board:
             it["ai"] = None
             it["img_b64"] = ""
         n = len(target_items)
-        use_framework = st.session_state.get("analysis_framework", "standard") == "framework"
-
         status.markdown(
             _analysis_status_html("capture", 0, n, "Playwright로 광고 카드 전체 영역을 캡처합니다"),
             unsafe_allow_html=True,
@@ -3664,30 +3784,15 @@ with tab_board:
         capture_screenshots_for_items(target_items, scrolls=scrolls)
         captured = sum(1 for it in target_items if it.get("img_b64"))
 
-        mode_label = "소비자 반응 + 레이어 진단 중" if use_framework else "OCR + Vision 분석 병렬 실행 중"
         status.markdown(
             _analysis_status_html(
                 "analyze", captured, n,
-                f"캡처 완료 {captured}개 · {mode_label}",
+                f"캡처 완료 {captured}개 · 소비자 반응 + 레이어 진단 병렬 실행 중",
             ),
             unsafe_allow_html=True,
         )
 
-        if use_framework:
-            errors = []
-            for it in target_items:
-                b64 = it.get("img_b64") or db_get_img_b64(it["id"])
-                if not b64:
-                    it["ai"] = {"_error": "캡처 실패"}
-                    errors.append(f"[{it['keyword']}] 캡처 실패")
-                    continue
-                result = analyze_new(b64, it["keyword"])
-                it["ai"] = result
-                db_set_field(it["id"], ai_json=json.dumps(result, ensure_ascii=False))
-                if result.get("_error"):
-                    errors.append(f"[{it['keyword']}] {result['_error']}")
-        else:
-            _, errors = analyze_parallel(target_items, max_workers=3, force=True)
+        _, errors = analyze_parallel(target_items, max_workers=3, force=True)
 
         done = sum(1 for it in target_items if it.get("ai") and not (it.get("ai") or {}).get("_error"))
 
@@ -3953,6 +4058,17 @@ with tab_board:
                             db_add_hidden(item["id"]); st.rerun()
                     with b4:
                         st.link_button("↗", item["source_url"], use_container_width=True)
+
+                    # 메모
+                    memo_key = f"memo_{item['id']}_{idx}"
+                    cur_memo = item.get("memo") or ""
+                    with st.expander("📝 메모" + (" ●" if cur_memo else ""), expanded=False):
+                        new_memo = st.text_area("메모", value=cur_memo, key=memo_key,
+                                                label_visibility="collapsed", height=68)
+                        if st.button("저장", key=f"memo_save_{item['id']}_{idx}", use_container_width=True):
+                            item["memo"] = new_memo
+                            db_set_field(item["id"], memo=new_memo)
+                            st.rerun()
 
 # ── 탭2: 비교 테이블 ─────────────────────────────────────────
 with tab_table:
