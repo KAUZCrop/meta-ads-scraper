@@ -3603,27 +3603,31 @@ def render_google_ads_page():
     )
 
     # 라이브러리 자동 설치 (Playwright ensure_browser 방식)
-    import importlib
-    importlib.invalidate_caches()
-    try:
-        importlib.import_module("google_ads_transparency_scraper")
-        lib_ok = True
-    except ImportError:
+    def _google_lib_ok():
+        """subprocess로 확인 — 프로세스 재시작 없이도 정확히 판별."""
+        r = subprocess.run(
+            [sys.executable, "-c", "import google_ads_transparency_scraper"],
+            capture_output=True, timeout=15,
+        )
+        return r.returncode == 0
+
+    lib_ok = _google_lib_ok()
+    if not lib_ok:
         with st.spinner("Google Ads Scraper 패키지 설치 중... (최초 1회)"):
-            ret = subprocess.run(
+            subprocess.run(
                 [sys.executable, "-m", "pip", "install", "Google-Ads-Transparency-Scraper"],
-                capture_output=True, text=True,
+                capture_output=True,
             )
-        if ret.returncode == 0:
-            importlib.invalidate_caches()
-            try:
-                importlib.import_module("google_ads_transparency_scraper")
-                lib_ok = True
-            except ImportError:
-                st.warning("설치됐지만 앱을 완전히 재시작해야 합니다. 브라우저를 새로고침(F5)하세요.")
-                lib_ok = False
+        lib_ok = _google_lib_ok()
+        if lib_ok:
+            st.success("설치 완료! 브라우저를 새로고침(F5)하면 바로 사용할 수 있습니다.")
+            st.stop()
         else:
-            st.error(f"설치 실패: {ret.stderr[:300]}")
+            st.error(
+                "패키지 설치 후에도 인식되지 않습니다.\n"
+                "Streamlit을 실행한 터미널(가상환경)에서 직접 실행하세요:\n\n"
+                "```\npip install Google-Ads-Transparency-Scraper\n```"
+            )
             lib_ok = False
 
     # 검색 영역
