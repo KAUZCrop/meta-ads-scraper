@@ -1,5 +1,6 @@
-streamlit
-playwright
-requests
-python-pptx
-pandas
+streamlit>=1.44.0,<2.0
+playwright>=1.50.0,<2.0
+requests>=2.32.0,<3.0
+python-pptx>=1.0.2,<2.0
+pandas>=2.2.0,<3.0
+Google-Ads-Transparency-Scraper>=1.6.0
