@@ -1,7 +1,7 @@
 # ============================================================
 # AD INTEL v4.0 — Meta Ad Library Intelligence Board
 # ============================================================
-import sys, asyncio, subprocess, time, uuid, io, json, requests, base64, sqlite3, random
+import sys, asyncio, subprocess, time, uuid, io, json, requests, base64, sqlite3, random, os
 import logging, threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
@@ -309,7 +309,8 @@ def db_init():
             capture_source TEXT DEFAULT '',
             img_b64 TEXT DEFAULT '',
             ai_json TEXT DEFAULT '',
-            memo TEXT DEFAULT ''
+            memo TEXT DEFAULT '',
+            video_url TEXT DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS hidden (id TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS history (keyword TEXT PRIMARY KEY, added_at TEXT);
@@ -327,6 +328,9 @@ def db_init():
             appeal_dist TEXT DEFAULT '{}',
             hook_dist TEXT DEFAULT '{}',
             avg_score REAL DEFAULT 0.0,
+            new_count INTEGER DEFAULT 0,
+            removed_count INTEGER DEFAULT 0,
+            image_url_set TEXT DEFAULT '[]',
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_trend_keyword ON trend_snapshots(keyword, snapshot_date);
@@ -339,13 +343,42 @@ def db_init():
             last_run TEXT DEFAULT '',
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS google_ads (
+            id TEXT PRIMARY KEY,
+            advertiser_id TEXT DEFAULT '',
+            advertiser_name TEXT DEFAULT '',
+            creative_id TEXT DEFAULT '',
+            ad_format TEXT DEFAULT '',
+            first_shown TEXT DEFAULT '',
+            last_shown TEXT DEFAULT '',
+            destination_url TEXT DEFAULT '',
+            image_url TEXT DEFAULT '',
+            video_url TEXT DEFAULT '',
+            ad_title TEXT DEFAULT '',
+            ad_body TEXT DEFAULT '',
+            keyword TEXT DEFAULT '',
+            country TEXT DEFAULT 'KR',
+            created_at TEXT NOT NULL,
+            starred INTEGER DEFAULT 0,
+            memo TEXT DEFAULT ''
+        );
         """)
-        # 기존 DB에 memo 컬럼 없으면 추가
-        try:
-            con.execute("ALTER TABLE assets ADD COLUMN memo TEXT DEFAULT ''")
-            con.commit()
-        except sqlite3.OperationalError:
-            pass  # 이미 존재
+        for _col, _def in [("memo", "TEXT DEFAULT ''"), ("video_url", "TEXT DEFAULT ''")]:
+            try:
+                con.execute(f"ALTER TABLE assets ADD COLUMN {_col} {_def}")
+                con.commit()
+            except sqlite3.OperationalError:
+                pass
+        for _col, _def in [
+            ("new_count", "INTEGER DEFAULT 0"),
+            ("removed_count", "INTEGER DEFAULT 0"),
+            ("image_url_set", "TEXT DEFAULT '[]'"),
+        ]:
+            try:
+                con.execute(f"ALTER TABLE trend_snapshots ADD COLUMN {_col} {_def}")
+                con.commit()
+            except sqlite3.OperationalError:
+                pass
         con.close()
     except Exception as e:
         st.error(f"DB 초기화 오류: {e}")
@@ -359,8 +392,8 @@ def db_upsert_assets(assets: list):
         cur.execute("""
         INSERT OR REPLACE INTO assets
         (id,keyword,country,asset_type,image_url,source_url,caption,
-         width,height,created_at,starred,capture_source,img_b64,ai_json,memo)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         width,height,created_at,starred,capture_source,img_b64,ai_json,memo,video_url)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             a["id"], a["keyword"], a["country"], a["asset_type"],
             a["image_url"], a["source_url"], a["caption"],
@@ -370,6 +403,7 @@ def db_upsert_assets(assets: list):
             a.get("img_b64", ""),
             json.dumps(a.get("ai"), ensure_ascii=False) if a.get("ai") else "",
             a.get("memo", ""),
+            a.get("video_url", ""),
         ))
     con.commit()
     con.close()
@@ -380,7 +414,7 @@ def db_load_assets() -> list:
     cur = con.cursor()
     cur.execute("""
         SELECT id,keyword,country,asset_type,image_url,source_url,caption,
-               width,height,created_at,starred,capture_source,ai_json,memo
+               width,height,created_at,starred,capture_source,ai_json,memo,video_url
         FROM assets ORDER BY created_at DESC
     """)
     rows = cur.fetchall()
@@ -399,9 +433,10 @@ def db_load_assets() -> list:
             "caption": r[6], "width": r[7], "height": r[8],
             "created_at": r[9], "starred": bool(r[10]),
             "capture_source": r[11],
-            "img_b64": "",   # 세션에는 비워둠
+            "img_b64": "",
             "ai": ai,
             "memo": r[13] if len(r) > 13 else "",
+            "video_url": r[14] if len(r) > 14 else "",
         })
     return out
 
@@ -472,68 +507,84 @@ def db_load_summary() -> dict | None:
     return None
 
 def db_save_trend_snapshot(keyword: str, assets: list) -> None:
-    """키워드별 오늘 날짜 스냅샷 저장 (하루 1회, 덮어쓰기)."""
+    """키워드별 오늘 날짜 스냅샷 저장 (하루 1회, 덮어쓰기). 이전 스냅샷 대비 신규/소멸 광고 계산."""
     today = time.strftime("%Y-%m-%d")
     kw_assets = [a for a in assets if a.get("keyword") == keyword]
-    analyzed = [a for a in kw_assets if a.get("ai") and not (a.get("ai") or {}).get("_error")]
+    analyzed  = [a for a in kw_assets if a.get("ai") and not (a.get("ai") or {}).get("_error")]
 
     appeal_dist: dict[str, int] = {}
-    hook_dist: dict[str, int] = {}
+    hook_dist:   dict[str, int] = {}
     scores: list[float] = []
     for a in analyzed:
         ai = a.get("ai") or {}
-        appeal = ai.get("appeal") or "미분류"
-        hook = ai.get("hook") or "미분류"
+        f  = _extract_ai_fields(ai)
+        appeal = f.get("appeal") or "미분류"
+        hook   = ai.get("hook") or "미분류"
         appeal_dist[appeal] = appeal_dist.get(appeal, 0) + 1
-        hook_dist[hook] = hook_dist.get(hook, 0) + 1
-        sc = ai.get("scores") or {}
+        hook_dist[hook]     = hook_dist.get(hook, 0) + 1
+        sc = f.get("scores") or {}
         ov = sc.get("overall_conversion_power")
         if isinstance(ov, (int, float)):
             scores.append(float(ov))
 
     avg_score = round(sum(scores) / len(scores), 2) if scores else 0.0
+    cur_urls  = set(a["image_url"] for a in kw_assets)
 
     con = sqlite3.connect(DB_PATH, timeout=15)
+
+    # 이전 스냅샷의 image_url_set 로드 (신규/소멸 계산용)
+    prev_row = con.execute(
+        "SELECT image_url_set FROM trend_snapshots WHERE keyword=? AND snapshot_date<? "
+        "ORDER BY snapshot_date DESC LIMIT 1",
+        (keyword, today),
+    ).fetchone()
+    prev_urls: set[str] = set()
+    if prev_row and prev_row[0]:
+        try:
+            prev_urls = set(json.loads(prev_row[0]))
+        except Exception:
+            pass
+    new_count     = len(cur_urls - prev_urls) if prev_urls else 0
+    removed_count = len(prev_urls - cur_urls) if prev_urls else 0
+
     con.execute(
         "DELETE FROM trend_snapshots WHERE keyword=? AND snapshot_date=?",
         (keyword, today),
     )
     con.execute(
-        "INSERT INTO trend_snapshots (snapshot_date,keyword,asset_count,analyzed_count,"
-        "appeal_dist,hook_dist,avg_score,created_at) VALUES (?,?,?,?,?,?,?,?)",
+        "INSERT INTO trend_snapshots "
+        "(snapshot_date,keyword,asset_count,analyzed_count,appeal_dist,hook_dist,"
+        "avg_score,new_count,removed_count,image_url_set,created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (
             today, keyword, len(kw_assets), len(analyzed),
             json.dumps(appeal_dist, ensure_ascii=False),
             json.dumps(hook_dist, ensure_ascii=False),
-            avg_score,
+            avg_score, new_count, removed_count,
+            json.dumps(list(cur_urls), ensure_ascii=False),
             time.strftime("%Y-%m-%d %H:%M:%S"),
         ),
     )
     con.commit()
     con.close()
-    logger.info(f'"trend snapshot saved: keyword={keyword} date={today} assets={len(kw_assets)}"')
+    logger.info(f'"trend snapshot saved: keyword={keyword} date={today} assets={len(kw_assets)} new={new_count} removed={removed_count}"')
 
 
 def db_load_trend_snapshots(keyword: str | None = None) -> list[dict]:
     """트렌드 스냅샷 로드. keyword=None이면 전체."""
     con = sqlite3.connect(DB_PATH, timeout=15)
+    _q = ("SELECT snapshot_date,keyword,asset_count,analyzed_count,appeal_dist,hook_dist,"
+          "avg_score,COALESCE(new_count,0),COALESCE(removed_count,0) FROM trend_snapshots ")
     if keyword:
-        rows = con.execute(
-            "SELECT snapshot_date,keyword,asset_count,analyzed_count,appeal_dist,hook_dist,avg_score "
-            "FROM trend_snapshots WHERE keyword=? ORDER BY snapshot_date",
-            (keyword,),
-        ).fetchall()
+        rows = con.execute(_q + "WHERE keyword=? ORDER BY snapshot_date", (keyword,)).fetchall()
     else:
-        rows = con.execute(
-            "SELECT snapshot_date,keyword,asset_count,analyzed_count,appeal_dist,hook_dist,avg_score "
-            "FROM trend_snapshots ORDER BY keyword, snapshot_date"
-        ).fetchall()
+        rows = con.execute(_q + "ORDER BY keyword, snapshot_date").fetchall()
     con.close()
     result = []
     for r in rows:
         try:
             appeal_dist = json.loads(r[4]) if r[4] else {}
-            hook_dist = json.loads(r[5]) if r[5] else {}
+            hook_dist   = json.loads(r[5]) if r[5] else {}
         except Exception:
             appeal_dist, hook_dist = {}, {}
         result.append({
@@ -541,6 +592,7 @@ def db_load_trend_snapshots(keyword: str | None = None) -> list[dict]:
             "asset_count": r[2], "analyzed_count": r[3],
             "appeal_dist": appeal_dist, "hook_dist": hook_dist,
             "avg_score": r[6],
+            "new_count": r[7], "removed_count": r[8],
         })
     return result
 
@@ -635,10 +687,13 @@ if "initialized" not in st.session_state:
 # ============================================================
 # CSS
 # ============================================================
-st.markdown(f"""<style>
+# ============================================================
+# CSS
+# ============================================================
+st.markdown("""<style>
 @import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css');
 
-:root {{
+:root {
     --bg:#ffffff; --bg2:#f7f8fa; --bg3:#eef0f4;
     --bd:#e2e4ea; --bd2:#d0d3dc;
     --ac:#e8284a; --ac2:rgba(232,40,74,0.08);
@@ -646,148 +701,123 @@ st.markdown(f"""<style>
     --ok:#00a86b; --er:#e8284a; --wn:#e07b00;
     --sh:0 1px 4px rgba(0,0,0,.06);
     --sh2:0 4px 20px rgba(232,40,74,.12);
-}}
+}
 
-html,body,[class*="css"]{{font-family:'Pretendard',sans-serif;background:var(--bg)!important;color:var(--tx)!important;}}
-.stApp{{background:var(--bg)!important;}}
-[data-testid="stHeader"]{{background:var(--bg)!important;border-bottom:1px solid var(--bd);}}
-[data-testid="stSidebar"]{{background:var(--bg2)!important;border-right:1px solid var(--bd)!important;}}
-[data-testid="stSidebar"] *{{color:var(--tx)!important;}}
-.block-container{{padding-top:4.5rem;padding-bottom:3rem;max-width:1600px;}}
-
-.hdr{{margin-bottom:2rem;padding-bottom:1.2rem;border-bottom:2px solid var(--bd);}}
-.hdr-row{{display:flex;align-items:center;gap:10px;}}
-.logo{{font-family:'Pretendard',sans-serif;font-size:22px;font-weight:800;letter-spacing:-.5px;color:var(--tx);}}
-.logo b{{color:var(--ac);}}
-.ver{{font-size:10px;color:var(--mu);border:1px solid var(--bd2);padding:2px 8px;border-radius:4px;background:var(--bg3);}}
-.sub{{font-size:10px;color:var(--mu);letter-spacing:2px;margin-top:8px;}}
-
-.slbl{{font-size:9px;color:var(--mu);letter-spacing:1.5px;text-transform:uppercase;margin:8px 0 6px;}}
-
-.srch{{background:var(--bg2);border:1.5px solid var(--bd);border-radius:14px;padding:16px 20px;margin-bottom:1.2rem;}}
-.srch-lbl{{font-size:9px;color:var(--mu);letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;}}
-.kw-chip{{display:inline-flex;align-items:center;gap:5px;background:var(--bg3);border:1px solid var(--bd2);border-radius:6px;padding:3px 10px;font-size:11px;color:var(--tx2);margin:2px;}}
-.kw-chip-active{{background:var(--ac2);border-color:var(--ac);color:var(--ac);}}
-.kw-chip-done{{background:rgba(61,255,160,.08);border-color:rgba(61,255,160,.25);color:var(--ok);}}
-.kw-chip-error{{background:rgba(255,79,107,.08);border-color:rgba(255,79,107,.25);color:var(--er);}}
-.multi-progress{{background:var(--bg);border:1px solid var(--bd);border-radius:12px;padding:16px 20px;margin-bottom:12px;}}
-.multi-progress-title{{font-size:9px;font-weight:700;color:var(--ac);letter-spacing:2px;margin-bottom:12px;}}
-.kw-row{{display:flex;align-items:center;gap:10px;margin-bottom:8px;padding:8px 12px;background:var(--bg2);border-radius:8px;border:1px solid var(--bd);}}
-
-.sc{{background:var(--bg);border:1.5px solid var(--bd);border-radius:12px;padding:20px 20px 18px;position:relative;overflow:hidden;box-shadow:var(--sh);transition:.2s;}}
-.sc:hover{{border-color:var(--ac);box-shadow:var(--sh2);}}
-.sc::before{{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--ac),#5b9dff);opacity:0;transition:.2s;}}
-.sc:hover::before{{opacity:1;}}
-.sc-lbl{{font-size:9px;color:var(--mu);letter-spacing:1px;text-transform:uppercase;margin-bottom:10px;}}
-.sc-val{{font-family:'Pretendard',sans-serif;font-size:32px;font-weight:800;color:var(--tx);line-height:1;}}
-.sc-sub{{font-size:11px;color:var(--mu);margin-top:8px;}}
-
-.tags{{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:1.2rem;}}
-.tag{{font-size:11px;background:var(--ac2);border:1px solid var(--ac2);color:var(--ac);padding:4px 10px;border-radius:20px;display:inline-flex;align-items:center;gap:6px;cursor:pointer;}}
-.tag-dot{{width:5px;height:5px;border-radius:50%;background:var(--ok);}}
-
-.sec{{display:flex;align-items:center;justify-content:space-between;margin-bottom:.8rem;padding-bottom:10px;border-bottom:1.5px solid var(--bd);}}
-.sec-t{{font-family:'Pretendard',sans-serif;font-size:13px;font-weight:800;color:var(--tx);letter-spacing:.5px;text-transform:uppercase;}}
-.sec-n{{font-size:11px;color:var(--mu);}}
-
-.card{{border:1.5px solid var(--bd);border-radius:12px;overflow:hidden;margin-bottom:10px;background:var(--bg);box-shadow:var(--sh);transition:.2s;}}
-.card:hover{{border-color:var(--ac);box-shadow:var(--sh2);}}
-.card-img-wrap{{width:100%;padding-top:100%;position:relative;overflow:hidden;background:var(--bg3);display:flex;align-items:center;justify-content:center;}}
-.card-img{{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;object-position:center;transition:.2s;}}
-.card:hover .card-img{{transform:scale(1.03);}}
-.ratio-section{{margin-bottom:2rem;}}
-.ratio-header{{display:flex;align-items:center;gap:10px;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--bd);}}
-.ratio-badge{{font-size:9px;font-weight:700;color:var(--ac);background:var(--ac2);border:1px solid var(--ac2);border-radius:6px;padding:3px 9px;letter-spacing:1px;}}
-.ratio-count{{font-size:10px;color:var(--mu);}}
-.card-body{{padding:10px 12px;border-top:1px solid var(--bd);background:var(--bg2);}}
-.card-kw{{font-size:10px;color:var(--ac);letter-spacing:.8px;text-transform:uppercase;margin-bottom:4px;}}
-.card-meta{{font-size:11px;color:var(--mu);margin-top:4px;}}
-.card-cap{{font-size:11px;color:var(--tx2);margin:4px 0;opacity:.8;font-style:italic;line-height:1.4;}}
-.bdg{{display:inline-block;font-size:9px;padding:2px 7px;border-radius:20px;margin:0 2px 4px 0;font-weight:600;}}
-.b-img{{background:var(--ac2);color:var(--ac);border:1px solid var(--ac2);}}
-.b-vid{{background:rgba(124,92,255,.12);color:#7c5cff;border:1px solid rgba(124,92,255,.2);}}
-.b-sav{{background:rgba(255,184,79,.12);color:var(--wn);border:1px solid rgba(255,184,79,.2);}}
-.b-ai {{background:rgba(61,255,160,.10);color:var(--ok);border:1px solid rgba(61,255,160,.2);}}
-
-.ai-wrap{{padding:0 12px 12px;background:var(--bg2);}}
-.ai-box{{background:var(--ac2);border:1px solid var(--ac2);border-radius:10px;padding:10px 12px;}}
-.ai-head{{font-size:9px;color:var(--ac);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:8px;font-weight:700;}}
-.ai-body{{font-size:12px;color:var(--tx2);line-height:1.75;}}
-.ai-tag{{display:inline-block;font-size:10px;background:var(--ac2);color:var(--ac);border-radius:4px;padding:1px 6px;margin:2px 2px 0 0;font-weight:600;}}
-
-.summary-box{{background:var(--bg2);border:2px solid var(--ac);border-radius:16px;padding:24px 28px;margin-bottom:1.5rem;}}
-.summary-head{{font-family:'Pretendard',sans-serif;font-size:16px;font-weight:800;color:var(--ac);margin-bottom:16px;}}
-.summary-grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px;}}
-.summary-item{{background:var(--bg);border:1px solid var(--bd);border-radius:10px;padding:12px 14px;}}
-.summary-item-lbl{{font-size:9px;color:var(--mu);letter-spacing:1px;text-transform:uppercase;margin-bottom:6px;font-weight:700;}}
-.summary-item-val{{font-size:13px;color:var(--tx);line-height:1.5;}}
-.summary-strategy{{background:var(--ac2);border:1px solid var(--ac2);border-radius:10px;padding:14px 16px;margin-bottom:12px;}}
-.summary-strategy-lbl{{font-size:9px;color:var(--ac);letter-spacing:1px;text-transform:uppercase;margin-bottom:8px;font-weight:700;}}
-.summary-strategy-val{{font-size:13px;color:var(--tx2);line-height:1.65;}}
-.summary-tags{{display:flex;flex-wrap:wrap;gap:6px;}}
-.summary-tag{{font-size:10px;background:var(--ac2);color:var(--ac);border:1px solid var(--ac2);border-radius:4px;padding:3px 9px;font-weight:600;}}
-
-.sel-bar{{display:flex;align-items:center;background:var(--bg2);border:1.5px solid var(--bd);border-radius:10px;padding:10px 16px;margin-bottom:1rem;}}
-.sel-count{{font-family:'Pretendard',sans-serif;font-size:14px;font-weight:800;color:var(--ac);margin-right:6px;}}
-.sel-bar-txt{{font-size:11px;color:var(--tx2);}}
-
-.banner{{display:flex;align-items:center;gap:10px;background:var(--ac2);border:1px solid var(--ac2);border-radius:10px;padding:10px 16px;margin-bottom:1rem;}}
-.banner-w{{background:rgba(224,123,0,.06);border-color:rgba(224,123,0,.2);}}
-.dot{{width:8px;height:8px;border-radius:50%;flex-shrink:0;}}
-.dot-on{{background:var(--ok);box-shadow:0 0 6px var(--ok);}}
-.banner-txt{{font-size:11px;color:var(--tx2);}}
-
-.err-box{{background:rgba(232,40,74,.06);border:1px solid rgba(232,40,74,.2);border-radius:10px;padding:10px 14px;margin-bottom:8px;font-size:11px;color:var(--er);}}
-
-.empty{{text-align:center;padding:80px 20px;}}
-.empty-t{{font-family:'Pretendard',sans-serif;font-size:16px;font-weight:700;color:var(--mu);margin-bottom:8px;}}
-.empty-d{{font-size:13px;color:var(--mu);line-height:1.6;}}
-
-.log{{font-size:11px;color:var(--mu);padding:4px 0;border-bottom:1px solid var(--bd);}}
-.log .ts{{color:var(--ac);margin-right:8px;}}
-.log .ok{{color:var(--ok);}}
-.log .er{{color:var(--er);}}
-
-.persist-badge{{display:inline-flex;align-items:center;gap:5px;font-size:10px;color:var(--ok);background:rgba(0,168,107,.08);border:1px solid rgba(0,168,107,.2);border-radius:6px;padding:3px 8px;}}
-
-.stButton>button{{
-    font-family:'Pretendard',sans-serif!important;font-size:13px!important;font-weight:600!important;
-    border-radius:8px!important;border:1.5px solid var(--bd2)!important;
-    background:var(--bg)!important;color:var(--tx2)!important;height:34px!important;
-    transition:.15s!important;white-space:nowrap!important;overflow:hidden!important;
-    padding:0 8px!important;line-height:34px!important;
-}}
-.stButton>button:hover{{border-color:var(--ac)!important;color:var(--ac)!important;background:var(--ac2)!important;}}
-.stDownloadButton>button{{
-    font-family:'Pretendard',sans-serif!important;font-size:12px!important;
-    border-radius:8px!important;border:1.5px solid var(--bd2)!important;
-    background:var(--bg)!important;color:var(--tx2)!important;white-space:nowrap!important;
-}}
-
-.stTextInput input{{background:var(--bg)!important;border:1.5px solid var(--bd2)!important;border-radius:10px!important;color:var(--tx)!important;font-family:'Pretendard',sans-serif!important;}}
-.stTextInput input:focus{{border-color:var(--ac)!important;box-shadow:0 0 0 3px var(--ac2)!important;}}
-div[data-baseweb="select"]>div{{background:var(--bg)!important;border-color:var(--bd2)!important;border-radius:8px!important;color:var(--tx)!important;}}
-
-.stSuccess{{background:rgba(0,168,107,.08)!important;border:1px solid rgba(0,168,107,.25)!important;border-radius:10px!important;}}
-.stWarning{{background:rgba(224,123,0,.08)!important;border:1px solid rgba(224,123,0,.25)!important;border-radius:10px!important;}}
-.stInfo   {{background:var(--ac2)!important;border:1px solid var(--ac2)!important;border-radius:10px!important;}}
-.stError  {{background:rgba(232,40,74,.08)!important;border:1px solid rgba(232,40,74,.25)!important;border-radius:10px!important;}}
-
-hr{{border-color:var(--bd)!important;}}
-.stCaption{{color:var(--mu)!important;font-size:11px!important;}}
-a{{color:var(--ac)!important;}}
-::-webkit-scrollbar{{width:4px;height:4px;}}
-::-webkit-scrollbar-track{{background:var(--bg2);}}
-::-webkit-scrollbar-thumb{{background:var(--bd2);border-radius:4px;}}
-.stSpinner>div{{border-top-color:var(--ac)!important;}}
-.chip{{display:inline-block;font-size:10px;font-weight:700;padding:3px 10px;border-radius:20px;margin:2px;}}
-.chip-a{{background:var(--ac2);color:var(--ac);border:1px solid var(--ac2);}}
-.chip-ok{{background:rgba(61,255,160,.1);color:var(--ok);border:1px solid rgba(61,255,160,.25);}}
-.chip-wn{{background:rgba(255,184,79,.1);color:var(--wn);border:1px solid rgba(255,184,79,.25);}}
-.chip-er{{background:rgba(255,79,107,.1);color:var(--er);border:1px solid rgba(255,79,107,.25);}}
-.panel{{background:var(--bg2);border:1px solid var(--bd);border-radius:12px;padding:20px 22px;margin-bottom:14px;}}
-.panel-title{{font-size:9px;font-weight:700;color:var(--ac);letter-spacing:2px;text-transform:uppercase;margin-bottom:14px;}}
-[data-testid="stTabs"]{{border-bottom:2px solid var(--bd);}}
+html,body,[class*="css"]{font-family:'Pretendard',sans-serif;background:var(--bg)!important;color:var(--tx)!important;}
+.stApp{background:var(--bg)!important;}
+[data-testid="stHeader"]{background:var(--bg)!important;border-bottom:1px solid var(--bd);}
+[data-testid="stSidebar"]{background:var(--bg2)!important;border-right:1px solid var(--bd)!important;}
+[data-testid="stSidebar"] *{color:var(--tx)!important;}
+.block-container{padding-top:4.5rem;padding-bottom:3rem;max-width:1600px;}
+.hdr{margin-bottom:2rem;padding-bottom:1.2rem;border-bottom:2px solid var(--bd);}
+.hdr-row{display:flex;align-items:center;gap:10px;}
+.logo{font-family:'Pretendard',sans-serif;font-size:22px;font-weight:800;letter-spacing:-.5px;color:var(--tx);}
+.logo b{color:var(--ac);}
+.ver{font-size:10px;color:var(--mu);border:1px solid var(--bd2);padding:2px 8px;border-radius:4px;background:var(--bg3);}
+.sub{font-size:10px;color:var(--mu);letter-spacing:2px;margin-top:8px;}
+.slbl{font-size:9px;color:var(--mu);letter-spacing:1.5px;text-transform:uppercase;margin:8px 0 6px;}
+.srch{background:var(--bg2);border:1.5px solid var(--bd);border-radius:14px;padding:16px 20px;margin-bottom:1.2rem;}
+.srch-lbl{font-size:9px;color:var(--mu);letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;}
+.kw-chip{display:inline-flex;align-items:center;gap:5px;background:var(--bg3);border:1px solid var(--bd2);border-radius:6px;padding:3px 10px;font-size:11px;color:var(--tx2);margin:2px;}
+.kw-chip-active{background:var(--ac2);border-color:var(--ac);color:var(--ac);}
+.kw-chip-done{background:rgba(61,255,160,.08);border-color:rgba(61,255,160,.25);color:var(--ok);}
+.kw-chip-error{background:rgba(255,79,107,.08);border-color:rgba(255,79,107,.25);color:var(--er);}
+.multi-progress{background:var(--bg);border:1px solid var(--bd);border-radius:12px;padding:16px 20px;margin-bottom:12px;}
+.multi-progress-title{font-size:9px;font-weight:700;color:var(--ac);letter-spacing:2px;margin-bottom:12px;}
+.kw-row{display:flex;align-items:center;gap:10px;margin-bottom:8px;padding:8px 12px;background:var(--bg2);border-radius:8px;border:1px solid var(--bd);}
+.sc{background:var(--bg);border:1.5px solid var(--bd);border-radius:12px;padding:20px 20px 18px;position:relative;overflow:hidden;box-shadow:var(--sh);transition:.2s;}
+.sc:hover{border-color:var(--ac);box-shadow:var(--sh2);}
+.sc::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--ac),#5b9dff);opacity:0;transition:.2s;}
+.sc:hover::before{opacity:1;}
+.sc-lbl{font-size:9px;color:var(--mu);letter-spacing:1px;text-transform:uppercase;margin-bottom:10px;}
+.sc-val{font-family:'Pretendard',sans-serif;font-size:32px;font-weight:800;color:var(--tx);line-height:1;}
+.sc-sub{font-size:11px;color:var(--mu);margin-top:8px;}
+.tags{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:1.2rem;}
+.tag{font-size:11px;background:var(--ac2);border:1px solid var(--ac2);color:var(--ac);padding:4px 10px;border-radius:20px;display:inline-flex;align-items:center;gap:6px;cursor:pointer;}
+.tag-dot{width:5px;height:5px;border-radius:50%;background:var(--ok);}
+.sec{display:flex;align-items:center;justify-content:space-between;margin-bottom:.8rem;padding-bottom:10px;border-bottom:1.5px solid var(--bd);}
+.sec-t{font-family:'Pretendard',sans-serif;font-size:13px;font-weight:800;color:var(--tx);letter-spacing:.5px;text-transform:uppercase;}
+.sec-n{font-size:11px;color:var(--mu);}
+.card{border:1.5px solid var(--bd);border-radius:12px;overflow:hidden;margin-bottom:10px;background:var(--bg);box-shadow:var(--sh);transition:.2s;}
+.card:hover{border-color:var(--ac);box-shadow:var(--sh2);}
+.card-img-wrap{width:100%;padding-top:100%;position:relative;overflow:hidden;background:var(--bg3);display:flex;align-items:center;justify-content:center;}
+.card-img{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;object-position:center;transition:.2s;}
+.card:hover .card-img{transform:scale(1.03);}
+.card-vid{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;}
+.ratio-section{margin-bottom:2rem;}
+.ratio-header{display:flex;align-items:center;gap:10px;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--bd);}
+.ratio-badge{font-size:9px;font-weight:700;color:var(--ac);background:var(--ac2);border:1px solid var(--ac2);border-radius:6px;padding:3px 9px;letter-spacing:1px;}
+.ratio-count{font-size:10px;color:var(--mu);}
+.card-body{padding:10px 12px;border-top:1px solid var(--bd);background:var(--bg2);}
+.card-kw{font-size:10px;color:var(--ac);letter-spacing:.8px;text-transform:uppercase;margin-bottom:4px;}
+.card-meta{font-size:11px;color:var(--mu);margin-top:4px;}
+.card-cap{font-size:11px;color:var(--tx2);margin:4px 0;opacity:.8;font-style:italic;line-height:1.4;}
+.bdg{display:inline-block;font-size:9px;padding:2px 7px;border-radius:20px;margin:0 2px 4px 0;font-weight:600;}
+.b-img{background:var(--ac2);color:var(--ac);border:1px solid var(--ac2);}
+.b-vid{background:rgba(124,92,255,.12);color:#7c5cff;border:1px solid rgba(124,92,255,.2);}
+.b-sav{background:rgba(255,184,79,.12);color:var(--wn);border:1px solid rgba(255,184,79,.2);}
+.b-ai {background:rgba(61,255,160,.10);color:var(--ok);border:1px solid rgba(61,255,160,.2);}
+.ai-wrap{padding:0 12px 12px;background:var(--bg2);}
+.ai-box{background:var(--ac2);border:1px solid var(--ac2);border-radius:10px;padding:10px 12px;}
+.ai-head{font-size:9px;color:var(--ac);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:8px;font-weight:700;}
+.ai-body{font-size:12px;color:var(--tx2);line-height:1.75;}
+.ai-tag{display:inline-block;font-size:10px;background:var(--ac2);color:var(--ac);border-radius:4px;padding:1px 6px;margin:2px 2px 0 0;font-weight:600;}
+.summary-box{background:var(--bg2);border:2px solid var(--ac);border-radius:16px;padding:24px 28px;margin-bottom:1.5rem;}
+.summary-head{font-family:'Pretendard',sans-serif;font-size:16px;font-weight:800;color:var(--ac);margin-bottom:16px;}
+.summary-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px;}
+.summary-item{background:var(--bg);border:1px solid var(--bd);border-radius:10px;padding:12px 14px;}
+.summary-item-lbl{font-size:9px;color:var(--mu);letter-spacing:1px;text-transform:uppercase;margin-bottom:6px;font-weight:700;}
+.summary-item-val{font-size:13px;color:var(--tx);line-height:1.5;}
+.summary-strategy{background:var(--ac2);border:1px solid var(--ac2);border-radius:10px;padding:14px 16px;margin-bottom:12px;}
+.summary-strategy-lbl{font-size:9px;color:var(--ac);letter-spacing:1px;text-transform:uppercase;margin-bottom:8px;font-weight:700;}
+.summary-strategy-val{font-size:13px;color:var(--tx2);line-height:1.65;}
+.summary-tags{display:flex;flex-wrap:wrap;gap:6px;}
+.summary-tag{font-size:10px;background:var(--ac2);color:var(--ac);border:1px solid var(--ac2);border-radius:4px;padding:3px 9px;font-weight:600;}
+.sel-bar{display:flex;align-items:center;background:var(--bg2);border:1.5px solid var(--bd);border-radius:10px;padding:10px 16px;margin-bottom:1rem;}
+.sel-count{font-family:'Pretendard',sans-serif;font-size:14px;font-weight:800;color:var(--ac);margin-right:6px;}
+.sel-bar-txt{font-size:11px;color:var(--tx2);}
+.banner{display:flex;align-items:center;gap:10px;background:var(--ac2);border:1px solid var(--ac2);border-radius:10px;padding:10px 16px;margin-bottom:1rem;}
+.banner-w{background:rgba(224,123,0,.06);border-color:rgba(224,123,0,.2);}
+.dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;}
+.dot-on{background:var(--ok);box-shadow:0 0 6px var(--ok);}
+.banner-txt{font-size:11px;color:var(--tx2);}
+.err-box{background:rgba(232,40,74,.06);border:1px solid rgba(232,40,74,.2);border-radius:10px;padding:10px 14px;margin-bottom:8px;font-size:11px;color:var(--er);}
+.empty{text-align:center;padding:80px 20px;}
+.empty-t{font-family:'Pretendard',sans-serif;font-size:16px;font-weight:700;color:var(--mu);margin-bottom:8px;}
+.empty-d{font-size:13px;color:var(--mu);line-height:1.6;}
+.log{font-size:11px;color:var(--mu);padding:4px 0;border-bottom:1px solid var(--bd);}
+.log .ts{color:var(--ac);margin-right:8px;}
+.log .ok{color:var(--ok);}
+.log .er{color:var(--er);}
+.persist-badge{display:inline-flex;align-items:center;gap:5px;font-size:10px;color:var(--ok);background:rgba(0,168,107,.08);border:1px solid rgba(0,168,107,.2);border-radius:6px;padding:3px 8px;}
+.stButton>button{font-family:'Pretendard',sans-serif!important;font-size:13px!important;font-weight:600!important;border-radius:8px!important;border:1.5px solid var(--bd2)!important;background:var(--bg)!important;color:var(--tx2)!important;height:34px!important;transition:.15s!important;white-space:nowrap!important;overflow:hidden!important;padding:0 8px!important;line-height:34px!important;}
+.stButton>button:hover{border-color:var(--ac)!important;color:var(--ac)!important;background:var(--ac2)!important;}
+.stDownloadButton>button{font-family:'Pretendard',sans-serif!important;font-size:12px!important;border-radius:8px!important;border:1.5px solid var(--bd2)!important;background:var(--bg)!important;color:var(--tx2)!important;white-space:nowrap!important;}
+.stTextInput input{background:var(--bg)!important;border:1.5px solid var(--bd2)!important;border-radius:10px!important;color:var(--tx)!important;font-family:'Pretendard',sans-serif!important;}
+.stTextInput input:focus{border-color:var(--ac)!important;box-shadow:0 0 0 3px var(--ac2)!important;}
+div[data-baseweb="select"]>div{background:var(--bg)!important;border-color:var(--bd2)!important;border-radius:8px!important;color:var(--tx)!important;}
+.stSuccess{background:rgba(0,168,107,.08)!important;border:1px solid rgba(0,168,107,.25)!important;border-radius:10px!important;}
+.stWarning{background:rgba(224,123,0,.08)!important;border:1px solid rgba(224,123,0,.25)!important;border-radius:10px!important;}
+.stInfo   {background:var(--ac2)!important;border:1px solid var(--ac2)!important;border-radius:10px!important;}
+.stError  {background:rgba(232,40,74,.08)!important;border:1px solid rgba(232,40,74,.25)!important;border-radius:10px!important;}
+hr{border-color:var(--bd)!important;}
+.stCaption{color:var(--mu)!important;font-size:11px!important;}
+a{color:var(--ac)!important;}
+::-webkit-scrollbar{width:4px;height:4px;}
+::-webkit-scrollbar-track{background:var(--bg2);}
+::-webkit-scrollbar-thumb{background:var(--bd2);border-radius:4px;}
+.stSpinner>div{border-top-color:var(--ac)!important;}
+.chip{display:inline-block;font-size:10px;font-weight:700;padding:3px 10px;border-radius:20px;margin:2px;}
+.chip-a{background:var(--ac2);color:var(--ac);border:1px solid var(--ac2);}
+.chip-ok{background:rgba(61,255,160,.1);color:var(--ok);border:1px solid rgba(61,255,160,.25);}
+.chip-wn{background:rgba(255,184,79,.1);color:var(--wn);border:1px solid rgba(255,184,79,.25);}
+.chip-er{background:rgba(255,79,107,.1);color:var(--er);border:1px solid rgba(255,79,107,.25);}
+.panel{background:var(--bg2);border:1px solid var(--bd);border-radius:12px;padding:20px 22px;margin-bottom:14px;}
+.panel-title{font-size:9px;font-weight:700;color:var(--ac);letter-spacing:2px;text-transform:uppercase;margin-bottom:14px;}
+[data-testid="stTabs"]{border-bottom:2px solid var(--bd);}
+.g-card{border:1.5px solid var(--bd);border-radius:12px;overflow:hidden;margin-bottom:10px;background:var(--bg);box-shadow:var(--sh);transition:.2s;}
+.g-card:hover{border-color:#4285f4;box-shadow:0 4px 20px rgba(66,133,244,.12);}
+.g-badge{display:inline-block;font-size:9px;padding:2px 7px;border-radius:20px;margin:0 2px 4px 0;font-weight:600;background:rgba(66,133,244,.1);color:#4285f4;border:1px solid rgba(66,133,244,.2);}
 </style>""", unsafe_allow_html=True)
 
 
@@ -989,8 +1019,24 @@ def scrape(keyword, country, scrolls, limit, known_fps: set | None = None):
         )
         ctx.route("**/*.{woff,woff2,ttf,otf,eot}", lambda r: r.abort())
         page = ctx.new_page()
+
+        # ── Method B: 네트워크 인터셉트로 mp4 URL 수집 ──
+        _intercepted_videos: list[str] = []
+
+        def _on_response(resp):
+            try:
+                url = resp.url
+                ct  = resp.headers.get("content-type", "")
+                if (("fbcdn.net" in url or "cdninstagram.com" in url) and
+                        (".mp4" in url.lower() or "video/mp4" in ct)):
+                    if url not in _intercepted_videos:
+                        _intercepted_videos.append(url)
+            except Exception:
+                pass
+
+        page.on("response", _on_response)
+
         page.goto(search_url, wait_until="domcontentloaded", timeout=90000)
-        # 랜덤 딜레이로 봇 탐지 회피
         page.wait_for_timeout(3000 + random.randint(500, 1500))
 
         def card_count():
@@ -1025,6 +1071,22 @@ def scrape(keyword, country, scrolls, limit, known_fps: set | None = None):
                 if stalls >= 2:
                     break
 
+        # 비디오 재생 트리거 → currentSrc 로드 + 네트워크 요청 발생
+        try:
+            page.evaluate("""() => {
+                document.querySelectorAll('video').forEach(v => {
+                    try { v.muted = true; v.play(); } catch(e) {}
+                });
+            }""")
+            page.wait_for_timeout(1800)
+            page.evaluate("""() => {
+                document.querySelectorAll('video').forEach(v => {
+                    try { v.pause(); } catch(e) {}
+                });
+            }""")
+        except Exception:
+            pass
+
         raw = page.evaluate("""() => {
             const out = [];
             const imgs = Array.from(document.querySelectorAll('img'));
@@ -1041,9 +1103,11 @@ def scrape(keyword, country, scrolls, limit, known_fps: set | None = None):
             const vids = Array.from(document.querySelectorAll('video'));
             vids.forEach((v, idx) => {
                 const poster = v.poster || '';
+                const video_src = v.currentSrc || v.src || '';
                 if (!poster) return;
                 out.push({
-                    type: 'video_poster', src: poster, idx,
+                    type: 'video_poster', src: poster,
+                    video_src: video_src, idx,
                     w: v.videoWidth  || v.clientWidth  || 0,
                     h: v.videoHeight || v.clientHeight || 0,
                     alt: ''
@@ -1057,6 +1121,7 @@ def scrape(keyword, country, scrolls, limit, known_fps: set | None = None):
 
     seen, collected, now = set(), [], time.strftime("%Y-%m-%d %H:%M:%S")
     consec_known = 0  # 연속 기존 중복 카운트 → 조기 종료 판단
+    _vid_intercept_idx = 0  # 인터셉트된 mp4 순서 매핑용
     for r in raw:
         if len(collected) >= limit:
             break
@@ -1065,6 +1130,15 @@ def scrape(keyword, country, scrolls, limit, known_fps: set | None = None):
         if not src or not valid(w, h):
             continue
         asset_type = r.get("type", "image")
+
+        # 영상 URL 결정: currentSrc 우선, 없으면 인터셉트 목록에서 순서대로
+        video_url = ""
+        if asset_type == "video_poster":
+            video_url = (r.get("video_src") or "").strip()
+            if not video_url and _vid_intercept_idx < len(_intercepted_videos):
+                video_url = _intercepted_videos[_vid_intercept_idx]
+                _vid_intercept_idx += 1
+
         asset = {
             "id":             str(uuid.uuid4()),
             "keyword":        keyword,
@@ -1081,6 +1155,7 @@ def scrape(keyword, country, scrolls, limit, known_fps: set | None = None):
             "img_b64":        "",
             "capture_source": "not_captured",
             "memo":           "",
+            "video_url":      video_url,
         }
         fp = make_fp(asset)
         if fp in seen:
@@ -2994,7 +3069,7 @@ def _group_by_ratio(items: list) -> list[tuple[str, str, list]]:
 
 
 def render_trend_report():
-    """트렌드 리포트 탭: 수집 이력 기반 시계열 차트 + 소구 유형 분포."""
+    """트렌드 리포트 탭: 수집 이력 기반 시계열 차트 + 신규/소멸 광고 + 소구 분포."""
     snapshots = db_load_trend_snapshots()
     if not snapshots:
         st.markdown(
@@ -3028,29 +3103,60 @@ def render_trend_report():
     filtered["date"] = pd.to_datetime(filtered["date"])
     filtered = filtered.sort_values("date")
 
-    col1, col2 = st.columns(2)
+    # ── 요약 KPI ───────────────────────────────────────────────
+    latest = filtered.sort_values("date").groupby("keyword").last().reset_index()
+    kpi_cols = st.columns(len(sel_kw))
+    for i, kw in enumerate(sel_kw):
+        row = latest[latest["keyword"] == kw]
+        if row.empty:
+            continue
+        r = row.iloc[0]
+        delta_new = int(r.get("new_count", 0) or 0)
+        delta_rm  = int(r.get("removed_count", 0) or 0)
+        with kpi_cols[i]:
+            st.markdown(
+                f'<div class="panel">'
+                f'<div class="panel-title">{kw}</div>'
+                f'<div style="font-size:26px;font-weight:900;color:var(--tx);">{int(r["asset_count"])}</div>'
+                f'<div style="font-size:11px;color:var(--mu);">소재 수</div>'
+                f'<div style="margin-top:8px;font-size:11px;">'
+                f'<span style="color:var(--ok);">+{delta_new} 신규</span>'
+                f'&nbsp;&nbsp;<span style="color:var(--er);">-{delta_rm} 소멸</span>'
+                f'</div>'
+                f'<div style="font-size:11px;color:var(--mu);margin-top:4px;">'
+                f'전환력 평균 {r["avg_score"]:.1f}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
-    with col1:
+    # ── 시계열 차트 ─────────────────────────────────────────────
+    c1, c2 = st.columns(2)
+    with c1:
         st.markdown("**소재 수 추이**")
         pivot = filtered.pivot_table(index="date", columns="keyword", values="asset_count", aggfunc="sum")
         st.line_chart(pivot)
-
-    with col2:
+    with c2:
         st.markdown("**평균 전환력 점수 추이**")
         pivot_score = filtered.pivot_table(index="date", columns="keyword", values="avg_score", aggfunc="mean")
         st.line_chart(pivot_score)
 
+    # 신규/소멸 추이 (2개 이상 스냅샷 있을 때만)
+    if filtered.shape[0] > len(sel_kw):
+        st.markdown("**신규 진입 / 소멸 광고 수 추이**")
+        nd_df = filtered[["date","keyword","new_count","removed_count"]].copy()
+        nd_df.columns = ["date","keyword","신규","소멸"]
+        pivot_nd = nd_df.pivot_table(index="date", columns="keyword", values="신규", aggfunc="sum")
+        st.area_chart(pivot_nd)
+
+    # ── 소구 유형 분포 ──────────────────────────────────────────
     st.markdown("---")
     st.markdown("**소구 유형 분포 (최신 스냅샷 기준)**")
-
-    latest = filtered.sort_values("date").groupby("keyword").last().reset_index()
     appeal_rows = []
     for _, row in latest.iterrows():
         dist = row.get("appeal_dist") or {}
         if isinstance(dist, dict):
             for appeal, cnt in dist.items():
                 appeal_rows.append({"키워드": row["keyword"], "소구 유형": appeal, "수": cnt})
-
     if appeal_rows:
         ap_df = pd.DataFrame(appeal_rows)
         pivot_appeal = ap_df.pivot_table(index="소구 유형", columns="키워드", values="수", aggfunc="sum", fill_value=0)
@@ -3058,15 +3164,16 @@ def render_trend_report():
     else:
         st.info("AI 분석 완료 후 소구 유형 분포가 표시됩니다.")
 
+    # ── 수집 이력 표 ────────────────────────────────────────────
     st.markdown("---")
     st.markdown("**수집 이력 요약**")
-    display_df = filtered[["date", "keyword", "asset_count", "analyzed_count", "avg_score"]].copy()
-    display_df.columns = ["날짜", "키워드", "수집 수", "분석 완료", "평균 전환력"]
-    display_df["날짜"] = display_df["날짜"].dt.strftime("%Y-%m-%d")
-    display_df["평균 전환력"] = display_df["평균 전환력"].round(2)
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    disp = filtered[["date","keyword","asset_count","new_count","removed_count","analyzed_count","avg_score"]].copy()
+    disp.columns = ["날짜","키워드","수집","신규","소멸","분석완료","평균전환력"]
+    disp["날짜"]   = disp["날짜"].dt.strftime("%Y-%m-%d")
+    disp["평균전환력"] = disp["평균전환력"].round(2)
+    st.dataframe(disp, use_container_width=True, hide_index=True)
 
-    # AI 트렌드 인사이트 생성
+    # ── AI 트렌드 인사이트 ──────────────────────────────────────
     if API_KEY and len(snapshots) >= 2:
         st.markdown("---")
         if st.button("AI 트렌드 인사이트 생성", key="btn_trend_insight"):
@@ -3091,6 +3198,7 @@ def _generate_trend_insight(snapshots: list, keywords: list) -> tuple[str | None
         top_appeal = max(s["appeal_dist"], key=s["appeal_dist"].get) if s["appeal_dist"] else "미분류"
         summary_lines.append(
             f"날짜={s['date']} 키워드={s['keyword']} 수집={s['asset_count']}개 "
+            f"신규={s.get('new_count',0)}개 소멸={s.get('removed_count',0)}개 "
             f"분석={s['analyzed_count']}개 평균전환력={s['avg_score']} 주요소구={top_appeal}"
         )
     if not summary_lines:
@@ -3098,15 +3206,15 @@ def _generate_trend_insight(snapshots: list, keywords: list) -> tuple[str | None
 
     prompt = (
         "당신은 디지털 마케팅 트렌드 분석 전문가입니다.\n"
-        "아래는 Meta 광고 소재 수집 이력 데이터입니다:\n\n"
+        "아래는 Meta 광고 소재 수집 이력 데이터입니다 (신규=새로 등장한 광고, 소멸=사라진 광고):\n\n"
         + "\n".join(summary_lines)
         + "\n\n위 데이터를 바탕으로 다음을 분석하세요:\n"
-        "1. 각 키워드별 소재 수 증감 추이와 의미\n"
-        "2. 평균 전환력 점수의 변화 흐름\n"
-        "3. 주요 소구 유형의 변화 패턴\n"
-        "4. 현재 시장에서 주목해야 할 기회나 위협\n"
-        "5. 다음 소재 기획을 위한 구체적 제언 2~3가지\n\n"
-        "답변은 한국어로 작성하고, 각 항목을 명확히 구분하세요."
+        "1. 각 키워드별 소재 수 증감 추이와 광고 경쟁 강도 변화\n"
+        "2. 신규 진입/소멸 광고 패턴 — 어떤 키워드에서 광고주 교체가 활발한가\n"
+        "3. 평균 전환력 점수 변화 — 업계 크리에이티브 품질 트렌드\n"
+        "4. 주요 소구 유형의 변화 패턴 — 감성소구 vs 이성소구 흐름\n"
+        "5. 다음 소재 기획을 위한 구체적 제언 3가지 (키워드별로)\n\n"
+        "답변은 한국어로 작성하고, 각 항목을 명확히 구분하며 마케터가 실행 가능한 수준으로 작성하세요."
     )
     try:
         resp = _anthropic_post({
@@ -3219,7 +3327,17 @@ def _group_similar_assets(items: list) -> list[tuple[str, list]]:
 def show_asset_detail(item: dict):
     c1, c2 = st.columns([1, 1])
     with c1:
-        st.image(item["image_url"], use_container_width=True)
+        video_url = item.get("video_url", "")
+        if video_url:
+            st.markdown(
+                f'<video src="{video_url}" poster="{item["image_url"]}" '
+                f'controls preload="metadata" playsinline '
+                f'style="width:100%;border-radius:10px;max-height:420px;object-fit:contain;'
+                f'background:#000;"></video>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.image(item["image_url"], use_container_width=True)
         cap = item.get("caption", "")
         if cap:
             st.caption(f'"{cap}"')
@@ -3228,6 +3346,8 @@ def show_asset_detail(item: dict):
             f"{'이미지' if item['asset_type']=='image' else '비디오'} · "
             f"{item.get('width',0)}×{item.get('height',0)}px"
         )
+        if video_url:
+            st.caption("▶ 영상 URL 확보됨")
         st.caption(item["created_at"][:10])
         memo = item.get("memo","")
         if memo:
@@ -3366,6 +3486,395 @@ def render_copy_analysis(items: list):
             st.dataframe(pd.DataFrame(cap_rows), hide_index=True, use_container_width=True)
 
 
+# ============================================================
+# Google 광고 투명성 센터 — DB / 스크래퍼 / 렌더러
+# ============================================================
+def db_google_upsert(ads: list):
+    if not ads:
+        return
+    con = sqlite3.connect(DB_PATH, timeout=15)
+    for a in ads:
+        con.execute("""
+            INSERT OR REPLACE INTO google_ads
+            (id,advertiser_id,advertiser_name,creative_id,ad_format,
+             first_shown,last_shown,destination_url,image_url,video_url,
+             ad_title,ad_body,keyword,country,created_at,starred,memo)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            a.get("id", str(uuid.uuid4())),
+            a.get("advertiser_id",""), a.get("advertiser_name",""),
+            a.get("creative_id",""),  a.get("ad_format",""),
+            a.get("first_shown",""),  a.get("last_shown",""),
+            a.get("destination_url",""), a.get("image_url",""),
+            a.get("video_url",""),    a.get("ad_title",""),
+            a.get("ad_body",""),      a.get("keyword",""),
+            a.get("country","KR"),    a.get("created_at", time.strftime("%Y-%m-%d %H:%M:%S")),
+            1 if a.get("starred") else 0,
+            a.get("memo",""),
+        ))
+    con.commit()
+    con.close()
+
+
+def db_google_load(keyword: str = "", limit: int = 300) -> list:
+    con = sqlite3.connect(DB_PATH, timeout=15)
+    if keyword:
+        rows = con.execute(
+            "SELECT id,advertiser_id,advertiser_name,creative_id,ad_format,"
+            "first_shown,last_shown,destination_url,image_url,video_url,"
+            "ad_title,ad_body,keyword,country,created_at,starred,memo "
+            "FROM google_ads WHERE keyword=? ORDER BY created_at DESC LIMIT ?",
+            (keyword, limit),
+        ).fetchall()
+    else:
+        rows = con.execute(
+            "SELECT id,advertiser_id,advertiser_name,creative_id,ad_format,"
+            "first_shown,last_shown,destination_url,image_url,video_url,"
+            "ad_title,ad_body,keyword,country,created_at,starred,memo "
+            "FROM google_ads ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+    con.close()
+    keys = ["id","advertiser_id","advertiser_name","creative_id","ad_format",
+            "first_shown","last_shown","destination_url","image_url","video_url",
+            "ad_title","ad_body","keyword","country","created_at","starred","memo"]
+    return [dict(zip(keys, r)) for r in rows]
+
+
+def db_google_delete_keyword(keyword: str):
+    con = sqlite3.connect(DB_PATH, timeout=15)
+    con.execute("DELETE FROM google_ads WHERE keyword=?", (keyword,))
+    con.commit()
+    con.close()
+
+
+def db_google_toggle_star(ad_id: str, current: bool):
+    con = sqlite3.connect(DB_PATH, timeout=15)
+    con.execute("UPDATE google_ads SET starred=? WHERE id=?", (0 if current else 1, ad_id))
+    con.commit()
+    con.close()
+
+
+def scrape_google_ads(keyword: str, country: str = "KR", limit: int = 50) -> tuple[list, str | None]:
+    try:
+        from google_ads_transparency_scraper import GoogleAdTransparencyScraper
+    except ImportError:
+        return [], (
+            "google_ads_transparency_scraper 패키지 미설치\n"
+            "터미널에서 실행: pip install Google-Ads-Transparency-Scraper"
+        )
+    try:
+        scraper = GoogleAdTransparencyScraper()
+        raw = scraper.search_by_keyword(keyword, region=country)
+    except Exception as ex:
+        return [], f"스크래핑 오류: {str(ex)[:300]}"
+
+    ads = []
+    for r in (raw or [])[:limit]:
+        fmt = str(r.get("format") or r.get("adFormat") or "").lower()
+        link = r.get("link") or ""
+        image_url = "" if "video" in fmt else (link or r.get("imageUrl") or r.get("previewUrl") or "")
+        video_url = link if "video" in fmt else ""
+        ads.append({
+            "id":              str(uuid.uuid4()),
+            "advertiser_id":   str(r.get("advertiserId") or ""),
+            "advertiser_name": str(r.get("advertiserName") or ""),
+            "creative_id":     str(r.get("creativeId") or ""),
+            "ad_format":       fmt or "unknown",
+            "first_shown":     str(r.get("firstShown") or ""),
+            "last_shown":      str(r.get("lastShown") or ""),
+            "destination_url": str(r.get("destinationUrl") or ""),
+            "image_url":       image_url,
+            "video_url":       video_url,
+            "ad_title":        str(r.get("title") or ""),
+            "ad_body":         str(r.get("body") or r.get("text") or ""),
+            "keyword":         keyword,
+            "country":         country,
+            "created_at":      time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+    return ads, None
+
+
+def render_google_ads_page():
+    """Google 광고 투명성 센터 전체 UI."""
+    st.markdown(
+        '<div class="sec"><div class="sec-t">Google 광고 투명성 센터</div>'
+        '<div class="sec-n">adstransparency.google.com</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    # 라이브러리 확인
+    try:
+        import importlib
+        importlib.import_module("google_ads_transparency_scraper")
+        lib_ok = True
+    except ImportError:
+        lib_ok = False
+
+    if not lib_ok:
+        st.warning(
+            "**google_ads_transparency_scraper** 패키지가 필요합니다.\n\n"
+            "```\npip install Google-Ads-Transparency-Scraper\n```\n\n"
+            "설치 후 페이지를 새로고침하세요."
+        )
+
+    # 검색 영역
+    sc1, sc2, sc3, sc4 = st.columns([3, 1, 1, 1])
+    with sc1:
+        g_kw = st.text_input("키워드", placeholder="예: 에어컨, 다이어트", key="g_kw_input",
+                             label_visibility="collapsed")
+    with sc2:
+        g_country = st.selectbox("국가", ["KR","US","JP","GB","AU","CA","SG"],
+                                 key="g_country", label_visibility="collapsed")
+    with sc3:
+        g_limit = st.selectbox("최대 수", [20, 50, 100, 200], index=1,
+                               key="g_limit", label_visibility="collapsed")
+    with sc4:
+        do_g_search = st.button("🔍 수집", use_container_width=True, key="g_search_btn")
+
+    if do_g_search and g_kw.strip() and lib_ok:
+        for kw in [k.strip() for k in g_kw.split(",") if k.strip()]:
+            with st.spinner(f"'{kw}' 수집 중..."):
+                ads, err = scrape_google_ads(kw, g_country, g_limit)
+            if err:
+                st.error(f"**{kw}** — {err}")
+            elif ads:
+                db_google_upsert(ads)
+                st.success(f"**{kw}** — {len(ads)}개 수집 완료")
+            else:
+                st.warning(f"**{kw}** — 결과 없음")
+        st.rerun()
+
+    # 필터
+    all_g_kws = sorted(set(a["keyword"] for a in db_google_load()))
+    f1, f2, f3 = st.columns([2, 2, 1])
+    with f1:
+        g_sel_kw  = st.selectbox("키워드 필터", ["전체"] + all_g_kws, key="g_sel_kw",
+                                 label_visibility="collapsed")
+    with f2:
+        g_ftype   = st.selectbox("형식", ["전체","image","video","text"],
+                                 key="g_ftype", label_visibility="collapsed")
+    with f3:
+        g_fstar   = st.toggle("즐겨찾기", key="g_fstar")
+
+    # 데이터 로드
+    g_items = db_google_load(keyword=g_sel_kw if g_sel_kw != "전체" else "")
+    if g_ftype != "전체":
+        g_items = [a for a in g_items if g_ftype in a.get("ad_format","").lower()]
+    if g_fstar:
+        g_items = [a for a in g_items if a.get("starred")]
+
+    if not g_items:
+        st.markdown(
+            '<div class="empty"><div class="empty-t">수집된 Google 광고가 없습니다</div>'
+            '<div class="empty-d">키워드를 입력하고 수집 버튼을 누르세요.</div></div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    # KPI
+    advs    = set(a["advertiser_name"] for a in g_items if a["advertiser_name"])
+    vid_cnt = sum(1 for a in g_items if a.get("video_url"))
+    img_cnt = sum(1 for a in g_items if a.get("image_url") and not a.get("video_url"))
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("총 광고", len(g_items))
+    k2.metric("광고주", len(advs))
+    k3.metric("이미지", img_cnt)
+    k4.metric("영상", vid_cnt)
+
+    # 그리드
+    g_cols = st.select_slider("열 수", options=[2,3,4,5], value=4, key="g_grid_cols")
+    grid   = st.columns(g_cols)
+    for i, ad in enumerate(g_items):
+        with grid[i % g_cols]:
+            if ad.get("video_url"):
+                st.markdown(
+                    f'<div class="g-card"><div class="card-img-wrap" style="padding-top:56.25%;">'
+                    f'<video src="{ad["video_url"]}" controls preload="none" playsinline '
+                    f'class="card-vid"></video></div></div>',
+                    unsafe_allow_html=True,
+                )
+            elif ad.get("image_url"):
+                st.markdown('<div class="g-card">', unsafe_allow_html=True)
+                st.image(ad["image_url"], use_container_width=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+            else:
+                st.markdown(
+                    '<div class="g-card"><div style="padding:20px;background:var(--bg3);'
+                    'text-align:center;color:var(--mu);font-size:11px;">텍스트 광고</div></div>',
+                    unsafe_allow_html=True,
+                )
+
+            fmt_b = f'<span class="g-badge">{(ad.get("ad_format") or "ADS").upper()}</span>'
+            body_snippet = (ad.get("ad_body") or "")[:60]
+            st.markdown(
+                fmt_b
+                + f'<div style="font-size:11px;font-weight:700;color:#4285f4;margin:4px 0 2px;">'
+                  f'{ad.get("advertiser_name","—")}</div>'
+                + (f'<div style="font-size:11px;color:var(--tx2);">{ad["ad_title"]}</div>'
+                   if ad.get("ad_title") else "")
+                + (f'<div style="font-size:10px;color:var(--mu);font-style:italic;">'
+                   f'{body_snippet}{"..." if len(ad.get("ad_body",""))>60 else ""}</div>'
+                   if body_snippet else "")
+                + f'<div style="font-size:10px;color:var(--mu);margin-top:4px;">'
+                  f'{(ad.get("first_shown",""))[:10]} ~ {(ad.get("last_shown",""))[:10]}</div>',
+                unsafe_allow_html=True,
+            )
+            b1, b2 = st.columns(2)
+            with b1:
+                if ad.get("destination_url"):
+                    st.link_button("원본 ↗", ad["destination_url"], use_container_width=True)
+            with b2:
+                if st.button("★" if ad.get("starred") else "☆",
+                             key=f"g_star_{ad['id']}_{i}", use_container_width=True):
+                    db_google_toggle_star(ad["id"], bool(ad.get("starred")))
+                    st.rerun()
+
+    # CSV
+    st.markdown("---")
+    import io as _io, csv as _csv
+    buf = _io.StringIO()
+    fields = ["advertiser_name","ad_format","ad_title","ad_body",
+              "first_shown","last_shown","destination_url","image_url","video_url","keyword","country"]
+    w = _csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
+    w.writeheader(); w.writerows(g_items)
+    gc1, gc2 = st.columns([1, 3])
+    with gc1:
+        st.download_button("CSV 내보내기", data=buf.getvalue().encode("utf-8-sig"),
+            file_name=f"google_ads_{time.strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv", use_container_width=True)
+    with gc2:
+        if g_sel_kw != "전체" and st.button(f"'{g_sel_kw}' 데이터 삭제", key="g_del_kw"):
+            db_google_delete_keyword(g_sel_kw)
+            st.rerun()
+
+
+def render_competitor_board(all_items: list):
+    """두 키워드의 소재를 나란히 비교하는 경쟁사 보드."""
+    kws = sorted(set(a["keyword"] for a in all_items))
+    if len(kws) < 2:
+        st.markdown(
+            '<div style="text-align:center;padding:60px;color:var(--mu);font-size:13px;">'
+            '경쟁사 비교를 하려면 키워드 2개 이상이 필요합니다.<br>'
+            '상단 검색창에서 쉼표로 구분해 여러 키워드를 수집하세요.</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    st.markdown(
+        '<div class="sec"><div class="sec-t">경쟁사 비교</div>'
+        '<div class="sec-n">키워드 2개를 나란히 비교합니다</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    _c1, _c2, _c3 = st.columns([2, 2, 1])
+    with _c1:
+        kw_a = st.selectbox("키워드 A", kws, index=0, key="cmp_kw_a")
+    with _c2:
+        default_b = kws[1] if len(kws) > 1 else kws[0]
+        kw_b = st.selectbox("키워드 B", kws, index=kws.index(default_b), key="cmp_kw_b")
+    with _c3:
+        cmp_cols = st.select_slider("열 수", options=[2, 3, 4], value=3, key="cmp_cols")
+
+    items_a = [a for a in all_items if a["keyword"] == kw_a]
+    items_b = [a for a in all_items if a["keyword"] == kw_b]
+
+    # ── KPI 비교 ─────────────────────────────────────────────
+    def _kpi(items, label):
+        analyzed = [a for a in items if a.get("ai") and not (a.get("ai") or {}).get("_error")]
+        scores   = []
+        for a in analyzed:
+            f = _extract_ai_fields(a.get("ai") or {})
+            s = f.get("score_overall")
+            if s:
+                scores.append(float(s))
+        avg_sc = round(sum(scores) / len(scores), 1) if scores else 0
+        img_c  = sum(1 for a in items if a["asset_type"] == "image")
+        vid_c  = sum(1 for a in items if a["asset_type"] == "video_poster")
+        return {
+            "label": label, "total": len(items),
+            "img": img_c, "vid": vid_c,
+            "analyzed": len(analyzed), "avg_score": avg_sc,
+        }
+
+    ka, kb = _kpi(items_a, kw_a), _kpi(items_b, kw_b)
+    col_a, col_vs, col_b = st.columns([5, 1, 5])
+
+    def _kpi_block(k, color):
+        better_score = (k == ka and ka["avg_score"] >= kb["avg_score"]) or \
+                       (k == kb and kb["avg_score"] > ka["avg_score"])
+        score_color  = "#00a86b" if better_score else "#e07b00"
+        return (
+            f'<div class="panel" style="border-color:{color}20;">'
+            f'<div class="panel-title" style="color:{color};">{k["label"]}</div>'
+            f'<div style="display:flex;gap:20px;flex-wrap:wrap;">'
+            f'<div><div style="font-size:24px;font-weight:900;">{k["total"]}</div>'
+            f'<div style="font-size:10px;color:var(--mu);">소재 수</div></div>'
+            f'<div><div style="font-size:24px;font-weight:900;color:{score_color};">{k["avg_score"]}</div>'
+            f'<div style="font-size:10px;color:var(--mu);">평균 전환력</div></div>'
+            f'<div><div style="font-size:14px;font-weight:700;">IMG {k["img"]} / VID {k["vid"]}</div>'
+            f'<div style="font-size:10px;color:var(--mu);">이미지 / 영상</div></div>'
+            f'<div><div style="font-size:14px;font-weight:700;">{k["analyzed"]}</div>'
+            f'<div style="font-size:10px;color:var(--mu);">AI 분석 완료</div></div>'
+            f'</div></div>'
+        )
+
+    with col_a:
+        st.markdown(_kpi_block(ka, "#e8284a"), unsafe_allow_html=True)
+    with col_vs:
+        st.markdown(
+            '<div style="display:flex;align-items:center;justify-content:center;height:100%;">'
+            '<span style="font-size:18px;font-weight:900;color:var(--mu);">VS</span></div>',
+            unsafe_allow_html=True,
+        )
+    with col_b:
+        st.markdown(_kpi_block(kb, "#4285f4"), unsafe_allow_html=True)
+
+    # ── 나란히 카드 그리드 ────────────────────────────────────
+    st.markdown("---")
+    left, right = st.columns(2)
+    max_items = max(len(items_a), len(items_b))
+    display_limit = st.slider("표시 소재 수 (각 키워드)", 4, min(40, max_items) if max_items >= 4 else 4, 12, key="cmp_limit")
+
+    def _mini_grid(items, label, color, col_count):
+        st.markdown(
+            f'<div style="font-size:11px;font-weight:700;color:{color};letter-spacing:1px;'
+            f'text-transform:uppercase;margin-bottom:10px;">{label} · {len(items)}개</div>',
+            unsafe_allow_html=True,
+        )
+        show = items[:display_limit]
+        grid = st.columns(col_count)
+        for j, item in enumerate(show):
+            with grid[j % col_count]:
+                video_url = item.get("video_url", "")
+                if video_url:
+                    st.markdown(
+                        f'<div class="card"><div class="card-img-wrap" style="padding-top:100%;">'
+                        f'<video src="{video_url}" poster="{item["image_url"]}" class="card-vid" '
+                        f'controls preload="none" playsinline></video></div></div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.image(item["image_url"], use_container_width=True)
+                ai = item.get("ai")
+                if ai and not ai.get("_error"):
+                    f_ai = _extract_ai_fields(ai)
+                    sc   = f_ai.get("score_overall")
+                    sc_c = "#00a86b" if (sc or 0) >= 4 else "#e07b00" if (sc or 0) >= 3 else "#e8284a"
+                    st.markdown(
+                        f'<div style="font-size:10px;color:{sc_c};font-weight:700;'
+                        f'margin-bottom:2px;">⚡ {sc}/5  {f_ai["hook"][:20]}</div>',
+                        unsafe_allow_html=True,
+                    )
+                cap = item.get("caption", "")
+                if cap:
+                    st.caption(f'"{cap[:50]}{"..." if len(cap)>50 else ""}"')
+
+    with left:
+        _mini_grid(items_a, kw_a, "#e8284a", cmp_cols)
+    with right:
+        _mini_grid(items_b, kw_b, "#4285f4", cmp_cols)
+
+
 def render_comparison_table(all_items):
     try:
         import pandas as pd
@@ -3480,6 +3989,9 @@ st.markdown("""
 # 사이드바
 # ============================================================
 with st.sidebar:
+    st.markdown('<div class="slbl">페이지 선택</div>', unsafe_allow_html=True)
+    _page = st.radio("page_select", ["Meta 광고 라이브러리", "Google 광고 투명성 센터"],
+                     label_visibility="collapsed", key="page_select")
     st.markdown("---")
 
     st.markdown('<div class="slbl">AI ANALYSIS</div>', unsafe_allow_html=True)
@@ -3942,9 +4454,16 @@ if summary:
 
 
 # ============================================================
-# 메인 탭 — 소재 보드 / 비교 테이블
+# 페이지 분기
 # ============================================================
-tab_board, tab_table, tab_trend, tab_copy = st.tabs(["◼ 소재 보드", "⊞ 비교 테이블", "📈 트렌드 리포트", "📝 카피 분석"])
+if st.session_state.get("page_select") == "Google 광고 투명성 센터":
+    render_google_ads_page()
+    st.stop()
+
+# ── Meta 광고 라이브러리 메인 탭 ──────────────────────────────
+tab_board, tab_table, tab_trend, tab_copy, tab_vs = st.tabs([
+    "◼ 소재 보드", "⊞ 비교 테이블", "📈 트렌드 리포트", "📝 카피 분석", "⚔️ 경쟁사 비교"
+])
 
 
 # ── 탭1: 소재 보드 ──────────────────────────────────────────
@@ -4135,7 +4654,12 @@ with tab_board:
                     # 비율별 padding-top 적용
                     st.markdown(
                         f'<div class="card-img-wrap" style="padding-top:{pt}%;">'
-                        f'<img src="{item["image_url"]}" class="card-img" loading="lazy">'
+                        + (
+                            f'<video src="{item["video_url"]}" poster="{item["image_url"]}" '
+                            f'class="card-vid" controls preload="none" playsinline></video>'
+                            if item.get("video_url") else
+                            f'<img src="{item["image_url"]}" class="card-img" loading="lazy">'
+                        ) +
                         f'</div>',
                         unsafe_allow_html=True,
                     )
@@ -4325,6 +4849,9 @@ with tab_trend:
 
 with tab_copy:
     render_copy_analysis(all_a)
+
+with tab_vs:
+    render_competitor_board(all_a)
 
 
 # ============================================================
