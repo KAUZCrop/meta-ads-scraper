@@ -3603,8 +3603,9 @@ def render_google_ads_page():
     )
 
     # 라이브러리 자동 설치 (Playwright ensure_browser 방식)
+    import importlib
+    importlib.invalidate_caches()
     try:
-        import importlib
         importlib.import_module("google_ads_transparency_scraper")
         lib_ok = True
     except ImportError:
@@ -3614,10 +3615,13 @@ def render_google_ads_page():
                 capture_output=True, text=True,
             )
         if ret.returncode == 0:
-            st.success("설치 완료. 페이지를 새로고침합니다...")
-            time.sleep(1)
-            st.rerun()
-            lib_ok = True
+            importlib.invalidate_caches()
+            try:
+                importlib.import_module("google_ads_transparency_scraper")
+                lib_ok = True
+            except ImportError:
+                st.warning("설치됐지만 앱을 완전히 재시작해야 합니다. 브라우저를 새로고침(F5)하세요.")
+                lib_ok = False
         else:
             st.error(f"설치 실패: {ret.stderr[:300]}")
             lib_ok = False
