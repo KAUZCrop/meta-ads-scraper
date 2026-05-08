@@ -3602,20 +3602,25 @@ def render_google_ads_page():
         unsafe_allow_html=True,
     )
 
-    # 라이브러리 확인
+    # 라이브러리 자동 설치 (Playwright ensure_browser 방식)
     try:
         import importlib
         importlib.import_module("google_ads_transparency_scraper")
         lib_ok = True
     except ImportError:
-        lib_ok = False
-
-    if not lib_ok:
-        st.warning(
-            "**google_ads_transparency_scraper** 패키지가 필요합니다.\n\n"
-            "```\npip install Google-Ads-Transparency-Scraper\n```\n\n"
-            "설치 후 페이지를 새로고침하세요."
-        )
+        with st.spinner("Google Ads Scraper 패키지 설치 중... (최초 1회)"):
+            ret = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "Google-Ads-Transparency-Scraper"],
+                capture_output=True, text=True,
+            )
+        if ret.returncode == 0:
+            st.success("설치 완료. 페이지를 새로고침합니다...")
+            time.sleep(1)
+            st.rerun()
+            lib_ok = True
+        else:
+            st.error(f"설치 실패: {ret.stderr[:300]}")
+            lib_ok = False
 
     # 검색 영역
     sc1, sc2, sc3, sc4 = st.columns([3, 1, 1, 1])
