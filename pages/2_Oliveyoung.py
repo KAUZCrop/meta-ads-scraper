@@ -73,22 +73,10 @@ _EXTRACT_JS = """
         const userComp = sr.querySelector('oy-review-review-user');
         const name     = userComp?.shadowRoot?.querySelector('.name')?.textContent?.trim() || '';
         const skinType = userComp?.shadowRoot?.querySelector('.skin-type')?.textContent?.trim() || '';
-        // 1) .rating 텍스트에서 숫자 우선 추출
+        // oy-review-star-icon shadow root 안 path[fill="#FF5753"] 개수 = 별점
         let stars = 0;
-        const ratingEl = sr.querySelector('.rating');
-        if (ratingEl) {
-            const n = parseFloat(ratingEl.textContent?.trim() || '');
-            if (!isNaN(n) && n > 0) stars = Math.round(n);
-        }
-        // 2) 없으면 oy-review-star-icon shadow root 안 SVG fill 로 카운트
-        if (!stars) {
-            for (const icon of sr.querySelectorAll('oy-review-star-icon')) {
-                const iconSr = icon.shadowRoot;
-                const fillSrc = iconSr
-                    ? (iconSr.querySelector('[fill]')?.getAttribute('fill') || iconSr.querySelector('svg')?.innerHTML || '')
-                    : (icon.getAttribute('fill') || '');
-                if (fillSrc.toLowerCase().match(/ff5753|e8284a|f5a623|ffa500|ffb300/)) stars++;
-            }
+        for (const icon of sr.querySelectorAll('oy-review-star-icon')) {
+            if (icon.shadowRoot?.querySelector('path[fill="#FF5753"]')) stars++;
         }
         const date    = sr.querySelector('.date')?.textContent?.trim() || '';
         const option  = sr.querySelector('.goods-option')?.textContent?.trim() || '';
