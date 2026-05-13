@@ -1,0 +1,20 @@
+version: "3.9"
+
+services:
+  adintel:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      # DB와 Streamlit secrets를 컨테이너 밖에 유지
+      - ./data:/app/data
+      - ./.streamlit:/app/.streamlit:ro
+    environment:
+      - DB_PATH=/app/data/adintel.db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
