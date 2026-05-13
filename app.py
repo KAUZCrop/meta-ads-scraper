@@ -90,9 +90,10 @@ st.set_page_config(page_title="AD INTEL", page_icon="◼", layout="wide")
 
 
 # ============================================================
-# 로딩 스플래시 스크린
+# 로딩 스플래시 스크린 — 세션 최초 1회만 표시
 # ============================================================
-st.markdown("""
+if "initialized" not in st.session_state:
+ st.markdown("""
 <div id="adintel-loader">
   <div class="al-bg-grid"></div>
   <div class="al-inner">
