@@ -343,25 +343,6 @@ def db_init():
             last_run TEXT DEFAULT '',
             created_at TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS google_ads (
-            id TEXT PRIMARY KEY,
-            advertiser_id TEXT DEFAULT '',
-            advertiser_name TEXT DEFAULT '',
-            creative_id TEXT DEFAULT '',
-            ad_format TEXT DEFAULT '',
-            first_shown TEXT DEFAULT '',
-            last_shown TEXT DEFAULT '',
-            destination_url TEXT DEFAULT '',
-            image_url TEXT DEFAULT '',
-            video_url TEXT DEFAULT '',
-            ad_title TEXT DEFAULT '',
-            ad_body TEXT DEFAULT '',
-            keyword TEXT DEFAULT '',
-            country TEXT DEFAULT 'KR',
-            created_at TEXT NOT NULL,
-            starred INTEGER DEFAULT 0,
-            memo TEXT DEFAULT ''
-        );
         """)
         for _col, _def in [("memo", "TEXT DEFAULT ''"), ("video_url", "TEXT DEFAULT ''")]:
             try:
@@ -815,9 +796,6 @@ a{color:var(--ac)!important;}
 .panel{background:var(--bg2);border:1px solid var(--bd);border-radius:12px;padding:20px 22px;margin-bottom:14px;}
 .panel-title{font-size:9px;font-weight:700;color:var(--ac);letter-spacing:2px;text-transform:uppercase;margin-bottom:14px;}
 [data-testid="stTabs"]{border-bottom:2px solid var(--bd);}
-.g-card{border:1.5px solid var(--bd);border-radius:12px;overflow:hidden;margin-bottom:10px;background:var(--bg);box-shadow:var(--sh);transition:.2s;}
-.g-card:hover{border-color:#4285f4;box-shadow:0 4px 20px rgba(66,133,244,.12);}
-.g-badge{display:inline-block;font-size:9px;padding:2px 7px;border-radius:20px;margin:0 2px 4px 0;font-weight:600;background:rgba(66,133,244,.1);color:#4285f4;border:1px solid rgba(66,133,244,.2);}
 </style>""", unsafe_allow_html=True)
 
 
@@ -3486,280 +3464,6 @@ def render_copy_analysis(items: list):
             st.dataframe(pd.DataFrame(cap_rows), hide_index=True, use_container_width=True)
 
 
-# ============================================================
-# Google 광고 투명성 센터 — DB / 스크래퍼 / 렌더러
-# ============================================================
-def db_google_upsert(ads: list):
-    if not ads:
-        return
-    con = sqlite3.connect(DB_PATH, timeout=15)
-    for a in ads:
-        con.execute("""
-            INSERT OR REPLACE INTO google_ads
-            (id,advertiser_id,advertiser_name,creative_id,ad_format,
-             first_shown,last_shown,destination_url,image_url,video_url,
-             ad_title,ad_body,keyword,country,created_at,starred,memo)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            a.get("id", str(uuid.uuid4())),
-            a.get("advertiser_id",""), a.get("advertiser_name",""),
-            a.get("creative_id",""),  a.get("ad_format",""),
-            a.get("first_shown",""),  a.get("last_shown",""),
-            a.get("destination_url",""), a.get("image_url",""),
-            a.get("video_url",""),    a.get("ad_title",""),
-            a.get("ad_body",""),      a.get("keyword",""),
-            a.get("country","KR"),    a.get("created_at", time.strftime("%Y-%m-%d %H:%M:%S")),
-            1 if a.get("starred") else 0,
-            a.get("memo",""),
-        ))
-    con.commit()
-    con.close()
-
-
-def db_google_load(keyword: str = "", limit: int = 300) -> list:
-    con = sqlite3.connect(DB_PATH, timeout=15)
-    if keyword:
-        rows = con.execute(
-            "SELECT id,advertiser_id,advertiser_name,creative_id,ad_format,"
-            "first_shown,last_shown,destination_url,image_url,video_url,"
-            "ad_title,ad_body,keyword,country,created_at,starred,memo "
-            "FROM google_ads WHERE keyword=? ORDER BY created_at DESC LIMIT ?",
-            (keyword, limit),
-        ).fetchall()
-    else:
-        rows = con.execute(
-            "SELECT id,advertiser_id,advertiser_name,creative_id,ad_format,"
-            "first_shown,last_shown,destination_url,image_url,video_url,"
-            "ad_title,ad_body,keyword,country,created_at,starred,memo "
-            "FROM google_ads ORDER BY created_at DESC LIMIT ?", (limit,)
-        ).fetchall()
-    con.close()
-    keys = ["id","advertiser_id","advertiser_name","creative_id","ad_format",
-            "first_shown","last_shown","destination_url","image_url","video_url",
-            "ad_title","ad_body","keyword","country","created_at","starred","memo"]
-    return [dict(zip(keys, r)) for r in rows]
-
-
-def db_google_delete_keyword(keyword: str):
-    con = sqlite3.connect(DB_PATH, timeout=15)
-    con.execute("DELETE FROM google_ads WHERE keyword=?", (keyword,))
-    con.commit()
-    con.close()
-
-
-def db_google_toggle_star(ad_id: str, current: bool):
-    con = sqlite3.connect(DB_PATH, timeout=15)
-    con.execute("UPDATE google_ads SET starred=? WHERE id=?", (0 if current else 1, ad_id))
-    con.commit()
-    con.close()
-
-
-def scrape_google_ads(keyword: str, country: str = "KR", limit: int = 50) -> tuple[list, str | None]:
-    try:
-        from google_ads_transparency_scraper import GoogleAdTransparencyScraper
-    except ImportError:
-        return [], (
-            "google_ads_transparency_scraper 패키지 미설치\n"
-            "터미널에서 실행: pip install Google-Ads-Transparency-Scraper"
-        )
-    try:
-        scraper = GoogleAdTransparencyScraper()
-        raw = scraper.search_by_keyword(keyword, region=country)
-    except Exception as ex:
-        return [], f"스크래핑 오류: {str(ex)[:300]}"
-
-    ads = []
-    for r in (raw or [])[:limit]:
-        fmt = str(r.get("format") or r.get("adFormat") or "").lower()
-        link = r.get("link") or ""
-        image_url = "" if "video" in fmt else (link or r.get("imageUrl") or r.get("previewUrl") or "")
-        video_url = link if "video" in fmt else ""
-        ads.append({
-            "id":              str(uuid.uuid4()),
-            "advertiser_id":   str(r.get("advertiserId") or ""),
-            "advertiser_name": str(r.get("advertiserName") or ""),
-            "creative_id":     str(r.get("creativeId") or ""),
-            "ad_format":       fmt or "unknown",
-            "first_shown":     str(r.get("firstShown") or ""),
-            "last_shown":      str(r.get("lastShown") or ""),
-            "destination_url": str(r.get("destinationUrl") or ""),
-            "image_url":       image_url,
-            "video_url":       video_url,
-            "ad_title":        str(r.get("title") or ""),
-            "ad_body":         str(r.get("body") or r.get("text") or ""),
-            "keyword":         keyword,
-            "country":         country,
-            "created_at":      time.strftime("%Y-%m-%d %H:%M:%S"),
-        })
-    return ads, None
-
-
-def render_google_ads_page():
-    """Google 광고 투명성 센터 전체 UI."""
-    st.markdown(
-        '<div class="sec"><div class="sec-t">Google 광고 투명성 센터</div>'
-        '<div class="sec-n">adstransparency.google.com</div></div>',
-        unsafe_allow_html=True,
-    )
-
-    # 라이브러리 자동 설치 (Playwright ensure_browser 방식)
-    def _google_lib_ok():
-        """subprocess로 확인 — 프로세스 재시작 없이도 정확히 판별."""
-        r = subprocess.run(
-            [sys.executable, "-c", "import google_ads_transparency_scraper"],
-            capture_output=True, timeout=15,
-        )
-        return r.returncode == 0
-
-    lib_ok = _google_lib_ok()
-    if not lib_ok:
-        with st.spinner("Google Ads Scraper 패키지 설치 중... (최초 1회)"):
-            subprocess.run(
-                [sys.executable, "-m", "pip", "install", "Google-Ads-Transparency-Scraper"],
-                capture_output=True,
-            )
-        lib_ok = _google_lib_ok()
-        if lib_ok:
-            st.success("설치 완료! 브라우저를 새로고침(F5)하면 바로 사용할 수 있습니다.")
-            st.stop()
-        else:
-            st.error(
-                "패키지 설치 후에도 인식되지 않습니다.\n"
-                "Streamlit을 실행한 터미널(가상환경)에서 직접 실행하세요:\n\n"
-                "```\npip install Google-Ads-Transparency-Scraper\n```"
-            )
-            lib_ok = False
-
-    # 검색 영역
-    sc1, sc2, sc3, sc4 = st.columns([3, 1, 1, 1])
-    with sc1:
-        g_kw = st.text_input("키워드", placeholder="예: 에어컨, 다이어트", key="g_kw_input",
-                             label_visibility="collapsed")
-    with sc2:
-        g_country = st.selectbox("국가", ["KR","US","JP","GB","AU","CA","SG"],
-                                 key="g_country", label_visibility="collapsed")
-    with sc3:
-        g_limit = st.selectbox("최대 수", [20, 50, 100, 200], index=1,
-                               key="g_limit", label_visibility="collapsed")
-    with sc4:
-        do_g_search = st.button("🔍 수집", use_container_width=True, key="g_search_btn")
-
-    if do_g_search and g_kw.strip() and lib_ok:
-        for kw in [k.strip() for k in g_kw.split(",") if k.strip()]:
-            with st.spinner(f"'{kw}' 수집 중..."):
-                ads, err = scrape_google_ads(kw, g_country, g_limit)
-            if err:
-                st.error(f"**{kw}** — {err}")
-            elif ads:
-                db_google_upsert(ads)
-                st.success(f"**{kw}** — {len(ads)}개 수집 완료")
-            else:
-                st.warning(f"**{kw}** — 결과 없음")
-        st.rerun()
-
-    # 필터
-    all_g_kws = sorted(set(a["keyword"] for a in db_google_load()))
-    f1, f2, f3 = st.columns([2, 2, 1])
-    with f1:
-        g_sel_kw  = st.selectbox("키워드 필터", ["전체"] + all_g_kws, key="g_sel_kw",
-                                 label_visibility="collapsed")
-    with f2:
-        g_ftype   = st.selectbox("형식", ["전체","image","video","text"],
-                                 key="g_ftype", label_visibility="collapsed")
-    with f3:
-        g_fstar   = st.toggle("즐겨찾기", key="g_fstar")
-
-    # 데이터 로드
-    g_items = db_google_load(keyword=g_sel_kw if g_sel_kw != "전체" else "")
-    if g_ftype != "전체":
-        g_items = [a for a in g_items if g_ftype in a.get("ad_format","").lower()]
-    if g_fstar:
-        g_items = [a for a in g_items if a.get("starred")]
-
-    if not g_items:
-        st.markdown(
-            '<div class="empty"><div class="empty-t">수집된 Google 광고가 없습니다</div>'
-            '<div class="empty-d">키워드를 입력하고 수집 버튼을 누르세요.</div></div>',
-            unsafe_allow_html=True,
-        )
-        return
-
-    # KPI
-    advs    = set(a["advertiser_name"] for a in g_items if a["advertiser_name"])
-    vid_cnt = sum(1 for a in g_items if a.get("video_url"))
-    img_cnt = sum(1 for a in g_items if a.get("image_url") and not a.get("video_url"))
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("총 광고", len(g_items))
-    k2.metric("광고주", len(advs))
-    k3.metric("이미지", img_cnt)
-    k4.metric("영상", vid_cnt)
-
-    # 그리드
-    g_cols = st.select_slider("열 수", options=[2,3,4,5], value=4, key="g_grid_cols")
-    grid   = st.columns(g_cols)
-    for i, ad in enumerate(g_items):
-        with grid[i % g_cols]:
-            if ad.get("video_url"):
-                st.markdown(
-                    f'<div class="g-card"><div class="card-img-wrap" style="padding-top:56.25%;">'
-                    f'<video src="{ad["video_url"]}" controls preload="none" playsinline '
-                    f'class="card-vid"></video></div></div>',
-                    unsafe_allow_html=True,
-                )
-            elif ad.get("image_url"):
-                st.markdown('<div class="g-card">', unsafe_allow_html=True)
-                st.image(ad["image_url"], use_container_width=True)
-                st.markdown('</div>', unsafe_allow_html=True)
-            else:
-                st.markdown(
-                    '<div class="g-card"><div style="padding:20px;background:var(--bg3);'
-                    'text-align:center;color:var(--mu);font-size:11px;">텍스트 광고</div></div>',
-                    unsafe_allow_html=True,
-                )
-
-            fmt_b = f'<span class="g-badge">{(ad.get("ad_format") or "ADS").upper()}</span>'
-            body_snippet = (ad.get("ad_body") or "")[:60]
-            st.markdown(
-                fmt_b
-                + f'<div style="font-size:11px;font-weight:700;color:#4285f4;margin:4px 0 2px;">'
-                  f'{ad.get("advertiser_name","—")}</div>'
-                + (f'<div style="font-size:11px;color:var(--tx2);">{ad["ad_title"]}</div>'
-                   if ad.get("ad_title") else "")
-                + (f'<div style="font-size:10px;color:var(--mu);font-style:italic;">'
-                   f'{body_snippet}{"..." if len(ad.get("ad_body",""))>60 else ""}</div>'
-                   if body_snippet else "")
-                + f'<div style="font-size:10px;color:var(--mu);margin-top:4px;">'
-                  f'{(ad.get("first_shown",""))[:10]} ~ {(ad.get("last_shown",""))[:10]}</div>',
-                unsafe_allow_html=True,
-            )
-            b1, b2 = st.columns(2)
-            with b1:
-                if ad.get("destination_url"):
-                    st.link_button("원본 ↗", ad["destination_url"], use_container_width=True)
-            with b2:
-                if st.button("★" if ad.get("starred") else "☆",
-                             key=f"g_star_{ad['id']}_{i}", use_container_width=True):
-                    db_google_toggle_star(ad["id"], bool(ad.get("starred")))
-                    st.rerun()
-
-    # CSV
-    st.markdown("---")
-    import io as _io, csv as _csv
-    buf = _io.StringIO()
-    fields = ["advertiser_name","ad_format","ad_title","ad_body",
-              "first_shown","last_shown","destination_url","image_url","video_url","keyword","country"]
-    w = _csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
-    w.writeheader(); w.writerows(g_items)
-    gc1, gc2 = st.columns([1, 3])
-    with gc1:
-        st.download_button("CSV 내보내기", data=buf.getvalue().encode("utf-8-sig"),
-            file_name=f"google_ads_{time.strftime('%Y%m%d_%H%M')}.csv",
-            mime="text/csv", use_container_width=True)
-    with gc2:
-        if g_sel_kw != "전체" and st.button(f"'{g_sel_kw}' 데이터 삭제", key="g_del_kw"):
-            db_google_delete_keyword(g_sel_kw)
-            st.rerun()
-
 
 def render_competitor_board(all_items: list):
     """두 키워드의 소재를 나란히 비교하는 경쟁사 보드."""
@@ -4002,11 +3706,6 @@ st.markdown("""
 # 사이드바
 # ============================================================
 with st.sidebar:
-    st.markdown('<div class="slbl">페이지 선택</div>', unsafe_allow_html=True)
-    _page = st.radio("page_select", ["Meta 광고 라이브러리", "Google 광고 투명성 센터"],
-                     label_visibility="collapsed", key="page_select")
-    st.markdown("---")
-
     st.markdown('<div class="slbl">AI ANALYSIS</div>', unsafe_allow_html=True)
     ai_on = st.toggle("소구포인트 분석 ON/OFF", value=st.session_state.ai_on)
     st.session_state.ai_on = ai_on
@@ -4465,13 +4164,6 @@ if summary:
         st.session_state.selected = set()
         st.rerun()
 
-
-# ============================================================
-# 페이지 분기
-# ============================================================
-if st.session_state.get("page_select") == "Google 광고 투명성 센터":
-    render_google_ads_page()
-    st.stop()
 
 # ── Meta 광고 라이브러리 메인 탭 ──────────────────────────────
 tab_board, tab_table, tab_trend, tab_copy, tab_vs = st.tabs([
