@@ -73,9 +73,22 @@ _EXTRACT_JS = """
         const userComp = sr.querySelector('oy-review-review-user');
         const name     = userComp?.shadowRoot?.querySelector('.name')?.textContent?.trim() || '';
         const skinType = userComp?.shadowRoot?.querySelector('.skin-type')?.textContent?.trim() || '';
+        // 1) .rating 텍스트에서 숫자 우선 추출
         let stars = 0;
-        for (const icon of sr.querySelectorAll('oy-review-star-icon')) {
-            if ((icon.getAttribute('fill') || '').toLowerCase().includes('ff5753')) stars++;
+        const ratingEl = sr.querySelector('.rating');
+        if (ratingEl) {
+            const n = parseFloat(ratingEl.textContent?.trim() || '');
+            if (!isNaN(n) && n > 0) stars = Math.round(n);
+        }
+        // 2) 없으면 oy-review-star-icon shadow root 안 SVG fill 로 카운트
+        if (!stars) {
+            for (const icon of sr.querySelectorAll('oy-review-star-icon')) {
+                const iconSr = icon.shadowRoot;
+                const fillSrc = iconSr
+                    ? (iconSr.querySelector('[fill]')?.getAttribute('fill') || iconSr.querySelector('svg')?.innerHTML || '')
+                    : (icon.getAttribute('fill') || '');
+                if (fillSrc.toLowerCase().match(/ff5753|e8284a|f5a623|ffa500|ffb300/)) stars++;
+            }
         }
         const date    = sr.querySelector('.date')?.textContent?.trim() || '';
         const option  = sr.querySelector('.goods-option')?.textContent?.trim() || '';
@@ -317,28 +330,146 @@ def _to_csv(df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
-def _to_excel(df: pd.DataFrame) -> bytes:
+def _to_excel(df: pd.DataFrame, pname: str = "", reviews: list = None) -> bytes:
     try:
         import openpyxl
-        from openpyxl.styles import PatternFill, Font, Alignment
+        from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
     except ImportError:
         return _to_csv(df)
 
+    reviews = reviews or []
     buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as w:
-        df.to_excel(w, index=False, sheet_name="리뷰")
-        ws = w.sheets["리뷰"]
-        for col, width in zip("ABCDEFGH", [14, 8, 14, 24, 60, 12, 10, 14]):
-            ws.column_dimensions[col].width = width
-        fill = PatternFill(start_color="1A5C38", end_color="1A5C38", fill_type="solid")
+    wb = openpyxl.Workbook()
+
+    green  = PatternFill(start_color="1A5C38", end_color="1A5C38", fill_type="solid")
+    red    = PatternFill(start_color="C0392B", end_color="C0392B", fill_type="solid")
+    gray   = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+    wfont  = Font(color="FFFFFF", bold=True, size=11)
+    bfont  = Font(bold=True, size=11)
+    center = Alignment(horizontal="center", vertical="center")
+    wrap   = Alignment(wrap_text=True, vertical="top")
+    thin   = Border(
+        left=Side(style="thin", color="DDDDDD"),
+        right=Side(style="thin", color="DDDDDD"),
+        bottom=Side(style="thin", color="DDDDDD"),
+    )
+
+    # ── 별점 계산 ──────────────────────────────────────────────
+    ratings = []
+    for r in reviews:
+        try:
+            v = float(r.get("rating", 0) or 0)
+            if v > 0:
+                ratings.append(v)
+        except Exception:
+            pass
+    total      = len(reviews)
+    avg        = sum(ratings) / len(ratings) if ratings else 0.0
+    five_cnt   = sum(1 for v in ratings if v == 5)
+    neg_list   = [r for r in reviews if _is_negative(r)]
+    neg_cnt    = len(neg_list)
+
+    def _style_sheet(ws, header_fill):
         for cell in ws[1]:
-            cell.fill = fill
-            cell.font = Font(color="FFFFFF", bold=True)
-            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.fill   = header_fill
+            cell.font   = wfont
+            cell.alignment = center
         for row in ws.iter_rows(min_row=2):
             for cell in row:
-                cell.alignment = Alignment(wrap_text=True, vertical="top")
+                cell.alignment = wrap
+                cell.border    = thin
+        col_widths = {"A": 6, "B": 14, "C": 8, "D": 14, "E": 30, "F": 60, "G": 12, "H": 10}
+        for col_letter, width in col_widths.items():
+            ws.column_dimensions[col_letter].width = width
+        ws.row_dimensions[1].height = 22
+
+    # ── 시트 1: 대시보드 ───────────────────────────────────────
+    ws_dash = wb.active
+    ws_dash.title = "대시보드"
+    ws_dash.sheet_view.showGridLines = False
+
+    def _kpi_block(ws, row, label, value, fill):
+        ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=3)
+        ws.merge_cells(start_row=row+1, start_column=2, end_row=row+1, end_column=3)
+        lc = ws.cell(row=row,   column=2, value=label); lc.font = Font(bold=True, size=10, color="888888"); lc.alignment = center
+        vc = ws.cell(row=row+1, column=2, value=value); vc.font = Font(bold=True, size=18); vc.alignment = center
+        for r in range(row, row+2):
+            for c in range(2, 4):
+                ws.cell(r, c).fill = fill
+
+    title_cell = ws_dash.cell(row=2, column=2, value=f"🌿 {pname} 리뷰 분석 대시보드")
+    title_cell.font = Font(bold=True, size=16)
+    ws_dash.merge_cells(start_row=2, start_column=2, end_row=2, end_column=9)
+
+    sub_cell = ws_dash.cell(row=3, column=2, value=f"총 리뷰 {total:,}개  |  수집일 {time.strftime('%Y-%m-%d')}")
+    sub_cell.font = Font(size=10, color="888888")
+    ws_dash.merge_cells(start_row=3, start_column=2, end_row=3, end_column=9)
+
+    # KPI 카드 (행 5~6)
+    kpis = [
+        ("총 리뷰 수",  f"{total:,}개",   gray),
+        ("평균 별점",   f"{avg:.2f} / 5", gray),
+        ("5점 리뷰",    f"{five_cnt:,}개", gray),
+        ("부정 리뷰",   f"{neg_cnt:,}개",  PatternFill(start_color="FDECEA", end_color="FDECEA", fill_type="solid")),
+    ]
+    kpi_cols = [2, 4, 6, 8]
+    for (label, value, fill), col in zip(kpis, kpi_cols):
+        ws_dash.merge_cells(start_row=5, start_column=col, end_row=5, end_column=col+1)
+        ws_dash.merge_cells(start_row=6, start_column=col, end_row=6, end_column=col+1)
+        lc = ws_dash.cell(row=5, column=col, value=label)
+        lc.font = Font(bold=True, size=9, color="888888"); lc.alignment = center; lc.fill = fill
+        vc = ws_dash.cell(row=6, column=col, value=value)
+        vc.font = Font(bold=True, size=16); vc.alignment = center; vc.fill = fill
+
+    # 별점 분포 표 (행 9~)
+    ws_dash.cell(row=8, column=2, value="별점 분포").font = Font(bold=True, size=11)
+    dist_header = ["별점", "리뷰 수", "비율"]
+    for ci, h in enumerate(dist_header, start=2):
+        c = ws_dash.cell(row=9, column=ci, value=h)
+        c.fill = green; c.font = wfont; c.alignment = center
+    for si, star in enumerate([5, 4, 3, 2, 1], start=10):
+        cnt = sum(1 for v in ratings if int(v) == star)
+        pct = f"{cnt/len(ratings)*100:.1f}%" if ratings else "0%"
+        ws_dash.cell(si, 2, f"{'★'*star}"); ws_dash.cell(si, 2).alignment = center
+        ws_dash.cell(si, 3, cnt); ws_dash.cell(si, 3).alignment = center
+        ws_dash.cell(si, 4, pct); ws_dash.cell(si, 4).alignment = center
+        if star <= 3:
+            for ci in range(2, 5):
+                ws_dash.cell(si, ci).fill = PatternFill(start_color="FDECEA", end_color="FDECEA", fill_type="solid")
+
+    for col, width in [(2,16),(3,12),(4,12),(5,12),(6,12),(7,12),(8,12),(9,12)]:
+        ws_dash.column_dimensions[get_column_letter(col)].width = width
+    ws_dash.row_dimensions[2].height = 28
+    ws_dash.row_dimensions[6].height = 30
+
+    # ── 시트 2: 부정 리뷰 ─────────────────────────────────────
+    neg_df = _ko_df(pd.DataFrame(neg_list)) if neg_list else pd.DataFrame(columns=df.columns)
+    neg_df.insert(0, "No.", range(1, len(neg_df)+1))
+    ws_neg = wb.create_sheet("⚠️ 부정 리뷰")
+    ws_neg.append(list(neg_df.columns))
+    for row_data in neg_df.itertuples(index=False):
+        ws_neg.append(list(row_data))
+    _style_sheet(ws_neg, red)
+
+    # ── 시트 3: 전체 리뷰 ─────────────────────────────────────
+    full_df = df.copy()
+    full_df.insert(0, "No.", range(1, len(full_df)+1))
+    ws_all = wb.create_sheet("📋 전체 리뷰")
+    ws_all.append(list(full_df.columns))
+    for row_data in full_df.itertuples(index=False):
+        ws_all.append(list(row_data))
+    _style_sheet(ws_all, green)
+
+    wb.save(buf)
     return buf.getvalue()
+
+
+def _is_negative(r: dict) -> bool:
+    try:
+        return float(r.get("rating", 5) or 5) <= 3
+    except Exception:
+        return False
 
 
 def _ko_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -453,12 +584,15 @@ if st.session_state.oy_reviews:
         five_pct = sum(1 for r in ratings if r == 5) / len(ratings) * 100 if ratings else 0.0
     except Exception:
         avg = five_pct = 0.0
+    neg_reviews = [r for r in reviews if _is_negative(r)]
+    neg_pct     = len(neg_reviews) / len(reviews) * 100 if reviews else 0.0
 
-    k1, k2, k3, k4 = st.columns(4)
+    k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("총 리뷰 수",   f"{len(reviews):,}개")
     k2.metric("평균 별점",    f"{avg:.2f} / 5.0")
     k3.metric("5점 비율",     f"{five_pct:.1f}%")
-    k4.metric("수집 페이지",  f"{(len(reviews) - 1) // 10 + 1}페이지")
+    k4.metric("부정 리뷰",    f"{len(neg_reviews):,}개", delta=f"-{neg_pct:.1f}%", delta_color="inverse")
+    k5.metric("수집 페이지",  f"{(len(reviews) - 1) // 10 + 1}페이지")
 
     st.markdown("---")
 
@@ -476,7 +610,7 @@ if st.session_state.oy_reviews:
         )
     with d2:
         st.download_button(
-            "📊 Excel", data=_to_excel(df),
+            "📊 Excel", data=_to_excel(df, pname=pname, reviews=reviews),
             file_name=f"{pname}_리뷰_{time.strftime('%Y%m%d')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
@@ -491,36 +625,45 @@ if st.session_state.oy_reviews:
 
     st.markdown("---")
 
-    # 리뷰 / 테이블 탭
-    tab_list, tab_table = st.tabs(["💬 리뷰 목록", "📋 데이터 테이블"])
+    # 리뷰 / 부정 리뷰 / 테이블 탭
+    tab_list, tab_neg, tab_table = st.tabs(["💬 전체 리뷰", "⚠️ 부정 리뷰 (1~3점)", "📋 데이터 테이블"])
 
-    with tab_list:
+    def _render_reviews(pool, key_prefix):
         filt = st.select_slider(
-            "별점 필터", ["전체", "5점", "4점", "3점", "2점", "1점"], "전체",
+            "별점 필터", ["전체", "5점", "4점", "3점", "2점", "1점"], "전체", key=f"{key_prefix}_filt",
         )
-        shown = (reviews if filt == "전체"
-                 else [r for r in reviews if str(r.get("rating", "")) == filt[0]])
-        st.caption(f"{len(shown)}개 표시 중 (전체 {len(reviews)}개)")
-
+        shown = (pool if filt == "전체"
+                 else [r for r in pool if str(r.get("rating", "")) == filt[0]])
+        st.caption(f"{len(shown)}개 표시 중 (전체 {len(pool)}개)")
         for r in shown[:50]:
             skin    = f" · {r['skin_type']}" if r.get("skin_type") else ""
             helpful = f" · 도움돼요 {r['helpful']}" if r.get("helpful") else ""
             content = str(r.get("content", "")).replace("\n", "<br>")
+            star_color = "#e8284a" if _is_negative(r) else "#f5a623"
             st.markdown(
                 f'<div class="card">'
                 f'<div class="card-body">'
                 f'<div style="display:flex;justify-content:space-between;align-items:center;">'
                 f'<span style="font-weight:700;font-size:13px;">{r.get("reviewer","익명")}</span>'
-                f'<span style="color:#f5a623;letter-spacing:2px;font-size:13px;">{_stars(r.get("rating",0))}</span>'
+                f'<span style="color:{star_color};letter-spacing:2px;font-size:13px;">{_stars(r.get("rating",0))}</span>'
                 f'</div>'
                 f'<div class="card-meta">{r.get("date","")}{skin}{helpful}</div>'
                 f'<div class="card-cap">{content}</div>'
                 f'</div></div>',
                 unsafe_allow_html=True,
             )
-
         if len(shown) > 50:
             st.info(f"50개까지 표시됩니다. 전체 {len(shown)}개는 다운로드로 확인하세요.")
+
+    with tab_list:
+        _render_reviews(reviews, "all")
+
+    with tab_neg:
+        if neg_reviews:
+            st.caption(f"⚠️ 별점 1~3점 리뷰 {len(neg_reviews)}개 ({neg_pct:.1f}%)")
+            _render_reviews(neg_reviews, "neg")
+        else:
+            st.success("부정 리뷰(1~3점)가 없습니다.")
 
     with tab_table:
         st.dataframe(df, use_container_width=True, height=520)
