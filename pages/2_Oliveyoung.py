@@ -1,5 +1,5 @@
 # ============================================================
-# 올리브영 리뷰 수집기 — 별도 페이지
+# 올리브영 리뷰 수집기 — 별도 페이지 (원본 oliveyoung_scrap 기반)
 # ============================================================
 import asyncio
 import concurrent.futures
@@ -9,29 +9,39 @@ import os
 import queue
 import random
 import re
-import sys
-import time
-from typing import Callable
 
 import pandas as pd
 import streamlit as st
-
-# ── CSS 공유 ─────────────────────────────────────────────────
-_css_path = os.path.join(os.path.dirname(__file__), "..", "static", "style.css")
-try:
-    with open(_css_path) as _f:
-        st.markdown(f"<style>{_f.read()}</style>", unsafe_allow_html=True)
-except FileNotFoundError:
-    pass
 
 st.set_page_config(
     page_title="올리브영 리뷰 — ADINTEL",
     page_icon="🌿",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
+st.markdown("""
+<style>
+.stApp { background-color: #f7faf8; }
+.main-title { font-size:2rem; font-weight:800; color:#1a5c38; }
+.sub-title  { color:#6b9e7e; font-size:0.9rem; margin-bottom:1.5rem; }
+div[data-testid="metric-container"] {
+    background:white; border:1px solid #d4edda; border-radius:10px; padding:12px;
+}
+.stButton > button {
+    background-color:#1a5c38 !important; color:white !important;
+    border-radius:8px !important; border:none !important; font-weight:600 !important;
+}
+.stDownloadButton > button {
+    background-color:#f0f7f3 !important; color:#1a5c38 !important;
+    border:1.5px solid #1a5c38 !important; border-radius:8px !important;
+    font-weight:600 !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # ============================================================
-# 올리브영 리뷰 스크래퍼 (self-contained)
+# 스크래퍼 (원본 reviews.py 그대로)
 # ============================================================
 _DETAIL_URL    = "https://www.oliveyoung.co.kr/store/goods/getGoodsDetail.do"
 _HOME_URL      = "https://www.oliveyoung.co.kr"
@@ -62,24 +72,36 @@ _EXTRACT_JS = """
         }
         return found;
     }
+
     const container = document.querySelector('oy-review-review-in-product');
     if (!container?.shadowRoot) return { error: 'no_container', reviews: [] };
+
     const items = findInShadow(container.shadowRoot, 'oy-review-review-item');
     if (!items.length) return { error: 'no_items', reviews: [] };
+
     const reviews = [];
     for (const item of items) {
         if (!item.shadowRoot) continue;
         const sr = item.shadowRoot;
+
         const userComp = sr.querySelector('oy-review-review-user');
         const name     = userComp?.shadowRoot?.querySelector('.name')?.textContent?.trim() || '';
         const skinType = userComp?.shadowRoot?.querySelector('.skin-type')?.textContent?.trim() || '';
+
+        let stars = 0;
+        for (const icon of sr.querySelectorAll('oy-review-star-icon')) {
+            if ((icon.getAttribute('fill') || '').toLowerCase().includes('ff5753')) stars++;
+        }
+
         const date    = sr.querySelector('.date')?.textContent?.trim() || '';
         const option  = sr.querySelector('.goods-option')?.textContent?.trim() || '';
+
         const contentComp = sr.querySelector('oy-review-review-content');
         const content = contentComp?.shadowRoot?.querySelector('p')?.textContent?.trim() || '';
         const helpful = sr.querySelector('.helpful-count')?.textContent?.trim() || '0';
+
         if (name || content) {
-            reviews.push({ name, date, option, content, skinType, helpful });
+            reviews.push({ name, stars, date, option, content, skinType, helpful });
         }
     }
     return { reviews, count: reviews.length };
@@ -106,6 +128,7 @@ _WAIT_ITEMS_JS = """
 def _to_review(r: dict) -> dict:
     return {
         "reviewer":      r.get("name", "익명"),
+        "rating":        str(r.get("stars", "")),
         "date":          r.get("date", ""),
         "title":         "",
         "content":       r.get("content", ""),
@@ -115,21 +138,21 @@ def _to_review(r: dict) -> dict:
     }
 
 
-async def _run_scrape(goods_no: str, max_pages: int, on_progress: Callable, log: list) -> list:
+async def _run(goods_no: str, max_pages: int, on_progress, log: list) -> list:
     from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
     executable = _CHROMIUM_PATH if os.path.exists(_CHROMIUM_PATH) else None
     log.append(f"[시작] goodsNo={goods_no}, 최대 {max_pages}페이지")
-
-    all_reviews: list = []
-    seen: set = set()
+    log.append(f"[브라우저] {executable or '내장 (Playwright 기본)'}")
 
     async with async_playwright() as pw:
         launch_kwargs = dict(
             headless=True,
             args=[
                 "--disable-blink-features=AutomationControlled",
-                "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
             ],
         )
         if executable:
@@ -143,76 +166,62 @@ async def _run_scrape(goods_no: str, max_pages: int, on_progress: Callable, log:
         )
         await context.add_init_script(_ANTI_DETECT_JS)
         page = await context.new_page()
+        all_reviews = []
+        seen = set()
 
         try:
-            # ── 1단계: 홈 방문 → 쿠키 확보 ──────────────────────
-            log.append("[1단계] 올리브영 홈 방문")
-            await page.goto(_HOME_URL, wait_until="domcontentloaded", timeout=30000)
+            log.append("[1단계] 홈 접속...")
+            await page.goto(_HOME_URL, wait_until="domcontentloaded", timeout=30_000)
             await asyncio.sleep(random.uniform(1.5, 2.5))
 
-            # ── 2단계: 상품 상세 페이지 이동 ──────────────────────
-            detail_url = f"{_DETAIL_URL}?goodsNo={goods_no}"
-            log.append(f"[2단계] 상품 페이지 이동: {detail_url}")
-            await page.goto(detail_url, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(random.uniform(2.0, 3.0))
+            log.append("[2단계] 상품 페이지 접속...")
+            await page.goto(
+                f"{_DETAIL_URL}?goodsNo={goods_no}&tab=review",
+                wait_until="load",
+                timeout=60_000,
+            )
+            log.append(f"[2단계] 완료 — {page.url}")
 
-            # 팝업 닫기
-            for selector in ["button.btn_close", ".layer_close", ".btnClose", "button[aria-label='닫기']"]:
-                try:
-                    btn = page.locator(selector).first
-                    if await btn.is_visible(timeout=500):
-                        await btn.click()
-                        await asyncio.sleep(0.3)
-                except Exception:
-                    pass
-
-            # ── 3단계: 리뷰 탭 클릭 ─────────────────────────────
-            log.append("[3단계] 리뷰 탭 클릭 시도")
-            for tab_sel in [
-                'a[href="#reviewInfo"]', 'button:has-text("리뷰")',
-                'a:has-text("리뷰")', '#reviewInfo',
-            ]:
-                try:
-                    el = page.locator(tab_sel).first
-                    if await el.is_visible(timeout=1500):
-                        await el.click()
-                        await asyncio.sleep(1.5)
-                        log.append(f"[3단계] 탭 클릭 성공: {tab_sel}")
-                        break
-                except Exception:
-                    pass
-
-            # ── 4단계: 리뷰 섹션으로 스크롤 ──────────────────────
-            log.append("[4단계] 리뷰 섹션 스크롤")
-            for anchor in ["#reviewInfo", "oy-review-review-in-product"]:
-                try:
-                    await page.evaluate(f"""
-                        () => {{
-                            const el = document.querySelector('{anchor}');
-                            if (el) el.scrollIntoView({{behavior:'smooth', block:'center'}});
-                        }}
-                    """)
-                    await asyncio.sleep(1.0)
-                except Exception:
-                    pass
-
-            # ── 5단계: Shadow DOM 컨테이너 대기 ───────────────────
-            log.append("[5단계] Shadow DOM 컨테이너 대기")
             try:
-                await page.wait_for_function(_WAIT_READY_JS, timeout=15000)
-                log.append("[5단계] Shadow DOM 컨테이너 감지됨")
-                await page.wait_for_function(_WAIT_ITEMS_JS, timeout=10000)
+                await page.wait_for_load_state("networkidle", timeout=12_000)
+            except Exception:
+                pass
+
+            log.append("[3단계] 리뷰 컴포넌트로 스크롤...")
+            scrolled = await page.evaluate("""
+                () => {
+                    const el = document.querySelector('oy-review-review-in-product');
+                    if (!el) return false;
+                    el.scrollIntoView({ behavior: 'instant', block: 'center' });
+                    return true;
+                }
+            """)
+            log.append(f"[3단계] 스크롤: {'성공' if scrolled else '컴포넌트 없음'}")
+            if not scrolled:
+                log.append("[오류] oy-review-review-in-product 없음")
+                return []
+
+            log.append("[4단계] shadow root 초기화 대기...")
+            try:
+                await page.wait_for_function(_WAIT_READY_JS, timeout=15_000)
+                log.append("[4단계] shadow root 확인됨")
+            except PWTimeout:
+                log.append("[4단계] 타임아웃 — 계속 진행")
+
+            log.append("[5단계] 리뷰 아이템 렌더링 대기...")
+            try:
+                await page.wait_for_function(_WAIT_ITEMS_JS, timeout=20_000)
                 log.append("[5단계] 리뷰 아이템 감지됨")
             except PWTimeout:
-                log.append("[5단계] 타임아웃 — 리뷰 로드 실패")
+                log.append("[5단계] 타임아웃")
 
             await asyncio.sleep(1.0)
 
-            # ── 6단계: 추출 → 스크롤 반복 ────────────────────────
             target = max_pages * 10
             no_new_streak = 0
             scroll_num = 0
-            log.append(f"[6단계] 추출→스크롤 반복 (목표 {target}개)")
+
+            log.append(f"[6단계] 추출→저장→스크롤 반복 시작 (목표 {target}개)")
 
             while len(all_reviews) < target:
                 result = await page.evaluate(_EXTRACT_JS)
@@ -251,26 +260,21 @@ async def _run_scrape(goods_no: str, max_pages: int, on_progress: Callable, log:
     return all_reviews
 
 
-def _run_in_thread(goods_no: str, max_pages: int, on_progress: Callable, log: list) -> list:
-    return asyncio.run(_run_scrape(goods_no, max_pages, on_progress, log))
+def _run_in_thread(goods_no, max_pages, on_progress, log):
+    return asyncio.run(_run(goods_no, max_pages, on_progress, log))
 
 
-def scrape_reviews(
-    goods_no: str,
-    max_pages: int = 10,
-    on_progress: Callable = None,
-) -> tuple[list, list]:
-    """(리뷰 리스트, 진단 로그) 반환"""
-    log: list = []
-    progress_q: queue.Queue = queue.Queue()
+def scrape_reviews(goods_no, max_pages=10, on_progress=None):
+    log = []
+    progress_q = queue.Queue() if on_progress else None
 
-    def _thread_progress(cur, total, collected):
+    def thread_progress(cur, total, collected):
         progress_q.put((cur, total, collected))
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(
             _run_in_thread, goods_no, max_pages,
-            _thread_progress if on_progress else None,
+            thread_progress if on_progress else None,
             log,
         )
         if on_progress:
@@ -288,7 +292,7 @@ def scrape_reviews(
 
 
 # ============================================================
-# 유틸 함수
+# 유틸
 # ============================================================
 def _extract_goods_no(text: str) -> str:
     text = text.strip()
@@ -306,26 +310,20 @@ def _stars(rating) -> str:
     return "★" * r + "☆" * (5 - r)
 
 
-def _to_csv(df: pd.DataFrame) -> bytes:
+def _to_csv(df):
     buf = io.BytesIO()
     df.to_csv(buf, index=False, encoding="utf-8-sig")
     return buf.getvalue()
 
 
-def _to_excel(df: pd.DataFrame, pname: str = "", reviews: list = None) -> bytes:  # noqa: ARG001
-    try:
-        import openpyxl
-        from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
-        from openpyxl.utils import get_column_letter
-    except ImportError:
-        return _to_csv(df)
-
+def _to_excel(df):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         df.to_excel(w, index=False, sheet_name="리뷰")
         ws = w.sheets["리뷰"]
-        for col, width in zip("ABCDEFGH", [14, 14, 24, 60, 12, 10, 14, 14]):
+        for col, width in zip("ABCDEFGH", [14, 8, 14, 24, 60, 12, 10, 14]):
             ws.column_dimensions[col].width = width
+        from openpyxl.styles import PatternFill, Font, Alignment
         fill = PatternFill(start_color="1A5C38", end_color="1A5C38", fill_type="solid")
         for cell in ws[1]:
             cell.fill = fill
@@ -337,81 +335,81 @@ def _to_excel(df: pd.DataFrame, pname: str = "", reviews: list = None) -> bytes:
     return buf.getvalue()
 
 
-def _ko_df(df: pd.DataFrame) -> pd.DataFrame:
+def _ko_df(df):
     return df.rename(columns={
-        "reviewer": "작성자", "date": "작성일",
+        "reviewer": "작성자", "rating": "별점", "date": "작성일",
         "title": "제목", "content": "내용", "skin_type": "피부타입",
         "helpful": "도움돼요", "purchase_type": "구매유형",
     })
 
 
 # ============================================================
-# 페이지 UI
+# 세션 상태
 # ============================================================
-# 헤더
-st.markdown(
-    '<div class="hdr">'
-    '<div class="hdr-row">'
-    '<div class="logo">AD<b>INTEL</b></div>'
-    '<span class="ver">올리브영 리뷰</span>'
-    '</div>'
-    '<div class="sub">OLIVEYOUNG REVIEW SCRAPER · 리뷰 수집 도구</div>'
-    '</div>',
-    unsafe_allow_html=True,
-)
-
-# ── 세션 초기화 ──────────────────────────────────────────────
 for _k, _v in {"oy_product": None, "oy_reviews": []}.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
-# ── 사이드바 ────────────────────────────────────────────────
+# ============================================================
+# 사이드바
+# ============================================================
 with st.sidebar:
-    st.markdown('<div class="slbl">상품 입력</div>', unsafe_allow_html=True)
+    st.markdown("## 🌿 올리브영 리뷰 수집기")
+    st.caption("상품 URL 붙여넣기 → 수집 → 다운로드")
+    st.divider()
 
     with st.form(key="oy_form"):
-        url_input  = st.text_area(
-            "상품 URL 또는 goodsNo",
+        url_input = st.text_area(
+            "상품 URL 또는 goodsNo 입력",
             placeholder=(
-                "https://www.oliveyoung.co.kr/store/goods/getGoodsDetail.do?goodsNo=A000000200106\n"
+                "https://www.oliveyoung.co.kr/store/goods/"
+                "getGoodsDetail.do?goodsNo=A000000200106\n\n"
                 "또는 goodsNo만: A000000200106"
             ),
-            height=120,
+            height=130,
             label_visibility="collapsed",
         )
         pname_input = st.text_input("상품명 (파일명용)", placeholder="예: 투에이엔 선크림")
         max_pages   = st.slider("수집 페이지 수", 1, 50, 10, help="1페이지 ≈ 리뷰 10개")
-        submit_btn  = st.form_submit_button("🌿 리뷰 수집 시작", use_container_width=True)
+        submit_btn  = st.form_submit_button("🚀 리뷰 수집 시작", use_container_width=True)
 
-    st.markdown("---")
+    st.divider()
     if st.button("🔄 초기화", use_container_width=True):
-        for _k in ["oy_product", "oy_reviews"]:
-            st.session_state[_k] = None if _k == "oy_product" else []
+        for _k in list(st.session_state.keys()):
+            del st.session_state[_k]
         st.rerun()
+    st.caption("⚠️ 개인·연구 목적으로만 사용하세요.")
 
-    st.markdown("---")
-    st.markdown(
-        '<div style="font-size:10px;color:var(--mu);">⚠️ 개인·연구 목적으로만 사용하세요.</div>',
-        unsafe_allow_html=True,
-    )
+# ============================================================
+# 메인
+# ============================================================
+st.markdown('<p class="main-title">🌿 올리브영 리뷰 수집기</p>', unsafe_allow_html=True)
+st.markdown('<p class="sub-title">상품 URL을 붙여넣으면 리뷰를 한 번에 수집해요</p>', unsafe_allow_html=True)
 
-# ── 수집 실행 ───────────────────────────────────────────────
+if not st.session_state.oy_reviews and not st.session_state.oy_product:
+    st.markdown("""
+    <div style="background:white;border:1.5px solid #d4edda;border-radius:12px;
+                padding:22px 26px;margin-bottom:20px;">
+        <div style="font-weight:700;color:#1a5c38;font-size:1.05rem;margin-bottom:14px;">
+            📋 사용 방법
+        </div>
+        <div style="color:#444;font-size:0.9rem;line-height:2.2;">
+            1. 올리브영에서 원하는 <b>상품 페이지</b>를 열어요<br>
+            2. 브라우저 <b>주소창 URL 전체</b>를 복사해요<br>
+            3. 왼쪽 입력창에 붙여넣고 버튼 클릭<br>
+            4. 수집 완료 후 <b>CSV / Excel / JSON</b>으로 다운로드
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
 if submit_btn:
     goods_no = _extract_goods_no(url_input or "")
     if not goods_no:
         st.error("URL 또는 goodsNo를 올바르게 입력해주세요.")
     else:
-        pname = (pname_input or "").strip() or goods_no
+        pname = pname_input.strip() or goods_no
         st.session_state.oy_product = {"name": pname, "goods_no": goods_no}
         st.session_state.oy_reviews = []
-
-        st.markdown(
-            f'<div class="banner">'
-            f'<div class="dot dot-on"></div>'
-            f'<span class="banner-txt">인식된 goodsNo: <b>{goods_no}</b> · 상품명: {pname}</span>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
 
         pbar   = st.progress(0, text="수집 준비 중...")
         status = st.empty()
@@ -420,7 +418,7 @@ if submit_btn:
             pbar.progress(int(cur / total * 100), text=f"페이지 {cur} / {total} 수집 중...")
             status.caption(f"📦 현재까지 {collected}개 리뷰 수집됨")
 
-        with st.spinner("Playwright 브라우저로 리뷰 수집 중..."):
+        with st.spinner("리뷰 수집 중... Playwright 브라우저로 우회 중입니다 ☕"):
             reviews, diag_log = scrape_reviews(goods_no, max_pages=max_pages, on_progress=_on_progress)
 
         pbar.progress(100, text="✅ 완료!")
@@ -436,83 +434,71 @@ if submit_btn:
             st.session_state.oy_reviews = reviews
             st.rerun()
 
-# ── 결과 표시 ───────────────────────────────────────────────
 if st.session_state.oy_reviews:
     reviews = st.session_state.oy_reviews
     pname   = (st.session_state.oy_product or {}).get("name", "상품")[:30]
     df      = _ko_df(pd.DataFrame(reviews))
 
-    # KPI
-    k1, k2 = st.columns(2)
-    k1.metric("총 리뷰 수",  f"{len(reviews):,}개")
-    k2.metric("수집 페이지", f"{(len(reviews) - 1) // 10 + 1}페이지")
+    try:
+        ratings  = [float(r["rating"]) for r in reviews if r.get("rating")]
+        avg      = sum(ratings) / len(ratings) if ratings else 0.0
+        five_pct = sum(1 for r in ratings if r == 5) / len(ratings) * 100 if ratings else 0.0
+    except Exception:
+        avg = five_pct = 0.0
 
     st.markdown("---")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("총 리뷰 수",  f"{len(reviews):,}개")
+    c2.metric("평균 별점",   f"{avg:.2f} / 5.0")
+    c3.metric("5점 비율",    f"{five_pct:.1f}%")
+    c4.metric("수집 페이지", f"{(len(reviews) - 1) // 10 + 1}페이지")
 
-    # 다운로드
-    st.markdown(
-        '<div class="sec"><div class="sec-t">다운로드</div></div>',
-        unsafe_allow_html=True,
-    )
-    d1, d2, d3, _ = st.columns([1, 1, 1, 3])
+    st.markdown("---")
+    st.markdown("#### ⬇️ 다운로드")
+    d1, d2, d3, _ = st.columns([1, 1, 1, 2])
     with d1:
-        st.download_button(
-            "📄 CSV", data=_to_csv(df),
-            file_name=f"{pname}_리뷰_{time.strftime('%Y%m%d')}.csv",
-            mime="text/csv", use_container_width=True,
-        )
+        st.download_button("📄 CSV", data=_to_csv(df),
+            file_name=f"{pname}_리뷰.csv", mime="text/csv", use_container_width=True)
     with d2:
-        st.download_button(
-            "📊 Excel", data=_to_excel(df, pname=pname, reviews=reviews),
-            file_name=f"{pname}_리뷰_{time.strftime('%Y%m%d')}.xlsx",
+        st.download_button("📊 Excel", data=_to_excel(df),
+            file_name=f"{pname}_리뷰.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
+            use_container_width=True)
     with d3:
-        st.download_button(
-            "🗂 JSON",
+        st.download_button("🗂 JSON",
             data=json.dumps(reviews, ensure_ascii=False, indent=2).encode("utf-8"),
-            file_name=f"{pname}_리뷰_{time.strftime('%Y%m%d')}.json",
-            mime="application/json", use_container_width=True,
-        )
+            file_name=f"{pname}_리뷰.json", mime="application/json",
+            use_container_width=True)
 
     st.markdown("---")
+    tab1, tab2 = st.tabs(["💬 리뷰 목록", "📋 데이터 테이블"])
 
-    # 리뷰 / 테이블 탭
-    tab_list, tab_table = st.tabs(["💬 리뷰 목록", "📋 데이터 테이블"])
+    with tab1:
+        filt = st.select_slider("별점 필터", ["전체", "5점", "4점", "3점", "2점", "1점"], "전체")
+        shown = (reviews if filt == "전체"
+                 else [r for r in reviews if str(r.get("rating", "")) == filt[0]])
+        st.caption(f"{len(shown)}개 표시 중 (전체 {len(reviews)}개)")
 
-    with tab_list:
-        st.caption(f"{len(reviews)}개")
-        for r in reviews[:100]:
+        for r in shown[:50]:
             skin    = f" · {r['skin_type']}" if r.get("skin_type") else ""
             helpful = f" · 도움돼요 {r['helpful']}" if r.get("helpful") else ""
             content = str(r.get("content", "")).replace("\n", "<br>")
-            st.markdown(
-                f'<div class="card">'
-                f'<div class="card-body">'
-                f'<div style="display:flex;justify-content:space-between;align-items:center;">'
-                f'<span style="font-weight:700;font-size:13px;">{r.get("reviewer","익명")}</span>'
-                f'<span style="font-size:11px;color:var(--mu);">{r.get("date","")}</span>'
-                f'</div>'
-                f'<div class="card-meta">{skin}{helpful}</div>'
-                f'<div class="card-cap">{content}</div>'
-                f'</div></div>',
-                unsafe_allow_html=True,
-            )
-        if len(reviews) > 100:
-            st.info(f"100개까지 표시됩니다. 전체 {len(reviews)}개는 다운로드로 확인하세요.")
+            st.markdown(f"""
+            <div style="background:white;border-radius:10px;border:1px solid #e8f0eb;
+                        padding:16px 20px;margin-bottom:10px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <span style="font-weight:600;color:#1a1a1a;">{r.get("reviewer","익명")}</span>
+                    <span style="color:#f5a623;letter-spacing:2px;">{_stars(r.get("rating",0))}</span>
+                </div>
+                <div style="color:#bbb;font-size:0.78rem;margin:4px 0 10px;">
+                    {r.get("date","")}{skin}{helpful}
+                </div>
+                <div style="color:#333;line-height:1.65;font-size:0.9rem;">{content}</div>
+            </div>
+            """, unsafe_allow_html=True)
 
-    with tab_table:
+        if len(shown) > 50:
+            st.info(f"화면에는 50개까지 표시됩니다. 전체 {len(shown)}개는 다운로드로 확인하세요.")
+
+    with tab2:
         st.dataframe(df, use_container_width=True, height=520)
-
-else:
-    # 빈 상태 안내
-    st.markdown(
-        '<div class="empty">'
-        '<div class="empty-t">🌿 올리브영 리뷰 수집기</div>'
-        '<div class="empty-d">'
-        '왼쪽 사이드바에 상품 URL 또는 goodsNo를 입력하고<br>'
-        '수집 버튼을 누르면 리뷰를 자동으로 가져옵니다.'
-        '</div></div>',
-        unsafe_allow_html=True,
-    )
